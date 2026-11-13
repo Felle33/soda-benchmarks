@@ -35,6 +35,19 @@ cases={
   }
   return
  }
+}''',
+'offset_tiles':'''module {
+ func.func @compute(%a: memref<18x24xf32>, %b: memref<24x22xf32>, %c: memref<18x22xf32>) {
+  %z = arith.constant 0 : index
+  %n = arith.constant 22 : index
+  %step = arith.constant 11 : index
+  scf.for %j = %z to %n step %step {
+   %bt = memref.subview %b[0,%j] [24,11] [1,1] : memref<24x22xf32> to memref<24x11xf32,strided<[22,1],offset: ?>>
+   %ct = memref.subview %c[0,%j] [18,11] [1,1] : memref<18x22xf32> to memref<18x11xf32,strided<[22,1],offset: ?>>
+   linalg.matmul ins(%a,%bt : memref<18x24xf32>,memref<24x11xf32,strided<[22,1],offset: ?>>) outs(%ct : memref<18x11xf32,strided<[22,1],offset: ?>>)
+  }
+  return
+ }
 }'''}
 lower=['func.func(convert-linalg-to-loops)','func.func(fold-memref-alias-ops)',
        'lower-affine','convert-scf-to-cf','expand-strided-metadata','lower-affine',
@@ -55,6 +68,9 @@ for name,source in cases.items():
  run(['mlir-opt',path/'input.mlir',*flags,'--pass-pipeline=builtin.module(sodap-prepare-compute-budget{lanes=64 report='+str(plan)+'},sodap-bank-matmul-buffers)', '-o',path/'banked.mlir'])
  physical=shapes((path/'banked.mlir').read_text())
  alloc=json.loads(plan.read_text());assert sum(s['lanes'] for s in alloc['groups'])==64
+ if name=='offset_tiles':
+  assert alloc['stages'][0]['column_origin_alignment']==1
+  assert alloc['stages'][0]['columns']==1,'A lane must select a fixed bank across the 11-column tile boundary'
  libs=[]
  for variant in ('reference','optimized'):
   inp=path/('input.mlir' if variant=='reference' else 'banked.mlir')

@@ -9,6 +9,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/JSON.h"
+#include <numeric>
 
 namespace mlir::sodap {
 #define GEN_PASS_DEF_PREPARECOMPUTEBUDGET
@@ -16,6 +17,54 @@ namespace mlir::sodap {
 }
 using namespace mlir;
 namespace {
+
+// A register lane should select a fixed cyclic bank across outer tiles.
+// Return a proven divisor of the index, capped by the requested lane budget.
+// Unknown values are only known to be divisible by one.
+static unsigned indexAlignment(Value value, unsigned cap, unsigned depth = 0) {
+  if (depth > 16) return 1;
+  if (auto c = value.getDefiningOp<arith::ConstantIndexOp>())
+    return std::gcd(uint64_t(c.value() < 0 ? -c.value() : c.value()), uint64_t(cap));
+  if (auto c = value.getDefiningOp<arith::ConstantIntOp>())
+    return std::gcd(uint64_t(c.value() < 0 ? -c.value() : c.value()), uint64_t(cap));
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (auto loop = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp()))
+      if (arg == loop.getInductionVar())
+        return std::gcd(indexAlignment(loop.getLowerBound(), cap, depth+1),
+                        indexAlignment(loop.getStep(), cap, depth+1));
+  }
+  if (auto add = value.getDefiningOp<arith::AddIOp>())
+    return std::gcd(indexAlignment(add.getLhs(),cap,depth+1),indexAlignment(add.getRhs(),cap,depth+1));
+  if (auto mul = value.getDefiningOp<arith::MulIOp>())
+    return std::gcd(indexAlignment(mul.getLhs(),cap,depth+1)*indexAlignment(mul.getRhs(),cap,depth+1),cap);
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    return indexAlignment(cast.getIn(),cap,depth+1);
+  return 1;
+}
+static unsigned axisAlignment(Value value, unsigned dim, unsigned cap) {
+  unsigned alignment = cap;
+  while (true) {
+    if (auto sub = value.getDefiningOp<memref::SubViewOp>()) {
+      auto dropped = sub.getDroppedDims(); unsigned visible = 0;
+      for (unsigned i=0;i<dropped.size();++i)
+        if (!dropped[i] && visible++ == dim) { dim=i; break; }
+      OpFoldResult offset = sub.getMixedOffsets()[dim]; unsigned current;
+      if (auto attr = dyn_cast<Attribute>(offset)) {
+        int64_t n=cast<IntegerAttr>(attr).getInt();
+        current=std::gcd(uint64_t(n<0 ? -n : n),uint64_t(cap));
+      } else current=indexAlignment(cast<Value>(offset),cap);
+      alignment=std::gcd(alignment,current);
+      value=sub.getSource();
+    } else if (auto expand=value.getDefiningOp<memref::ExpandShapeOp>()) {
+      auto groups=expand.getReassociationIndices(); bool found=false;
+      for (auto [source,group]:llvm::enumerate(groups))
+        if (llvm::is_contained(group,int64_t(dim))) { dim=source;found=true;break; }
+      if (!found) return 1;
+      value=expand.getSrc();
+    } else if (auto cast=value.getDefiningOp<memref::CastOp>()) value=cast.getSource();
+    else return alignment;
+  }
+}
 
 // Normalize contraction indexing, not benchmark names. Preserve the sequential
 // reduction and scalar body; unsupported arithmetic must fail, never disappear.
@@ -212,23 +261,29 @@ struct PrepareComputeBudget : sodap::impl::PrepareComputeBudgetBase<PrepareCompu
         {"function",cast<func::FuncOp>(op).getSymName().str()}, {"lanes",allocated[i]}});
     OpBuilder b(&getContext());
     for (auto [index,mm] : llvm::enumerate(matmuls)) {
-      unsigned count = allocated[groups[mm->getParentOfType<func::FuncOp>()]], r = 1, c = count;
+      unsigned count = allocated[groups[mm->getParentOfType<func::FuncOp>()]], r = 1, c = 1;
       auto type = cast<MemRefType>(mm.getOutputs()[0].getType());
-      if (type.getDimSize(1) == 1) { r = count; c = 1; }
-      else if (type.getDimSize(0) != 1) {
-        for (unsigned i = 1; i * i <= count; ++i) if (!(count % i)) { r = i; c = count/i; }
-      }
-      // Tiny validation tensors may be narrower than the hardware budget.
-      // Never create a bank which has no logical element and hence no consumer.
-      // LARGE tiles retain the full budget; record any small-shape reduction.
-      while (r > unsigned(type.getDimSize(0)) && r > 1) r /= 2;
-      while (c > unsigned(type.getDimSize(1)) && c > 1) c /= 2;
+      unsigned ra=axisAlignment(mm.getInputs()[0],0,count);
+      unsigned ca=std::gcd(axisAlignment(mm.getInputs()[1],1,count),
+                           axisAlignment(mm.getOutputs()[0],1,count));
+      // Prefer maximum active compute, then minimize distinct operand reads.
+      // Only choose factors which divide every relevant outer-tile origin.
+      // A too-small MINI tensor can use fewer lanes; LARGE is audited in RTL.
+      unsigned best=UINT32_MAX;
+      for (unsigned active=count;active && best==UINT32_MAX;active/=2)
+        for (unsigned rows=1;rows<=active;++rows) {
+          if (active%rows) continue;
+          unsigned cols=active/rows;
+          if (rows>unsigned(type.getDimSize(0)) || cols>unsigned(type.getDimSize(1)) || ra%rows || ca%cols) continue;
+          if (rows+cols<best) { r=rows;c=cols;best=rows+cols; }
+        }
       mm->setAttr("sodap.register_rows", b.getI32IntegerAttr(r));
       mm->setAttr("sodap.register_columns", b.getI32IntegerAttr(c));
       auto f = mm->getParentOfType<func::FuncOp>();
       stages.push_back(llvm::json::Object{{"stage",int64_t(index)},
         {"function",f ? f.getSymName().str() : ""}, {"lanes",count},
-        {"active_lanes",r*c}, {"rows",r}, {"columns",c}});
+        {"active_lanes",r*c}, {"rows",r}, {"columns",c},
+        {"row_origin_alignment",ra}, {"column_origin_alignment",ca}});
     }
     if (!report.empty()) {
       std::error_code error; llvm::raw_fd_ostream stream(report, error, llvm::sys::fs::OF_Text);
