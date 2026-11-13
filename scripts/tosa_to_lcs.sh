@@ -29,6 +29,11 @@
 #
 # Environment:
 #   LCS_TRANSFORM        schedules, default scripts/lcs/transform.mlir
+#   LCS_REGISTER_BLOCK   optional compute register block, e.g. 8,8 (off by default)
+#   LCS_COMPUTE_LANES    optional matmul lane budget; choose a balanced factor pair
+#                        unless LCS_REGISTER_BLOCK is explicit (64 gives 8,8)
+#   LCS_BANK_LOCAL       cyclic banking for that block (default true)
+#   LCS_FP_UNITS         FP mul/add units allowed per compute task (block area by default)
 #   LCS_TILES            kernel (default): the whole kernel on one tile
 #                        (sodap-tosa-outline-kernel); operators: one accelerator
 #                        per operator, today tosa.matmul, launched once per
@@ -305,6 +310,47 @@ fi
 # The passes taking top-func find the kernel by the tile's name, and write
 # their files in $TILE.
 section "$ACC_DUMP" "Tile: to nodes and LLVM, mlir-opt"
+# Apply Tommaso's register-blocked organization with explicit lanes and tails,
+# without changing the memory schedule or the reduction order.
+# The block is a hardware configuration, independent of the external shapes.
+REGISTER_TRANSFORM=
+BANK_PREPARE=
+MEMREF_BACKEND=finalize-memref-to-llvm
+COMPUTE_SELECTION=explicit
+if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  BLOCK_FROM_BUDGET=$(python3 "$REPO_DIR/scripts/lcs/compute_budget.py" "$LCS_COMPUTE_LANES")
+  if [[ -z ${LCS_REGISTER_BLOCK:-} ]]; then
+    LCS_REGISTER_BLOCK=$BLOCK_FROM_BUDGET
+    COMPUTE_SELECTION=balanced_factorization
+  fi
+  LCS_FP_UNITS=${LCS_FP_UNITS:-$LCS_COMPUTE_LANES}
+  if [[ ! $LCS_FP_UNITS =~ ^[1-9][0-9]*$ ]] || (( LCS_FP_UNITS > LCS_COMPUTE_LANES )); then
+    echo 'FP units exceed the requested matmul compute budget' >&2; exit 1
+  fi
+fi
+# Explicitly disable the configuration when reusing an output directory that
+# previously held an optimized build; stale metadata must not alter HLS.
+printf '{"enabled":false}\n' > compute_config.json
+if [[ -n ${LCS_REGISTER_BLOCK:-} ]]; then
+  if [[ ! $LCS_REGISTER_BLOCK =~ ^([1-9][0-9]*),([1-9][0-9]*)$ ]]; then
+    echo 'LCS_REGISTER_BLOCK must be positive rows,columns' >&2; exit 1
+  fi
+  MR=${BASH_REMATCH[1]}; NR=${BASH_REMATCH[2]}
+  FP_UNITS=${LCS_FP_UNITS:-$((MR * NR))}
+  if [[ ! $FP_UNITS =~ ^[1-9][0-9]*$ ]] || (( MR * NR > 256 || FP_UNITS > 256 )); then
+    echo 'Register block and FP unit count must be in 1..256' >&2; exit 1
+  fi
+  REGISTER_TRANSFORM="sodap-register-block-matmul{rows=$MR cols=$NR}, canonicalize, cse,"
+  case ${LCS_BANK_LOCAL:-true} in
+    true)
+      BANK_PREPARE="sodap-bank-matmul-buffers{rows=$MR cols=$NR plm-bytes=$TOTAL_PLM_BYTES report=$PWD/compute_storage.json},"
+      MEMREF_BACKEND=sodap-finalize-banked-memrefs-to-llvm ;;
+    false) ;;
+    *) echo 'LCS_BANK_LOCAL must be true or false' >&2; exit 1 ;;
+  esac
+  printf '{"enabled":true,"selection":"%s","register_rows":%s,"register_columns":%s,"fp_units_per_task":%s,"bank_local":%s}\n' \
+    "$COMPUTE_SELECTION" "$MR" "$NR" "$FP_UNITS" "${LCS_BANK_LOCAL:-true}" > compute_config.json
+fi
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     builtin.module(
       sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE},
@@ -313,6 +359,8 @@ step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
         sodap-dataflow-tasks-to-nodes
       ),
       sodap-dataflow-nodes-to-func,
+      $BANK_PREPARE
+      $REGISTER_TRANSFORM
       func.func(
         convert-linalg-to-loops
       ),
@@ -322,12 +370,13 @@ step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
       func.func(
         promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}
       ),
+      $([[ -n $BANK_PREPARE ]] && echo 'func.func(fold-memref-alias-ops),')
       lower-affine,
       convert-scf-to-cf,
       convert-math-to-llvm,
       expand-strided-metadata,
       lower-affine,
-      finalize-memref-to-llvm,
+      $MEMREF_BACKEND,
       convert-func-to-llvm{use-bare-ptr-memref-call-conv=true},
       convert-index-to-llvm,
       convert-cf-to-llvm,
