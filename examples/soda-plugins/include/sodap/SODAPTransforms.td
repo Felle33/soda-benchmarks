@@ -113,7 +113,8 @@ def TileAndFuseOp : Op<Transform_Dialect, "sodap.tile_and_fuse",
     OptionalAttr<ArrayAttr>:$tile_sizes,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$plm_bytes,
     DefaultValuedAttr<I64Attr, "64">:$dma_request_cycles,
-    DefaultValuedAttr<I64Attr, "1">:$dma_word_cycles);
+    DefaultValuedAttr<I64Attr, "1">:$dma_word_cycles,
+    DefaultValuedAttr<I64Attr, "0">:$compute_lanes);
 
   let results = (outs);
 

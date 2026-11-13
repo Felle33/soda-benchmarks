@@ -170,6 +170,9 @@ elif [ -n "${_LCS_PROPOSAL_MAX_TILE:-}" ]; then
 else
   TILE_ATTRS="plm_bytes = ${_LCS_PROPOSAL_PLM_BYTES:-65536} : i64, dma_request_cycles = ${LCS_DMA_REQUEST_CYCLES:-64} : i64, dma_word_cycles = ${LCS_DMA_WORD_CYCLES:-1} : i64"
 fi
+if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  TILE_ATTRS="$TILE_ATTRS, compute_lanes = $LCS_COMPUTE_LANES : i64"
+fi
 if [ -n "$TILE_ATTRS" ]; then
   TILE_PATTERN='tile_and_fuse %tasks {[^}]*}'
   if ! grep -q "$TILE_PATTERN" "$TRANSFORM"; then
@@ -305,7 +308,7 @@ else
     python3 -c "$COST_LINE" "$dir/schedule_cost.json" "$(basename "$dir"): "
   done > tile_cost.txt
 fi
-[ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ] && exit 0
+
 
 # The passes taking top-func find the kernel by the tile's name, and write
 # their files in $TILE.
@@ -314,6 +317,7 @@ section "$ACC_DUMP" "Tile: to nodes and LLVM, mlir-opt"
 # without changing the memory schedule or the reduction order.
 # The block is a hardware configuration, independent of the external shapes.
 REGISTER_TRANSFORM=
+COMPUTE_PREPARE=
 BANK_PREPARE=
 MEMREF_BACKEND=finalize-memref-to-llvm
 COMPUTE_SELECTION=explicit
@@ -323,6 +327,7 @@ if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
     LCS_REGISTER_BLOCK=$BLOCK_FROM_BUDGET
     COMPUTE_SELECTION=balanced_factorization
   fi
+  COMPUTE_PREPARE="sodap-prepare-compute-budget{lanes=$LCS_COMPUTE_LANES report=$PWD/compute_plan.json},"
   LCS_FP_UNITS=${LCS_FP_UNITS:-$LCS_COMPUTE_LANES}
   if [[ ! $LCS_FP_UNITS =~ ^[1-9][0-9]*$ ]] || (( LCS_FP_UNITS > LCS_COMPUTE_LANES )); then
     echo 'FP units exceed the requested matmul compute budget' >&2; exit 1
@@ -351,6 +356,16 @@ if [[ -n ${LCS_REGISTER_BLOCK:-} ]]; then
   printf '{"enabled":true,"selection":"%s","register_rows":%s,"register_columns":%s,"fp_units_per_task":%s,"bank_local":%s}\n' \
     "$COMPUTE_SELECTION" "$MR" "$NR" "$FP_UNITS" "${LCS_BANK_LOCAL:-true}" > compute_config.json
 fi
+if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
+  if [[ -n $COMPUTE_PREPARE ]]; then
+    step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(builtin.module(
+      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE},
+      $OUTSTANDING_LOAD func.func(sodap-dataflow-tasks-to-nodes),
+      sodap-dataflow-nodes-to-func, $COMPUTE_PREPARE ${BANK_PREPARE%,}
+    ))" -o /dev/null
+  fi
+  exit 0
+fi
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     builtin.module(
       sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE},
@@ -359,6 +374,7 @@ step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
         sodap-dataflow-tasks-to-nodes
       ),
       sodap-dataflow-nodes-to-func,
+      $COMPUTE_PREPARE
       $BANK_PREPARE
       $REGISTER_TRANSFORM
       func.func(

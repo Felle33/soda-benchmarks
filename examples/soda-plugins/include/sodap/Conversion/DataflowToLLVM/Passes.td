@@ -67,6 +67,16 @@ def EmitBambuArchitecture :
   let dependentDialects = ["::mlir::sodap::dataflow::DataflowDialect"];
 }
 
+def PrepareComputeBudget : Pass<"sodap-prepare-compute-budget", "::mlir::ModuleOp"> {
+  let summary = "Normalize FP32 contractions and allocate one shared compute budget";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "Whole-accelerator contraction lane budget">,
+    Option<"report", "report", "std::string", "\"\"", "Optional allocation report JSON">
+  ];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect", "::mlir::linalg::LinalgDialect"];
+}
+
 def BankMatmulBuffers : Pass<"sodap-bank-matmul-buffers", "::mlir::ModuleOp"> {
   let summary = "Mark matmul local memories for cyclic banking before register blocking";
   let options = [

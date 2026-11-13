@@ -15,6 +15,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include <numeric>
 
 namespace mlir::sodap {
 #define GEN_PASS_DEF_BANKMATMULBUFFERS
@@ -37,11 +38,14 @@ struct RegisterBlockMatmul : sodap::impl::RegisterBlockMatmulBase<RegisterBlockM
     }
     SmallVector<linalg::MatmulOp> matmuls;
     getOperation().walk([&](linalg::MatmulOp mm) { matmuls.push_back(mm); });
-    if (matmuls.size() > 1) {
+    if (matmuls.size() > 1 && llvm::any_of(matmuls, [](auto op) { return !op->hasAttr("sodap.register_rows"); })) {
       getOperation().emitError("resource-matched register blocking currently supports one matmul per accelerator; allocate a whole-accelerator budget before enabling multiple compute nodes");
       return signalPassFailure();
     }
     for (auto mm : matmuls) {
+      unsigned rows = this->rows, cols = this->cols;
+      if (auto a = mm->getAttrOfType<IntegerAttr>("sodap.register_rows")) rows = a.getInt();
+      if (auto a = mm->getAttrOfType<IntegerAttr>("sodap.register_columns")) cols = a.getInt();
       auto at = dyn_cast<MemRefType>(mm.getInputs()[0].getType());
       auto bt = dyn_cast<MemRefType>(mm.getInputs()[1].getType());
       auto ct = dyn_cast<MemRefType>(mm.getOutputs()[0].getType());
@@ -130,9 +134,10 @@ struct BankMatmulBuffers : sodap::impl::BankMatmulBuffersBase<BankMatmulBuffers>
       getOperation().emitError("bank factors must be positive");
       return signalPassFailure();
     }
-    llvm::MapVector<Value, std::pair<unsigned, unsigned>> banks;
-    bool invalid = false;
+    llvm::MapVector<Value, SmallVector<unsigned>> banks;
+    bool invalid = false, layoutChanged = false;
     auto mark = [&](Value value, unsigned dim, unsigned factor) {
+      if (factor < 2) return;
       while (true) {
         if (auto sub = value.getDefiningOp<memref::SubViewOp>()) {
           auto dropped = sub.getDroppedDims();
@@ -140,58 +145,60 @@ struct BankMatmulBuffers : sodap::impl::BankMatmulBuffersBase<BankMatmulBuffers>
           for (unsigned i = 0; i < dropped.size(); ++i)
             if (!dropped[i] && visible++ == dim) { dim = i; break; }
           value = sub.getSource();
+        } else if (auto expand = value.getDefiningOp<memref::ExpandShapeOp>()) {
+          // Only normalization's insertion of extent-one axes is supported.
+          auto groups = expand.getReassociationIndices(); bool found = false;
+          for (auto [sourceDim,group] : llvm::enumerate(groups))
+            if (llvm::is_contained(group, int64_t(dim))) {
+              for (int64_t axis : group) if (unsigned(axis) != dim && expand.getType().getDimSize(axis) != 1) invalid = true;
+              dim = sourceDim; found = true; break;
+            }
+          if (!found || invalid) { getOperation().emitError("banked expansion must only insert unit dimensions"); invalid = true; return; }
+          value = expand.getSrc();
         } else if (auto cast = value.getDefiningOp<memref::CastOp>()) {
           value = cast.getSource();
         } else break;
       }
       auto type = dyn_cast<MemRefType>(value.getType());
-      if (!type || !type.hasStaticShape() || !type.getLayout().isIdentity()) {
-        getOperation().emitError("banking requires a static identity-layout base buffer");
-        invalid = true;
-        return;
+      if (!type || !type.hasStaticShape() || !type.getLayout().isIdentity() || dim >= unsigned(type.getRank())) {
+        getOperation().emitError("banking requires a static identity-layout base buffer"); invalid = true; return;
       }
-      if (factor < 2) return;
-      auto [it, inserted] = banks.try_emplace(value, dim, factor);
-      if (!inserted && it->second != std::make_pair(dim, factor)) {
-        getOperation().emitError("conflicting bank mappings for a shared buffer");
-        invalid = true;
-      }
+      auto [it, inserted] = banks.try_emplace(value, type.getRank(), 1);
+      unsigned combined = std::lcm(it->second[dim], factor);
+      if (combined > 256) { getOperation().emitError("combined bank factor exceeds supported limit"); invalid = true; return; }
+      if (inserted || combined != it->second[dim]) layoutChanged = true;
+      it->second[dim] = combined;
     };
     getOperation().walk([&](linalg::MatmulOp op) {
-      if (!op.hasPureBufferSemantics()) {
-        op.emitError("banking runs after bufferization"); invalid = true; return;
-      }
-      mark(op.getInputs()[0], 0, rows);
-      mark(op.getInputs()[1], 1, cols);
-      mark(op.getOutputs()[0], 1, cols);
+      if (!op.hasPureBufferSemantics()) { op.emitError("banking runs after bufferization"); invalid = true; return; }
+      unsigned r = rows, c = cols;
+      if (auto a = op->getAttrOfType<IntegerAttr>("sodap.register_rows")) r = a.getInt();
+      if (auto a = op->getAttrOfType<IntegerAttr>("sodap.register_columns")) c = a.getInt();
+      mark(op.getInputs()[0], 0, r);
+      mark(op.getInputs()[1], 1, c);
+      mark(op.getOutputs()[0], 1, c);
     });
     if (invalid) return signalPassFailure();
     if (banks.empty()) return;
-    // Every task sharing the same physical PLM needs the same padded layout.
-    // Propagate through the explicit node call graph before changing any types.
-    bool changed = true;
-    while (changed && !invalid) {
-      changed = false;
+    while (layoutChanged && !invalid) {
+      layoutChanged = false;
       getOperation().walk([&](func::CallOp call) {
         auto callee = getOperation().lookupSymbol<func::FuncOp>(call.getCallee());
         if (!callee || callee.isExternal()) return;
         for (auto [i, operand] : llvm::enumerate(call.getOperands())) {
           auto arg = callee.getArgument(i);
           auto a = banks.find(operand), b = banks.find(arg);
-          if (a != banks.end() && b == banks.end()) {
+          if (a != banks.end()) {
             auto layout = a->second;
-            mark(arg, layout.first, layout.second); changed = true;
-          } else if (b != banks.end() && a == banks.end()) {
-            // The node ABI passes whole local buffers, not interior pointers.
-            if (!isa<MemRefType>(operand.getType()) ||
-                operand.getDefiningOp<memref::SubViewOp>()) {
-              call.emitError("banked node arguments must pass a whole local buffer");
-              invalid = true; continue;
+            for (auto [dim,factor] : llvm::enumerate(layout)) mark(arg, dim, factor);
+          }
+          b = banks.find(arg);
+          if (b != banks.end()) {
+            if (!isa<MemRefType>(operand.getType()) || operand.getDefiningOp<memref::SubViewOp>()) {
+              call.emitError("banked node arguments must pass a whole local buffer"); invalid = true; continue;
             }
             auto layout = b->second;
-            mark(operand, layout.first, layout.second); changed = true;
-          } else if (a != banks.end() && b != banks.end() && a->second != b->second) {
-            call.emitError("inconsistent banking across a node call"); invalid = true;
+            for (auto [dim,factor] : llvm::enumerate(layout)) mark(operand, dim, factor);
           }
         }
       });
@@ -203,10 +210,12 @@ struct BankMatmulBuffers : sodap::impl::BankMatmulBuffersBase<BankMatmulBuffers>
     for (auto [buffer, layout] : banks) {
       auto original = cast<MemRefType>(buffer.getType());
       SmallVector<int64_t> shape(original.getShape());
-      unsigned dim = layout.first, factor = layout.second;
-      int64_t padded = llvm::divideCeil(shape[dim], int64_t(factor)) * factor;
-      if (padded == shape[dim]) continue;
-      shape[dim] = padded;
+      bool padded = false;
+      for (auto [dim,factor] : llvm::enumerate(layout)) {
+        int64_t rounded = llvm::divideCeil(shape[dim], int64_t(factor)) * factor;
+        padded |= rounded != shape[dim]; shape[dim] = rounded;
+      }
+      if (!padded) continue;
       auto physical = MemRefType::get(shape, original.getElementType());
       if (!isa<BlockArgument>(buffer) &&
           !isa<memref::AllocOp, memref::AllocaOp>(buffer.getDefiningOp())) {
@@ -291,8 +300,8 @@ struct BankMatmulBuffers : sodap::impl::BankMatmulBuffersBase<BankMatmulBuffers>
       auto constant = [&](unsigned v) -> Value {
         return b.create<LLVM::ConstantOp>(loc, b.getI32Type(), b.getI32IntegerAttr(v));
       };
-      b.create<LLVM::CallOp>(loc, fn, ValueRange{base, constant(2),
-          constant(layout.second), constant(layout.first + 1)});
+      for (auto [dim,factor] : llvm::enumerate(layout)) if (factor > 1)
+        b.create<LLVM::CallOp>(loc, fn, ValueRange{base, constant(2), constant(factor), constant(dim + 1)});
     }
   }
 };

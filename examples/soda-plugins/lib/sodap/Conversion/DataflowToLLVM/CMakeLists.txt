@@ -1,6 +1,7 @@
 add_mlir_dialect_library(MLIRSODAPDataflowToLLVM
         ConvertDataflowToLLVM.cpp
         BankedMemrefs.cpp
+        ComputeBudget.cpp
         EmitBambuArchitecture.cpp
         Pipelines.cpp
 
