@@ -11,12 +11,18 @@ shopt -s nullglob
 memories=("$generated/bambu_syn/"*.mem)
 if ((${#memories[@]})); then cp "${memories[@]}" "$fixtures/"; fi
 tol=$(sed -n 's/^#define TD_TOL *//p' "$generated/testdata.h")
-iverilog -g2012 -I"$fixtures" -s reusable_gemm_tb \
+adapter="$here/../generated-gemm/sqr_bambu_basic_dma64.sv"
+flags=()
+if grep -q '^dma_abi=packed$' "$generated/layout.txt"; then
+  adapter=$(python3 "$repo/scripts/lcs/native_dma_contract.py" select "$generated" --wrapper thin)
+  flags+=(-DSODAP_PACKED_DMA)
+fi
+iverilog -g2012 "${flags[@]}" -I"$fixtures" -s reusable_gemm_tb \
   -Preusable_gemm_tb.TOL="$tol" \
   -Preusable_gemm_tb.TIMEOUT_CYCLES="${LCS_TIMEOUT_CYCLES:-2000000}" \
   -o "$fixtures/test.vvp" "$generated/bambu_syn/forward_kernel.v" \
   "$generated/bambu_syn/panda_libtech.v" \
-  "$here/../generated-gemm/sqr_bambu_basic_dma64.sv" "$here/dma64_tb.sv"
+  "$adapter" "$here/dma64_tb.sv"
 cd "$fixtures"
 for stall in 0 50000; do
   vvp ./test.vvp +gemm_stall="$stall" | tee "simulation-stall$stall.log"

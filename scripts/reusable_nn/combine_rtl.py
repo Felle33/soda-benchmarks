@@ -16,9 +16,13 @@ root = Path(__file__).resolve().parents[2]
 out = args.hardware / "combined"
 out.mkdir(parents=True, exist_ok=True)
 pieces, manifest = [], {}
+widths = set()
 token = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/|\b[A-Za-z_][\w$]*\b', re.S)
 for kind in ("conv", "add", "gemm"):
     directory = args.hardware / kind / "bambu_syn"
+    module=args.hardware/kind/'hardware.mlir'
+    match=re.search(r'sodap.dma_data_width = (\d+) :',module.read_text()) if module.exists() else None
+    widths.add(int(match[1]) if match else 0)
     files = [directory / f"{kind}_kernel.v", directory / "panda_libtech.v"]
     text = "\n".join(p.read_text() for p in files)
     names = re.findall(r"^module\s+([\w$]+)\b", text, re.M)
@@ -37,7 +41,12 @@ for kind in ("conv", "add", "gemm"):
     pieces.append(text)
     manifest[kind] = {str(p.name): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 (out / "operator_engines.v").write_text("\n".join(pieces))
-shutil.copyfile(root / "examples/esp-validation/reusable-nn/operator_socket.sv", out / "forward_kernel.sv")
+if len(widths)!=1 or next(iter(widths)) not in (0,64):
+    raise ValueError('Operator engines must share one supported transport ABI/width')
+width=next(iter(widths))
+socket=(root/'examples/esp-validation/reusable-nn/operator_socket.sv').read_text()
+(out/'forward_kernel.sv').write_text(socket.replace('parameter PACKED_DMA=0',f'parameter PACKED_DMA={int(bool(width))}'))
+(out/'transport.json').write_text(json.dumps({'abi':2 if width else 1,'dma_data_width':width,'adapter':'packed_dma64' if width else 'legacy_buffered'},indent=2)+'\n')
 subprocess.run(["c++", "-std=c++17", "-I", str(root / "examples/soda-plugins/include"),
                 str(root / "scripts/reusable_nn/print_abi.cpp"), "-o", str(out / "print-abi")], check=True)
 with (out / "operator_abi.svh").open("w") as file:

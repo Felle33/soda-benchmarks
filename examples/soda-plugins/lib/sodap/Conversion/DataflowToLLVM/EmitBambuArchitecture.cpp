@@ -353,6 +353,11 @@ void EmitBambuArchitecture::emitFunction(llvm::raw_ostream &os,
 }
 
 void EmitBambuArchitecture::runOnOperation() {
+  if(auto width=getOperation()->getAttrOfType<IntegerAttr>("sodap.dma_data_width"))
+    if(width.getInt()!=64) {
+      getOperation().emitError("Bambu packed DMA backend supports dma-data-width=64 only; wider widths are compiler-level layouts");
+      return signalPassFailure();
+    }
   auto module = getOperation();
 
   topName = dataflow::getTopName(module, topFunc);

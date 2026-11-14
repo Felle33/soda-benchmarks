@@ -1,3 +1,4 @@
+#include "sodap/ExecutionEngine/DmaTransport.h"
 //===- ESPPasses.cpp - Replace linalg.batch_matmul with ESP calls -*- C++-*-==//
 //
 // This file is licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -504,6 +505,7 @@ struct EspCalls {
   Location loc;
   unsigned dmaWordStride;
   bool profile;
+  unsigned dmaDataWidth = 0;
 
   /// Declares what the calls below use.
   void declare(ModuleOp module) {
@@ -515,7 +517,7 @@ struct EspCalls {
     getOrInsertFunc(module, builder, kEspFreeShared, {}, {i64Ty});
     SmallVector<Type> inTypes{urMemRefF32, i64Ty, i64Ty};
     SmallVector<Type> outTypes{i64Ty, i64Ty, urMemRefF32};
-    if (dmaWordStride != 1) {
+    if (dmaWordStride != 1 || dmaDataWidth) {
       inTypes.push_back(i64Ty);
       outTypes.push_back(i64Ty);
     }
@@ -530,10 +532,12 @@ struct EspCalls {
   }
 
   StringRef copyInName() const {
+    if (dmaDataWidth) return "esp_copy_to_shared_f32_packed";
     return dmaWordStride == 1 ? kEspCopyToSharedF32
                               : "esp_copy_to_shared_f32_strided";
   }
   StringRef copyOutName() const {
+    if (dmaDataWidth) return "esp_copy_from_shared_f32_packed";
     return dmaWordStride == 1 ? kEspCopyFromSharedF32
                               : "esp_copy_from_shared_f32_strided";
   }
@@ -565,17 +569,17 @@ struct EspCalls {
   void copyIn(Value value, Value handle, int64_t offset) {
     Value cast = builder.create<memref::CastOp>(
         loc, UnrankedMemRefType::get(builder.getF32Type(), 0), value);
-    SmallVector<Value> args{cast, handle, constant(offset)};
-    if (dmaWordStride != 1)
-      args.push_back(constant(dmaWordStride));
+    SmallVector<Value> args{cast, handle, constant(dmaDataWidth ? offset * 4 : offset)};
+    if (dmaWordStride != 1 || dmaDataWidth)
+      args.push_back(constant(dmaDataWidth ? dmaDataWidth : dmaWordStride));
     builder.create<func::CallOp>(loc, copyInName(), TypeRange{}, args);
   }
   void copyOut(Value handle, int64_t offset, Value value) {
     Value cast = builder.create<memref::CastOp>(
         loc, UnrankedMemRefType::get(builder.getF32Type(), 0), value);
-    SmallVector<Value> args{handle, constant(offset), cast};
-    if (dmaWordStride != 1)
-      args.push_back(constant(dmaWordStride));
+    SmallVector<Value> args{handle, constant(dmaDataWidth ? offset * 4 : offset), cast};
+    if (dmaWordStride != 1 || dmaDataWidth)
+      args.push_back(constant(dmaDataWidth ? dmaDataWidth : dmaWordStride));
     builder.create<func::CallOp>(loc, copyOutName(), TypeRange{}, args);
   }
   void run() {
@@ -589,13 +593,19 @@ struct EspCalls {
 /// The words of an f32 memref with a static shape and the identity layout in
 /// shared memory, or failure.
 static FailureOr<int64_t> sharedWords(Value value, Location loc,
-                                      unsigned dmaWordStride) {
+                                      unsigned dmaWordStride, unsigned dmaDataWidth = 0) {
   auto type = dyn_cast<MemRefType>(value.getType());
   if (!type || !type.getElementType().isF32() || !type.hasStaticShape() ||
       !type.getLayout().isIdentity())
     return emitError(loc, "expected f32 memrefs with static shapes and the "
                           "identity layout, got ")
            << value.getType();
+  if (dmaDataWidth) {
+    uint64_t words;
+    if (!::sodap::DmaTransport{dmaDataWidth}.tensorWords(type.getShape().data(),type.getRank(),words))
+      return emitError(loc,"invalid packed DMA layout/width or address range");
+    return int64_t(words);
+  }
   return type.getNumElements() * dmaWordStride;
 }
 
@@ -625,7 +635,7 @@ public:
     int64_t words = 0;
     for (BlockArgument arg : function.getArguments()) {
       FailureOr<int64_t> size =
-          sharedWords(arg, function.getLoc(), dmaWordStride);
+          sharedWords(arg, function.getLoc(), dmaWordStride, dmaDataWidth);
       if (failed(size))
         return signalPassFailure();
       offsets.push_back(words);
@@ -645,7 +655,7 @@ public:
     while (!entry.empty())
       entry.back().erase();
     OpBuilder builder = OpBuilder::atBlockEnd(&entry);
-    EspCalls esp{builder, function.getLoc(), dmaWordStride, profile};
+    EspCalls esp{builder, function.getLoc(), dmaWordStride, profile, dmaDataWidth};
     esp.declare(module);
     Value handle = esp.alloc(words);
     esp.mark(kEspProfBegin, kProfPack);
@@ -695,7 +705,7 @@ static void forwardOutParams(dataflow::LaunchOp launch) {
 /// writes copied out after the last; a buffer between two launches stays in
 /// the arena. Each launch passes its shapes, addresses and row strides.
 static LogicalResult lowerInvocations(ModuleOp module,
-                                      MutableArrayRef<dataflow::LaunchOp> launches) {
+                                      MutableArrayRef<dataflow::LaunchOp> launches, unsigned width) {
   SetVector<Value> buffers, read, written;
   for (dataflow::LaunchOp launch : launches) {
     // A matmul: (A, B, M, K, N) outs(C).
@@ -728,8 +738,14 @@ static LogicalResult lowerInvocations(ModuleOp module,
   int64_t bytes = GEMM_HEADER_BYTES;
   for (Value buffer : buffers) {
     offset[buffer] = bytes;
-    bytes += cast<MemRefType>(buffer.getType()).getNumElements() *
-             GEMM_SLOT_BYTES;
+    auto type = cast<MemRefType>(buffer.getType());
+    uint64_t words = 0;
+    if (width) {
+      if (!::sodap::DmaTransport{width}.tensorWords(type.getShape().data(), type.getRank(), words) ||
+          words > (uint64_t(1) << 28))
+        return module.emitError("invalid packed GEMM layout or address overflow");
+      bytes += words * 4;
+    } else bytes += type.getNumElements() * GEMM_SLOT_BYTES;
   }
   if (bytes > (int64_t(1) << 30))
     return module.emitError("GEMM arena exceeds the one-GiB interface limit");
@@ -746,7 +762,8 @@ static LogicalResult lowerInvocations(ModuleOp module,
     b.create<func::FuncOp>(loc, name, b.getFunctionType(inputs, results))
         .setPrivate();
   };
-  declare("esp_gemm_open", {i64, i64}, {i64});
+  StringRef openName = width ? "esp_gemm_open_packed" : "esp_gemm_open";
+  declare(openName, SmallVector<Type>(width ? 3 : 2, i64), {i64});
   declare("esp_gemm_close", {i64}, {});
   declare("esp_gemm_copy_in", {i64, i64, unranked}, {});
   declare("esp_gemm_copy_out", {i64, i64, unranked}, {});
@@ -767,10 +784,9 @@ static LogicalResult lowerInvocations(ModuleOp module,
   };
 
   b.setInsertionPoint(launches.front().getOperation());
-  Value context = b.create<func::CallOp>(
-                       loc, "esp_gemm_open", TypeRange{i64},
-                       ValueRange{constant(bytes), constant(0)})
-                      .getResult(0);
+  SmallVector<Value> openArgs{constant(bytes), constant(0)};
+  if (width) openArgs.push_back(constant(width));
+  Value context = b.create<func::CallOp>(loc, openName, TypeRange{i64}, openArgs).getResult(0);
   for (Value arg : read)
     copy("esp_gemm_copy_in", context, arg);
   Value one = b.create<arith::ConstantFloatOp>(loc, APFloat(1.0f),
@@ -782,8 +798,13 @@ static LogicalResult lowerInvocations(ModuleOp module,
     ValueRange in = launch.getInputs();
     Value a = in[0], rhs = in[1], c = launch.getOuts()[0];
     auto ld = [&](Value m) {
-      return constant(cast<MemRefType>(m.getType()).getDimSize(1) *
-                      GEMM_SLOT_BYTES);
+      int64_t cols = cast<MemRefType>(m.getType()).getDimSize(1);
+      uint64_t words = 0;
+      if (width) {
+        (void)::sodap::DmaTransport{width}.rowWords(cols, words);
+        return constant(words * 4);
+      }
+      return constant(cols * GEMM_SLOT_BYTES);
     };
     b.create<func::CallOp>(
         launch.getLoc(), "esp_gemm_invoke", TypeRange{},
@@ -838,7 +859,7 @@ public:
         }
         forwardOutParams(launch);
       }
-      if (failed(lowerInvocations(module, launches)))
+      if (failed(lowerInvocations(module, launches, dmaDataWidth)))
         return signalPassFailure();
       tiles.front().erase();
       host.setSymName(this->host);
@@ -868,7 +889,7 @@ public:
         return signalPassFailure();
       }
       for (Value operand : launch->getOperands())
-        if (failed(sharedWords(operand, launch.getLoc(), dmaWordStride)))
+        if (failed(sharedWords(operand, launch.getLoc(), dmaWordStride, dmaDataWidth)))
           return signalPassFailure();
       forwardOutParams(launch);
     }
@@ -879,7 +900,7 @@ public:
     int64_t words = 0;
     for (Value operand : launches.front()->getOperands()) {
       FailureOr<int64_t> size =
-          sharedWords(operand, launches.front().getLoc(), dmaWordStride);
+          sharedWords(operand, launches.front().getLoc(), dmaWordStride, dmaDataWidth);
       if (failed(size))
         return signalPassFailure();
       offsets.push_back(words);
@@ -888,7 +909,7 @@ public:
 
     OpBuilder builder(module.getContext());
     builder.setInsertionPoint(launches.front());
-    EspCalls esp{builder, launches.front().getLoc(), dmaWordStride, profile};
+    EspCalls esp{builder, launches.front().getLoc(), dmaWordStride, profile, dmaDataWidth};
     esp.declare(module);
     Value handle = esp.alloc(words);
     for (dataflow::LaunchOp launch : launches) {

@@ -26,6 +26,8 @@
 
 #include "sodap/Dialect/Dataflow/Transforms/Passes.h"
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
+#include "sodap/ExecutionEngine/DmaTransport.h"
+#include "sodap/Dialect/Dataflow/Transforms/PackedDMA.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -57,13 +59,7 @@ using namespace mlir::sodap::dataflow;
 
 namespace {
 
-/// The four streams of the DMA engine.
-struct DMAStreams {
-  Value readCtrl;
-  Value readData;
-  Value writeCtrl;
-  Value writeData;
-};
+using namespace mlir::sodap::dataflow::packed;
 
 /// One copy of a tile of a top argument, and where that argument starts.
 struct Transfer {
@@ -230,16 +226,21 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   }
 }
 
+#include "PackedDMA.inc"
+
 /// Each task of `dispatch` gets the descriptor at its start: the load task
 /// reads it from the DMA at address 0 (one 64-bit slot per field) and writes
 /// it to a stream per other task, which read it from there. Returns each
 /// task's fields, as index values.
 static FailureOr<DenseMap<Operation *, SmallVector<Value>>>
-readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma) {
+readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma,
+               unsigned width, const DenseMap<Operation *, PackedClient> &clients) {
   MLIRContext *ctx = b.getContext();
   Location loc = dispatch.getLoc();
   Block &body = dispatch.getBody().front();
-  SmallVector<TaskOp> tasks = llvm::to_vector(body.getOps<TaskOp>());
+  SmallVector<TaskOp> tasks;
+  for (TaskOp task : body.getOps<TaskOp>())
+    if (!task->hasAttr("sodap.dma_broker")) tasks.push_back(task);
   auto load = llvm::find_if(tasks, [](TaskOp t) { return t->hasAttr("load"); });
   if (load == tasks.end())
     return dispatch.emitOpError("expected a load task to read the descriptor");
@@ -259,38 +260,72 @@ readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma) {
     Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
     Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
     Value count = b.create<arith::ConstantIndexOp>(loc, GEMM_FIELD_COUNT);
-    if (task == *load)
-      b.create<StreamWriteOp>(
-          loc, dma.readCtrl,
-          b.create<arith::ConstantIntOp>(
-              loc, int64_t(GEMM_FIELD_COUNT * GEMM_WORD_STRIDE) << 32, 64));
+    DMAStreams ports = dma;
+    Value meta, notice;
+    if (auto it = clients.find(task); it != clients.end()) {
+      ports = it->second.dma; meta = it->second.meta; notice = it->second.notice;
+    }
+    PackedEmitter e{b, loc, width ? width : 64};
+    if (task == *load) {
+      if (meta) e.write(meta, e.integer(0));
+      e.write(ports.readCtrl, e.request(e.idx(0), e.idx(width
+          ? GEMM_HEADER_BYTES / (width / 8) : GEMM_FIELD_COUNT * GEMM_WORD_STRIDE)));
+      if (notice) e.write(notice, e.integer(1, 8));
+    }
+    if (width && task == *load) {
+      // Descriptor fields retain 64-bit slots independently of payload width.
+      // Buffer the entire header before publishing it to any consumer.
+      e.loop(e.idx(GEMM_HEADER_BYTES / (width / 8)), [&](Value beat) {
+        Value data = e.read(ports.readData);
+        for (unsigned lane = 0; lane < width / 64; ++lane) {
+          Value value = b.create<arith::TruncIOp>(loc, i32,
+              b.create<arith::ShRUIOp>(loc, data, e.integer(lane * 64, width)));
+          Value field = e.add(e.mul(beat, e.idx(width / 64)), e.idx(lane));
+          b.create<memref::StoreOp>(loc, value, local, field);
+        }
+      });
+    }
     auto loop = b.create<scf::ForOp>(loc, c0, count, c1);
     {
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(loop.getBody());
       Value value;
       if (task == *load) {
-        value = b.create<StreamReadOp>(loc, i32, dma.readData).getResult();
-        b.create<StreamReadOp>(loc, i32, dma.readData); // The padding lane.
+        if (width)
+          value = b.create<memref::LoadOp>(loc, local, loop.getInductionVar());
+        else {
+          value = b.create<StreamReadOp>(loc, i32, ports.readData).getResult();
+          b.create<StreamReadOp>(loc, i32, ports.readData);
+        }
         for (TaskOp other : tasks)
-          if (other != *load)
-            b.create<StreamWriteOp>(loc, streams[other], value);
-      } else {
-        value = b.create<StreamReadOp>(loc, i32, streams[task]).getResult();
-      }
+          if (other != *load) e.write(streams[other], value);
+      } else value = e.read(streams[task]);
       b.create<memref::StoreOp>(loc, value, local, loop.getInductionVar());
     }
-    // ponytail: no magic/version check; add William's guard (no work on an
-    // invalid descriptor) once the runtime can send one.
     for (int64_t f = 0; f < GEMM_FIELD_COUNT; ++f) {
       Value word = b.create<memref::LoadOp>(
           loc, local, ValueRange{b.create<arith::ConstantIndexOp>(loc, f)});
       fields[task].push_back(
           b.create<arith::IndexCastUIOp>(loc, b.getIndexType(), word));
     }
+    // Invalid ABI headers do no matrix work. Keep broker EOF outside this
+    // guard so all participants still terminate on an invalid invocation.
+    if (width) {
+      Value valid = e.band(e.eq(fields[task][GEMM_FIELD_MAGIC], e.idx(GEMM_MAGIC)),
+          e.band(e.eq(fields[task][GEMM_FIELD_VERSION], e.idx(GEMM_PACKED_VERSION)),
+                 e.eq(fields[task][GEMM_FIELD_DMA_WIDTH], e.idx(width))));
+      auto guarded = b.create<scf::IfOp>(loc, valid, false);
+      for (Operation *op = guarded->getNextNode(); op && !op->hasTrait<OpTrait::IsTerminator>() &&
+           !op->hasAttr("sodap.dma_eof");) {
+        Operation *next = op->getNextNode();
+        op->moveBefore(guarded.thenBlock()->getTerminator());
+        op = next;
+      }
+    }
   }
   return fields;
 }
+
 
 namespace {
 
@@ -299,6 +334,10 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    if (dmaDataWidth && !::sodap::DmaTransport{dmaDataWidth}.valid()) {
+      module.emitError("dma-data-width must be 64, 128, 256 or 512 (0 selects legacy)");
+      return signalPassFailure();
+    }
     if (wordStride != 1 && wordStride != 2) {
       module.emitError("dma-word-stride must be 1 or 2");
       return signalPassFailure();
@@ -321,8 +360,16 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
       if (failed(collectTransfers(arg, base, transfers)))
         return signalPassFailure();
       regions.set(arg.getArgNumber());
-      if (type.hasStaticShape())
-        base += type.getNumElements() * wordStride;
+      if (type.hasStaticShape()) {
+        uint64_t words=type.getNumElements()*wordStride;
+        if (dmaDataWidth && (!::sodap::DmaTransport{dmaDataWidth}.tensorWords(
+            type.getShape().data(),type.getRank(),words) ||
+            uint64_t(base)+words > uint64_t(UINT32_MAX)*(dmaDataWidth/32))) {
+          module.emitError("packed DMA arena exceeds request address range");
+          return signalPassFailure();
+        }
+        base += words;
+      }
     }
     // The index arguments read from the descriptor.
     SmallVector<std::pair<BlockArgument, int64_t>> scalars;
@@ -336,7 +383,7 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
       }
     bool descriptor = llvm::any_of(
         transfers, [](const Transfer &t) { return t.baseField >= 0; });
-    if (descriptor && wordStride != GEMM_WORD_STRIDE) {
+    if (descriptor && !dmaDataWidth && wordStride != GEMM_WORD_STRIDE) {
       module.emitError("a descriptor needs dma-word-stride=2");
       return signalPassFailure();
     }
@@ -359,7 +406,7 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
     MLIRContext *ctx = &getContext();
     Location loc = top.getLoc();
     auto ctrlType = StreamType::get(ctx, IntegerType::get(ctx, 64), 4);
-    auto dataType = StreamType::get(ctx, IntegerType::get(ctx, 32), 1);
+    auto dataType = StreamType::get(ctx, IntegerType::get(ctx, dmaDataWidth ? dmaDataWidth : 32), 1);
     unsigned next = top.getNumArguments();
     for (Type type : {ctrlType, dataType, ctrlType, dataType})
       top.insertArgument(next++, type, DictionaryAttr::get(ctx), loc);
@@ -368,6 +415,30 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
                    top.getArgument(first + 2), top.getArgument(first + 3)};
 
     OpBuilder b(ctx);
+    DenseMap<Operation*,PackedClient> clients;
+    if (dmaDataWidth) {
+      module->setAttr("sodap.dma_abi", b.getI32IntegerAttr(2));
+      module->setAttr("sodap.dma_data_width", b.getI32IntegerAttr(dmaDataWidth));
+      llvm::SmallPtrSet<Operation*,4> tasks;
+      bool boundary=false;
+      for (const auto &t:transfers) {
+        if(auto task=t.copy->getParentOfType<TaskOp>())tasks.insert(task);
+        boundary |= packedNeedsBoundary(t,dmaDataWidth);
+      }
+      if (boundary && tasks.size()>1) {
+        SmallVector<TaskOp> owners;
+        for (auto &transfer : transfers) {
+          auto task=transfer.copy->getParentOfType<TaskOp>();
+          if (!task) {
+            transfer.copy.emitError("mixed scoped/unscoped DMA owners are unsupported");
+            return signalPassFailure();
+          }
+          if (!llvm::is_contained(owners,task)) owners.push_back(task);
+        }
+        clients=packedBroker(b,top,dma,owners,dmaDataWidth);
+        top->setAttr("sodap.dma_broker",b.getUnitAttr());
+      }
+    }
     DenseMap<Operation *, SmallVector<Value>> fields;
     if (descriptor) {
       auto dispatches = llvm::to_vector(top.front().getOps<DispatchOp>());
@@ -375,7 +446,7 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
         top.emitError("a descriptor needs one dataflow.dispatch");
         return signalPassFailure();
       }
-      auto read = readDescriptor(b, dispatches.front(), dma);
+      auto read = readDescriptor(b, dispatches.front(), dma, dmaDataWidth, clients);
       if (failed(read))
         return signalPassFailure();
       fields = std::move(*read);
@@ -403,7 +474,12 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
       ArrayRef<Value> taskFields;
       if (transfer.baseField >= 0)
         taskFields = fields[transfer.copy->getParentOfType<TaskOp>()];
-      lowerTransfer(b, transfer, dma, wordStride, taskFields);
+      if (dmaDataWidth) {
+        auto task=transfer.copy->getParentOfType<TaskOp>();
+        auto it=clients.find(task);
+        if(it!=clients.end())lowerPackedTransfer(b,transfer,it->second.dma,dmaDataWidth,it->second.meta,it->second.notice,taskFields);
+        else lowerPackedTransfer(b,transfer,dma,dmaDataWidth,{}, {},taskFields);
+      } else lowerTransfer(b, transfer, dma, wordStride, taskFields);
       transfer.copy.erase();
     }
     // A stalled tile publication must complete before the receiver admits

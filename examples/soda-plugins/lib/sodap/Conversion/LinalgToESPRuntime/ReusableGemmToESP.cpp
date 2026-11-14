@@ -4,6 +4,7 @@
 // implementations of ReusableGemmABI.h.
 #include "sodap/SODAPPasses.h"
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
+#include "sodap/ExecutionEngine/DmaTransport.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -51,6 +52,10 @@ public:
   using ReusableGemmToESPBase::ReusableGemmToESPBase;
   void runOnOperation() final {
     ModuleOp module = getOperation();
+    if(dmaDataWidth && !::sodap::DmaTransport{dmaDataWidth}.valid()) {
+      module.emitError("dma-data-width must be 64, 128, 256 or 512");
+      return signalPassFailure();
+    }
     auto function = module.lookupSymbol<func::FuncOp>(kernel);
     if (!function || function.isExternal() ||
         !llvm::hasSingleElement(function.getBody()) || function.getNumResults()) {
@@ -123,6 +128,15 @@ public:
           op.emitError("expected compatible GEMM shapes and a distinct zero-initialized output");
           return signalPassFailure();
         }
+        if(dmaDataWidth) {
+          for(auto pair : {std::make_pair(call.a,call.k),std::make_pair(call.b,call.n),std::make_pair(call.c,call.n)}) {
+            auto rootType=cast<MemRefType>(pair.first.getType());
+            if(!rootType.getRank() || rootType.getShape().back()!=pair.second) {
+              op.emitError("packed GEMM reshape must preserve the innermost matrix dimension");
+              return signalPassFailure();
+            }
+          }
+        }
         for (Value input : {call.a, call.b}) {
           if (!produced.contains(input)) {
             if (!isa<BlockArgument>(input) || filled.contains(input)) {
@@ -166,13 +180,17 @@ public:
     DenseMap<Value, int64_t> offset;
     int64_t bytes = GEMM_HEADER_BYTES;
     for (Value buffer : buffers) {
-      int64_t elements = cast<MemRefType>(buffer.getType()).getNumElements();
-      if (elements > ((1 << 30) - bytes) / GEMM_SLOT_BYTES) {
+      auto type=cast<MemRefType>(buffer.getType());
+      uint64_t words=type.getNumElements()*GEMM_WORD_STRIDE;
+      if(dmaDataWidth && !::sodap::DmaTransport{dmaDataWidth}.tensorWords(type.getShape().data(),type.getRank(),words)) {
+        function.emitError("invalid packed GEMM layout");return signalPassFailure();
+      }
+      if (words > uint64_t((1 << 30) - bytes) / 4) {
         function.emitError("GEMM arena exceeds the one-GiB interface limit");
         return signalPassFailure();
       }
       offset[buffer] = bytes;
-      bytes += elements * GEMM_SLOT_BYTES;
+      bytes += words * 4;
     }
 
     OpBuilder builder(module.getContext());
@@ -188,7 +206,8 @@ public:
       builder.create<func::FuncOp>(loc, name,
           builder.getFunctionType(inputs, results)).setPrivate();
     };
-    declare("esp_gemm_open", {i64, i64}, {i64});
+    StringRef openName=dmaDataWidth?"esp_gemm_open_packed":"esp_gemm_open";
+    declare(openName,SmallVector<Type>(dmaDataWidth?3:2,i64),{i64});
     declare("esp_gemm_close", {i64}, {});
     declare("esp_gemm_copy_in", {i64, i64, unranked}, {});
     declare("esp_gemm_copy_out", {i64, i64, unranked}, {});
@@ -203,8 +222,14 @@ public:
     auto constant = [&](int64_t n) -> Value {
       return builder.create<arith::ConstantIntOp>(loc, n, 64);
     };
-    Value context = builder.create<func::CallOp>(loc, "esp_gemm_open", TypeRange{i64},
-        ValueRange{constant(bytes), constant(instance)}).getResult(0);
+    SmallVector<Value> openArgs{constant(bytes),constant(instance)};
+    if(dmaDataWidth)openArgs.push_back(constant(dmaDataWidth));
+    Value context=builder.create<func::CallOp>(loc,openName,TypeRange{i64},openArgs).getResult(0);
+    auto ld=[&](int64_t cols) {
+      uint64_t words=cols*GEMM_WORD_STRIDE;
+      if(dmaDataWidth)(void)::sodap::DmaTransport{dmaDataWidth}.rowWords(cols,words);
+      return constant(words*4);
+    };
     for (Value arg : function.getArguments()) {
       if (!readArguments.contains(arg)) continue;
       Value cast = builder.create<memref::CastOp>(loc, unranked, arg);
@@ -217,9 +242,8 @@ public:
       auto invoke = builder.create<func::CallOp>(loc, "esp_gemm_invoke", TypeRange{},
           ValueRange{context, constant(offset[call.a]), constant(offset[call.b]),
             constant(offset[call.c]), constant(call.m), constant(call.n), constant(call.k),
-            constant(call.k * GEMM_SLOT_BYTES), constant(call.n * GEMM_SLOT_BYTES),
-            constant(call.n * GEMM_SLOT_BYTES), one, zero});
-      invoke->setAttr("sodap.operator", builder.getStringAttr("gemm_f32_v1"));
+            ld(call.k),ld(call.n),ld(call.n), one, zero});
+      invoke->setAttr("sodap.operator", builder.getStringAttr(dmaDataWidth?"gemm_f32_v2":"gemm_f32_v1"));
       invoke->setAttr("sodap.invocation", builder.getI64IntegerAttr(index));
       invoke->setAttr("sodap.instance", builder.getI64IntegerAttr(instance));
     }

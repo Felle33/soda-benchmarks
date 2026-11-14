@@ -136,6 +136,16 @@ case "$REUSE_BUFFER_BUDGET:$TOTAL_PLM_BYTES" in *[!0-9:]*) echo 'Memory budgets 
 case "$OVERLAP" in true|false) ;; *) echo 'LCS_OVERLAP must be true or false' >&2; exit 1 ;; esac
 [ "$SEQUENTIAL" = true ] && OVERLAP=false
 [ "$OVERLAP" = false ] && SEQUENTIAL=true
+# ABI is explicit; keep legacy generation reproducible. New campaigns select packed.
+DMA_ABI=${LCS_DMA_ABI:-legacy}
+DMA_WIDTH=0
+case "$DMA_ABI" in
+  legacy) if [[ -n ${LCS_DMA_DATA_WIDTH:-} ]]; then echo 'LCS_DMA_DATA_WIDTH requires LCS_DMA_ABI=packed' >&2; exit 1; fi ;;
+  packed)
+    DMA_WIDTH=${LCS_DMA_DATA_WIDTH:-64}
+    case "$DMA_WIDTH" in 64) ;; 128|256|512) echo 'Bambu backend supports packed DMA width 64 only; use MLIR passes for wider layout tests' >&2; exit 1 ;; *) echo 'DMA width must be 64/128/256/512' >&2; exit 1 ;; esac ;;
+  *) echo 'LCS_DMA_ABI must be legacy or packed' >&2; exit 1 ;;
+esac
 WORD_STRIDE=${LCS_DMA_WORD_STRIDE:-2}
 case "$WORD_STRIDE" in 1|2) ;; *) echo "LCS_DMA_WORD_STRIDE must be 1 or 2" >&2; exit 1 ;; esac
 if [ "$TILES" = operators ] && [ "$WORD_STRIDE" != 2 ]; then
@@ -151,6 +161,7 @@ case "$SEQUENTIAL" in true|false) ;; *) echo "LCS_SEQUENTIAL must be true or fal
 [ "$TILES" = operators ] && OUTSTANDING_LOADS=false
 printf 'dma_word_stride=%s\nprofile=%s\noutstanding_loads=%s\nsequential=%s\n' \
   "$WORD_STRIDE" "$PROFILE" "$OUTSTANDING_LOADS" "$SEQUENTIAL" > layout.txt
+printf 'dma_abi=%s\ndma_data_width=%s\n' "$DMA_ABI" "$DMA_WIDTH" >> layout.txt
 printf 'reuse_buffer_budget=%s\nplm_budget=%s\noverlap=%s\n' "$REUSE_BUFFER_BUDGET" "$TOTAL_PLM_BYTES" "$OVERLAP" >> layout.txt
 # Rank proposals using the actual scheduled IR, with the same overlap/reuse
 # policy for both ablation variants. Explicit tile sizes remain reproducible.
@@ -295,7 +306,7 @@ step "$ACC_DUMP" mlir-opt bufferized.mlir $PLUGIN --pass-pipeline="builtin.modul
 
 { grep 'remark: reuse_buffer ' "$ACC_DUMP" || true; } | sed 's/^.*remark: / /' > reuse_decisions.txt
 section "$ACC_DUMP" "Scheduled DMA work and total logical storage"
-REPORT_COST="sodap-dataflow-report-cost{file=schedule_cost.json request-cycles=${LCS_DMA_REQUEST_CYCLES:-64} word-cycles=${LCS_DMA_WORD_CYCLES:-1} dma-word-stride=$WORD_STRIDE plm-bytes=$TOTAL_PLM_BYTES}"
+REPORT_COST="sodap-dataflow-report-cost{dma-data-width=$DMA_WIDTH file=schedule_cost.json request-cycles=${LCS_DMA_REQUEST_CYCLES:-64} word-cycles=${LCS_DMA_WORD_CYCLES:-1} dma-word-stride=$WORD_STRIDE plm-bytes=$TOTAL_PLM_BYTES}"
 COST_LINE='import json,sys; c=json.load(open(sys.argv[1])); print(sys.argv[2] + "dma_cycles = %d, plm_bytes = %d" % (c["dma_cycles"], c["plm_bytes"]))'
 if [ "$TILES" = kernel ]; then
   step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module($REPORT_COST)" -o /dev/null
@@ -359,7 +370,7 @@ fi
 if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
   if [[ -n $COMPUTE_PREPARE ]]; then
     step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(builtin.module(
-      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE},
+      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH},
       $OUTSTANDING_LOAD func.func(sodap-dataflow-tasks-to-nodes),
       sodap-dataflow-nodes-to-func, $COMPUTE_PREPARE ${BANK_PREPARE%,}
     ))" -o /dev/null
@@ -368,7 +379,7 @@ if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
 fi
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     builtin.module(
-      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE},
+      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH},
       $OUTSTANDING_LOAD
       func.func(
         sodap-dataflow-tasks-to-nodes
@@ -416,7 +427,7 @@ step "$HOST_DUMP" mlir-opt acc.mlir $PLUGIN --pass-pipeline="builtin.module(
       tosa-to-linalg
     ),
     $BUFFERIZE,
-    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE}
+    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH}
   )" -o host.mlir
 # forward_kernel's arguments are @forward's, then its results.
 N_ARGS=$(grep -m1 -oE "func.func @$TOP\([^)]*\)" host.mlir | grep -oE '%arg[0-9]+:' | wc -l)

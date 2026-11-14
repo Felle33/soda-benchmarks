@@ -394,6 +394,8 @@ def CopyToDMA :
   let options = [
     Option<"topFunc", "top-func", "std::string", /*default=*/"",
            "Top function of the design (default: the module's name)">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
+           "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"wordStride", "dma-word-stride", "unsigned", /*default=*/"1",
            "32-bit words per shared-memory element; must match host lowering">
   ];
@@ -434,6 +436,7 @@ def BindDims : Pass<"sodap-dataflow-bind-dims", "::mlir::func::FuncOp"> {
 def ReportLCSCost : Pass<"sodap-dataflow-report-cost", "::mlir::ModuleOp"> {
   let summary = "Report static DMA work and allocated storage after LCS scheduling";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport accounting; 0 retains legacy only">,
     Option<"file", "file", "std::string", "\"schedule_cost.json\"", "JSON output" >,
     Option<"requestCycles", "request-cycles", "int64_t", "64", "Cost per row request">,
     Option<"wordCycles", "word-cycles", "int64_t", "1", "Cost per transferred 32-bit word">,

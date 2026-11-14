@@ -279,6 +279,7 @@ def ProfileKernel : Pass<"sodap-profile-kernel", "::mlir::ModuleOp"> {
 def GenerateReusableGemm : Pass<"sodap-generate-reusable-gemm", "::mlir::ModuleOp"> {
   let summary = "Generate a tiled float32 GEMM with runtime dimensions and DMA addresses";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"topName", "top-name", "std::string", "\"forward_kernel\"", "Hardware entry point">,
     Option<"tileM", "tile-m", "int64_t", "4", "Local output row tile extent">,
     Option<"tileN", "tile-n", "int64_t", "4", "Local output column tile extent">,
@@ -293,6 +294,7 @@ def GenerateReusableGemm : Pass<"sodap-generate-reusable-gemm", "::mlir::ModuleO
 def GenerateReusableOperator : Pass<"sodap-generate-reusable-operator", "::mlir::ModuleOp"> {
   let summary = "Generate a reusable convolution or elementwise addition engine";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"kind", "kind", "std::string", "\"conv\"", "conv or add">,
     Option<"pixels", "tile-pixels", "int64_t", "4", "Local output spatial tile">,
     Option<"lanes", "output-lanes", "int64_t", "8", "Parallel convolution output channels">,
@@ -308,6 +310,7 @@ def GenerateReusableOperator : Pass<"sodap-generate-reusable-operator", "::mlir:
 def ReusableGemmToESP : Pass<"sodap-reusable-gemm-to-esp", "::mlir::ModuleOp"> {
   let summary = "Bind a straight-line GEMM graph to one reusable ESP device";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"kernel", "kernel", "std::string", "\"forward_kernel\"", "Host function">,
     Option<"instance", "instance", "int64_t", "0", "Physical instance index">
   ];
@@ -342,6 +345,8 @@ def KernelToESPAccelerator : Pass<"sodap-kernel-to-esp-accelerator", "::mlir::Mo
            "Function to replace">,
     Option<"profile", "profile", "bool", /*default=*/"false",
            "Measure allocation, packing, execution and unpacking">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
+           "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"dmaWordStride", "dma-word-stride", "unsigned", /*default=*/"1",
            "32-bit words per shared-memory element (1 dense, 2 padded for DMA64)">
   ];
@@ -378,6 +383,8 @@ def LaunchesToESP : Pass<"sodap-launches-to-esp", "::mlir::ModuleOp"> {
            "New name of the function holding the launches">,
     Option<"profile", "profile", "bool", /*default=*/"false",
            "Measure allocation, packing, execution and unpacking">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
+           "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"dmaWordStride", "dma-word-stride", "unsigned", /*default=*/"1",
            "32-bit words per shared-memory element (1 dense, 2 padded for DMA64)">
   ];

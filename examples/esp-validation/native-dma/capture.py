@@ -19,10 +19,15 @@ kernel=kernel.replace('@forward_kernel','@reference_tile')
 (out/'tile.mlir').write_text(kernel)
 signature=re.search(r'func.func @reference_tile\((.*?)\) \{',kernel)[1]
 shapes=re.findall(r'memref<((?:\d+x)*)f32>',signature)
+columns=[int(s.split('x')[-2]) if s else 1 for s in shapes]
+layout=dict(line.split('=',1) for line in (host/'layout.txt').read_text().splitlines())
+width=int(layout.get('dma_data_width',0))
 counts=[math.prod(int(n) for n in s.split('x') if n) for s in shapes]
 assert counts and len(counts)==signature.count('%arg')
 (out/'tile_signature.h').write_text('#include <cstddef>\nextern "C" void reference_tile('+','.join('float *' for _ in counts)+');\n'+
  'static const size_t tile_sizes[]={'+','.join(map(str,counts))+'};\n'+
+ 'static const size_t tile_columns[]={'+','.join(map(str,columns))+'};\n'+
+ f'#define PACKED_WIDTH {width}\n'+
  '#define CALL_REFERENCE_TILE(args) reference_tile('+','.join(f'args[{i}].data()' for i in range(len(counts)))+')\n')
 run(['mlir-opt',out/'tile.mlir',*flags,'--pass-pipeline=builtin.module(func.func(sodap-dataflow-tasks-to-nodes),sodap-dataflow-nodes-to-func,func.func(convert-linalg-to-loops),canonicalize)','-o',out/'tile_funcs.mlir'])
 run(['soda-opt',out/'tile_funcs.mlir','--lower-all-to-llvm=use-bare-ptr-memref-call-conv','--convert-func-to-llvm','--reconcile-unrealized-casts','-o',out/'tile_llvm.mlir'])
