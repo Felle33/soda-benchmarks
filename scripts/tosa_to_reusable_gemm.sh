@@ -16,9 +16,20 @@ plugin=${MLIR_PLUGIN_PATH:-$repo/examples/soda-plugins/build/lib/SODAPlugin.so}
 plugins=(--load-dialect-plugin="$plugin" --load-pass-plugin="$plugin")
 profile=${LCS_PROFILE:-false}
 [[ "$profile" == true || "$profile" == false ]]
-[[ ${LCS_DMA_WORD_STRIDE:-2} == 2 ]] || {
-  echo 'Reusable GEMM ABI v1 requires LCS_DMA_WORD_STRIDE=2' >&2; exit 1;
-}
+abi=${LCS_DMA_ABI:-legacy}
+width=0
+version=1
+case "$abi" in
+  legacy)
+    [[ -z ${LCS_DMA_DATA_WIDTH:-} && ${LCS_DMA_WORD_STRIDE:-2} == 2 ]] || {
+      echo 'Legacy GEMM needs stride 2 and no packed DMA width' >&2; exit 1; }
+    ;;
+  packed)
+    width=${LCS_DMA_DATA_WIDTH:-64};version=2
+    [[ $width == 64 ]] || { echo 'Bambu backend supports packed DMA width 64 only' >&2; exit 1; }
+    ;;
+  *) echo 'LCS_DMA_ABI must be legacy or packed' >&2; exit 1 ;;
+esac
 tm=${LCS_GEMM_TILE_M:-4}
 tn=${LCS_GEMM_TILE_N:-4}
 tk=${LCS_GEMM_TILE_K:-4}
@@ -29,7 +40,7 @@ for tile in "$tm" "$tn" "$tk"; do
     echo 'GEMM tile extents must be in [1,128]' >&2; exit 1;
   }
 done
-printf 'mechanism=reusable-gemm\nabi=1\ndma_word_stride=2\nprofile=%s\n' "$profile" > layout.txt
+printf 'mechanism=reusable-gemm\nabi=%s\ndma_word_stride=2\nprofile=%s\ndma_abi=%s\ndma_data_width=%s\n' "$version" "$profile" "$abi" "$width" > layout.txt
 printf 'tile_m=%s\ntile_n=%s\ntile_k=%s\nschedule=%s\n' "$tm" "$tn" "$tk" "$schedule" > schedule.txt
 
 $DOCKER_RUN mlir-opt "$input" --pass-pipeline='builtin.module(
@@ -45,7 +56,7 @@ $DOCKER_RUN soda-opt outlined.mlir -soda-generate-bambu-accelcode=no-aa -canonic
 # No scheduling options enter this pass. Inspect host.mlir for each invocation
 # and its explicit binding to instance zero.
 $DOCKER_RUN mlir-opt kernel.mlir "${plugins[@]}" \
-  --pass-pipeline='builtin.module(sodap-reusable-gemm-to-esp)' -o host.mlir
+  --pass-pipeline="builtin.module(sodap-reusable-gemm-to-esp{dma-data-width=$width})" -o host.mlir
 cp kernel.mlir cpu.mlir
 if [[ "$profile" == true ]]; then
   for ir in host cpu; do
@@ -64,7 +75,7 @@ $DOCKER_RUN mlir-translate --mlir-to-llvmir cpu-llvm.mlir -o 05_cpu_baseline.ll
 # Hardware depends only on the common ABI and the selected implementation.
 printf 'module {}\n' > empty.mlir
 $DOCKER_RUN mlir-opt empty.mlir "${plugins[@]}" \
-  --pass-pipeline="builtin.module(sodap-generate-reusable-gemm{tile-m=$tm tile-n=$tn tile-k=$tk schedule=$schedule},canonicalize,cse)" \
+  --pass-pipeline="builtin.module(sodap-generate-reusable-gemm{dma-data-width=$width tile-m=$tm tile-n=$tn tile-k=$tk schedule=$schedule},canonicalize,cse)" \
   -o accelerator.mlir
 $DOCKER_RUN mlir-opt accelerator.mlir "${plugins[@]}" --pass-pipeline='builtin.module(
   func.func(promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}),
@@ -78,4 +89,5 @@ $DOCKER_RUN mlir-translate --mlir-to-llvmir accelerator-llvm.mlir \
   | $DOCKER_RUN opt -passes=always-inline -S -o 05_hw_acc.ll
 cp "$repo/examples/soda-plugins/include/sodap/ExecutionEngine/ReusableGemmABI.h" interface.h
 sha256sum interface.h 05_hw_acc.ll architecture.xml > hardware-inputs.sha256
+python3 "$repo/scripts/lcs/native_dma_contract.py" record "$PWD"
 echo "Reusable GEMM host and hardware: $PWD"

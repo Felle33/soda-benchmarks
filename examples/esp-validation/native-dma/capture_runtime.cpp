@@ -27,21 +27,36 @@ extern "C" void esp_copy_from_shared_f32_strided(int64_t h,int64_t offset,int64_
   assert(sodap::copyMemRefF32(rank,p,shared,words,offset,false,stride));
   for(int64_t i=0;i<view.numElements;i++) mask.at(offset+i*stride)=2;
 }
+extern "C" void esp_copy_to_shared_f32_packed(int64_t rank,void *p,int64_t h,int64_t off,int64_t width) {
+  assert(h==(int64_t)shared); assert(sodap::copyMemRefF32Packed(rank,p,shared,words*4,off,true,width));
+}
+extern "C" void esp_copy_from_shared_f32_packed(int64_t h,int64_t off,int64_t rank,void *p,int64_t width) {
+  assert(h==(int64_t)shared);assert(sodap::copyMemRefF32Packed(rank,p,shared,words*4,off,false,width));
+  auto v=sodap::decodeMemRefF32(rank,p);uint64_t cols=rank?v.sizes[rank-1]:1,row;
+  assert(sodap::DmaTransport{unsigned(width)}.rowWords(cols,row));
+  for(int64_t i=0;i<v.numElements;i++)mask.at(off/4+(i/cols)*row+i%cols)=2;
+}
 extern "C" void esp_accel_start() {
   before.assign(shared,shared+words); mask.assign(words,1);
   std::vector<std::vector<float>> args;
-  size_t offset=0;
+  size_t offset=0,argno=0;
   for(size_t count:tile_sizes) {
+    uint64_t cols=tile_columns[argno++],row;
+    if(PACKED_WIDTH)sodap::DmaTransport{PACKED_WIDTH}.rowWords(cols,row);
+    else row=2*cols;
     args.emplace_back(count);
-    for(size_t i=0;i<count;i++) memcpy(&args.back()[i],&shared[offset+2*i],4);
-    offset+=2*count;
+    for(size_t i=0;i<count;i++) memcpy(&args.back()[i],&shared[offset+(i/cols)*row+(i%cols)*(PACKED_WIDTH?1:2)],4);
+    offset+=(count/cols)*row;
   }
   assert(offset==words);
   CALL_REFERENCE_TILE(args);
-  offset=0;
+  offset=0;argno=0;
   for(auto &arg:args) {
-    for(size_t i=0;i<arg.size();i++) memcpy(&shared[offset+2*i],&arg[i],4);
-    offset+=2*arg.size();
+    uint64_t cols=tile_columns[argno++],row;
+    if(PACKED_WIDTH)sodap::DmaTransport{PACKED_WIDTH}.rowWords(cols,row);
+    else row=2*cols;
+    for(size_t i=0;i<arg.size();i++) memcpy(&shared[offset+(i/cols)*row+(i%cols)*(PACKED_WIDTH?1:2)],&arg[i],4);
+    offset+=(arg.size()/cols)*row;
   }
   after.assign(shared,shared+words);
 }

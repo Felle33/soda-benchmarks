@@ -121,6 +121,7 @@ struct Tile {
 /// every loop of the yielded ops. Loop ids follow the yielded ops' order.
 struct TileModel {
   ::mlir::SmallVector<int64_t> ranges;
+  ::mlir::SmallVector<int64_t> bankFactors, minimums;
   /// The parallel loops of each yielded op.
   ::mlir::SmallVector<::mlir::SmallVector<int>> parallel;
   ::mlir::SmallVector<Tile> tiles;
@@ -233,7 +234,7 @@ static ::mlir::SmallVector<int64_t> loopRanges(::mlir::linalg::LinalgOp op,
 /// ping-pong buffer, stored a tile at a time if read outside the tasks; values
 /// computed in the nest keep a buffer of their own.
 static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
-                                ::llvm::ArrayRef<int64_t> inv = {}) {
+                                ::llvm::ArrayRef<int64_t> inv = {}, int64_t computeLanes = 0) {
   using namespace ::mlir;
   using sodap::dataflow::TaskOp;
   TileModel m;
@@ -242,12 +243,13 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
   for (Operation *op : lasts) {
     auto last = cast<linalg::LinalgOp>(op);
     auto task = op->getParentOfType<TaskOp>();
+    unsigned firstId = m.ranges.size();
     SmallVector<Extent> leaf, fused;
     SmallVector<int> all, parallel;
     for (auto [iterator, range] : llvm::zip_equal(
              last.getIteratorTypesArray(), loopRanges(last, inv))) {
       int id = m.ranges.size();
-      m.ranges.push_back(range);
+      m.ranges.push_back(range); m.bankFactors.push_back(1); m.minimums.push_back(1);
       m.same.insert(id);
       leaf.push_back({id, 0});
       all.push_back(id);
@@ -258,6 +260,24 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
         parallel.push_back(id);
     }
     m.parallel.push_back(parallel);
+    if (computeLanes && last.getNumReductionLoops() && last.getNumDpsInputs() == 2) {
+      auto maps = last.getIndexingMapsArray();
+      auto uses = [&](unsigned operand,unsigned dim) {
+        return llvm::is_contained(maps[operand].getResults(), getAffineDimExpr(dim,last.getContext()));
+      };
+      int left = -1, right = -1;
+      for (auto [d,kind] : llvm::enumerate(last.getIteratorTypesArray())) if (kind == utils::IteratorType::parallel) {
+        if (uses(0,d) && !uses(1,d) && (left < 0 || m.ranges[firstId+d] > m.ranges[firstId+left])) left = d;
+        if (uses(1,d) && !uses(0,d) && (right < 0 || m.ranges[firstId+d] > m.ranges[firstId+right])) right = d;
+      }
+      int64_t rows = 1, cols = computeLanes;
+      if (right < 0) { rows = computeLanes; cols = 1; }
+      else if (left >= 0) for (int64_t f=1; f*f<=computeLanes; ++f) if (!(computeLanes%f)) { rows=f; cols=computeLanes/f; }
+      for (auto [dim,factor] : {std::pair<int,int64_t>{left,rows}, {right,cols}}) if (dim >= 0) {
+        m.bankFactors[firstId+dim] = factor;
+        if (m.ranges[firstId+dim] >= 2*factor) m.minimums[firstId+dim] = factor;
+      }
+    }
 
     for (OpOperand &yielded : task.getYieldOp()->getOpOperands()) {
       if (yielded.get().getDefiningOp() != op)
@@ -328,8 +348,12 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
         whole.push_back(std::max(a.id, b.id));
     }
   }
-  for (int id : whole)
-    m.whole.insert(m.same.getLeaderValue(id));
+  for (int id : whole) m.whole.insert(m.same.getLeaderValue(id));
+  for (unsigned i=0;i<m.ranges.size();++i) for (unsigned j=0;j<m.ranges.size();++j)
+    if (m.same.getLeaderValue(i) == m.same.getLeaderValue(j)) {
+      m.bankFactors[i] = std::lcm(m.bankFactors[i],m.bankFactors[j]);
+      m.minimums[i] = std::max(m.minimums[i],m.minimums[j]);
+    }
   return m;
 }
 
@@ -340,14 +364,16 @@ static std::pair<int64_t, int64_t> tileCost(const TileModel &m,
                                             int64_t wordCycles) {
   int64_t cycles = 0, bytes = 0;
   for (const Tile &tile : m.tiles) {
-    int64_t elements = 1, rows = 1;
+    int64_t elements = 1, rows = 1, physicalElements = 1;
     for (auto [d, extent] : llvm::enumerate(tile.extents)) {
       int64_t n = extent.id < 0 ? extent.fixed : size[extent.id];
       elements *= n;
+      int64_t factor = extent.id < 0 ? 1 : m.bankFactors[extent.id];
+      physicalElements *= llvm::divideCeil(n,factor)*factor;
       if (d + 1 < tile.extents.size())
         rows *= n;
     }
-    bytes += tile.copies * elements * tile.elementBytes;
+    bytes += tile.copies * physicalElements * tile.elementBytes;
     if (!tile.moves)
       continue;
     // CopyToDMA: a request per row, then the row's words.
@@ -395,7 +421,7 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     if (inserted) {
       leaders.push_back(leader);
       SmallVector<int64_t> divisors;
-      for (int64_t d = 1; d <= range; ++d)
+      for (int64_t d = m.minimums[id]; d <= range; ++d)
         if (llvm::all_of(models,
                          [&](const TileModel &each) {
                            return each.ranges[id] % d == 0;
@@ -564,9 +590,9 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
       llvm::to_vector(llvm::make_first_range(lasts));
   SmallVector<TileModel, 1> models;
   if (invocations.empty())
-    models.push_back(buildTileModel(lastOps));
+    models.push_back(buildTileModel(lastOps, {}, getComputeLanes()));
   for (ArrayRef<int64_t> inv : invocations)
-    models.push_back(buildTileModel(lastOps, inv));
+    models.push_back(buildTileModel(lastOps, inv, getComputeLanes()));
   const TileModel &model = models.front();
   // Before tiling replaces the ops.
   SetVector<func::FuncOp> funcs;

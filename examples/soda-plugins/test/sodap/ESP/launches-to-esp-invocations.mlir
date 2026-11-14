@@ -1,3 +1,4 @@
+// RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-launches-to-esp{dma-data-width=64})" | FileCheck %s --check-prefix=PACKED
 // RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-launches-to-esp)" | FileCheck %s
 
 // Two launches of one matmul tile (sodap-join-multiple-tiles): one arena,
@@ -32,3 +33,12 @@ module {
     return
   }
 }
+
+// PACKED-LABEL: func.func @forward_kernel(
+// PACKED: call @esp_gemm_open_packed(%c448_i64, %c0_i64, %c64_i64)
+// PACKED: call @esp_gemm_copy_in(%{{.*}}, %c128_i64
+// PACKED: call @esp_gemm_copy_in(%{{.*}}, %c192_i64
+// PACKED: call @esp_gemm_copy_in(%{{.*}}, %c320_i64
+// PACKED: call @esp_gemm_invoke(%{{.*}}, %c128_i64{{.*}}, %c192_i64{{.*}}, %c256_i64{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %c16_i64
+// PACKED: call @esp_gemm_invoke(%{{.*}}, %c256_i64{{.*}}, %c320_i64{{.*}}, %c384_i64
+// PACKED: call @esp_gemm_copy_out(%{{.*}}, %c384_i64

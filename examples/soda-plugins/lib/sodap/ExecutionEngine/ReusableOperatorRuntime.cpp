@@ -42,9 +42,16 @@ size_t cpuArenaUsed = 0;
 #if defined(__riscv) && defined(SODAP_OP_CPU_ONLY) && !defined(SODAP_OP_CPU_ARENA_BYTES)
 #error Specify SODAP_OP_CPU_ARENA_BYTES for baremetal CPU execution
 #endif
+struct TensorLayout {
+  int64_t offset;
+  uint64_t elements,columns,rowWords,bytes;
+  TensorLayout *next;
+};
 struct Context {
   uint32_t *arena;
-  uint32_t bytes, instance, invocations;
+  uint32_t bytes, instance, invocations, dmaWidth;
+  TensorLayout *layouts, *recent[4];
+  unsigned recentIndex;
   bool running;
   int64_t outputOffset;
   uint64_t outputElements;
@@ -88,6 +95,17 @@ Context &lookup(int64_t handle) {
     if (reinterpret_cast<intptr_t>(p) == handle) return *p;
   fail("invalid context handle");
 }
+TensorLayout &layout(Context &ctx,int64_t offset) {
+  for(auto *p:ctx.recent) if(p && p->offset==offset)return *p;
+  for(auto *p=ctx.layouts;p;p=p->next)if(p->offset==offset) {
+    ctx.recent[ctx.recentIndex++%4]=p;return *p;
+  }
+  fail("packed tensor layout is not registered");
+}
+void columns(Context &ctx,int64_t offset,uint64_t count) {
+  if(ctx.dmaWidth && layout(ctx,offset).columns!=count)
+    fail("operator shape disagrees with packed tensor row layout");
+}
 uint64_t product(std::initializer_list<int64_t> dimensions) {
   uint64_t count = 1;
   for (int64_t extent : dimensions) {
@@ -98,6 +116,11 @@ uint64_t product(std::initializer_list<int64_t> dimensions) {
   return count;
 }
 uint64_t check(Context &ctx, int64_t offset, uint64_t elements) {
+  if(ctx.dmaWidth) {
+    auto &t=layout(ctx,offset);
+    if(ctx.running || elements>t.elements)fail("packed tensor exceeds registered layout");
+    return offset+t.bytes;
+  }
   if (ctx.running || offset < 0 || offset % OP_SLOT_BYTES ||
       uint64_t(offset) > ctx.bytes - OP_HEADER_BYTES ||
       elements > (ctx.bytes - OP_HEADER_BYTES - offset) / OP_SLOT_BYTES)
@@ -115,21 +138,30 @@ void spatial(std::initializer_list<int64_t> values, bool allowZero = false) {
     if (v < (allowZero ? 0 : 1) || v > (1 << 20))
       fail("invalid spatial parameter");
 }
-uint32_t address(int64_t offset) { return (offset + OP_HEADER_BYTES) / 4; }
+uint32_t wordAddress(int64_t offset) { return (offset + OP_HEADER_BYTES) / 4; }
+uint32_t wireAddress(Context &ctx,int64_t offset) {
+  return ctx.dmaWidth ? offset+OP_HEADER_BYTES : wordAddress(offset);
+}
+uint64_t elementAddress(Context &ctx,int64_t offset,uint64_t index) {
+  if(!ctx.dmaWidth)return wordAddress(offset)+index*2;
+  auto &t=layout(ctx,offset);
+  if(index>=t.elements)fail("packed tensor index exceeds layout");
+  return wordAddress(offset)+(index/t.columns)*t.rowWords+index%t.columns;
+}
 float read(Context &ctx, int64_t offset, uint64_t index) {
   float value;
 #ifdef SODAP_OP_CPU_ONLY
   // GCC 8 otherwise expands memcpy from the arena into byte loads and stack
   // stores. An explicit aligned word access preserves ordinary float loads.
-  uint32_t bits = ctx.arena[address(offset) + index * 2];
+  uint32_t bits = ctx.arena[elementAddress(ctx,offset,index)];
   std::memcpy(&value, &bits, 4);
 #else
-  std::memcpy(&value, ctx.arena + address(offset) + index * 2, 4);
+  std::memcpy(&value, ctx.arena + elementAddress(ctx,offset,index), 4);
 #endif
   return value;
 }
 void write(Context &ctx, int64_t offset, uint64_t index, float value) {
-  auto *p = ctx.arena + address(offset) + index * 2;
+  auto *p = ctx.arena + elementAddress(ctx,offset,index);
 #ifdef SODAP_OP_CPU_ONLY
   uint32_t bits;
   std::memcpy(&bits, &value, 4);
@@ -137,7 +169,7 @@ void write(Context &ctx, int64_t offset, uint64_t index, float value) {
 #else
   std::memcpy(p, &value, 4);
 #endif
-  p[1] = 0;
+  if(!ctx.dmaWidth)p[1] = 0;
 }
 float activation(float value, int64_t relu) {
   if (!relu) return value;
@@ -146,7 +178,8 @@ float activation(float value, int64_t relu) {
 void header(Context &ctx, uint32_t magic) {
   std::memset(ctx.arena, 0, OP_HEADER_BYTES);
   ctx.arena[0] = magic;
-  ctx.arena[2] = OP_VERSION;
+  ctx.arena[2] = ctx.dmaWidth ? OP_PACKED_VERSION : OP_VERSION;
+  if(ctx.dmaWidth)ctx.arena[2*OP_DMA_WIDTH]=ctx.dmaWidth;
 }
 void field(Context &ctx, unsigned index, uint32_t value) { ctx.arena[index * 2] = value; }
 bool launch(Context &ctx, const char *kind, int64_t outputOffset, uint64_t outputElements) {
@@ -186,7 +219,7 @@ void complete(Context &ctx) {
   auto *expected=static_cast<float *>(allocate(ctx.outputElements*sizeof(float)));
   for(uint64_t i=0;i<ctx.outputElements;++i) {
     expected[i]=read(ctx,ctx.outputOffset,i);
-    ctx.arena[address(ctx.outputOffset)+2*i]=0x7fc00000;
+    ctx.arena[elementAddress(ctx,ctx.outputOffset,i)]=0x7fc00000;
   }
   esp_op_execute_rtl(ctx.arena,ctx.bytes);
   float maxError=0;
@@ -206,7 +239,7 @@ void complete(Context &ctx) {
 #ifdef SODAP_OP_TRACE
   std::printf("OP_OUTPUT call=%u",ctx.invocations);
   for(uint64_t i=0;i<std::min(ctx.outputElements,uint64_t(16));++i)
-    std::printf(" %x",ctx.arena[address(ctx.outputOffset)+2*i]);
+    std::printf(" %x",ctx.arena[elementAddress(ctx,ctx.outputOffset,i)]);
   std::printf("\n");
 #endif
   ctx.running = false;
@@ -218,13 +251,22 @@ void complete(Context &ctx) {
 void copy(int64_t handle, int64_t offset, int64_t rank, void *desc, bool in) {
   Context &ctx = lookup(handle);
   check(ctx, offset, 0);
-  if (!sodap::copyMemRefF32(rank, desc, ctx.arena, ctx.bytes / 4,
-                           address(offset), in, 2)) fail("invalid tensor copy");
+  if(ctx.dmaWidth) {
+    auto &t=layout(ctx,offset);
+    if(!sodap::copyMemRefF32Packed(rank,desc,ctx.arena,
+        OP_HEADER_BYTES+offset+t.bytes,OP_HEADER_BYTES+offset,in,ctx.dmaWidth,t.columns))
+      fail("invalid packed tensor copy");
+  } else if (!sodap::copyMemRefF32(rank, desc, ctx.arena, ctx.bytes / 4,
+                           wordAddress(offset), in, 2)) fail("invalid tensor copy");
 }
 } // namespace
 
-extern "C" int64_t esp_op_open(int64_t bytes, int64_t instance) {
-  if (bytes <= 0 || bytes > (1 << 30) - OP_HEADER_BYTES || bytes % 8 ||
+static int64_t openContext(int64_t bytes,int64_t instance,unsigned width) {
+  if(width && !sodap::DmaTransport{width}.valid())fail("invalid DMA width");
+#ifdef SODAP_OP_ESP_HW
+  if(width && width!=64)fail("ESP backend supports packed DMA64 only");
+#endif
+  if (bytes <= 0 || bytes > (1 << 30) - OP_HEADER_BYTES || bytes % (width?width/8:8) ||
       instance < 0 || instance > UINT32_MAX) fail("invalid arena or instance");
   for (auto *p = live; p; p = p->next)
     if (p->instance == instance) fail("socket already owned");
@@ -232,6 +274,7 @@ extern "C" int64_t esp_op_open(int64_t bytes, int64_t instance) {
   *ctx = {};
   ctx->bytes = bytes + OP_HEADER_BYTES;
   ctx->instance = instance;
+  ctx->dmaWidth=width;
 #ifdef SODAP_OP_ESP_HW
   int count = probe(&ctx->devices, VENDOR_SLD, SODAP_ESP_DEVICE_ID, SODAP_ESP_DEVICE_NAME);
   if (instance >= count) fail("operator socket not found");
@@ -265,6 +308,38 @@ extern "C" int64_t esp_op_open(int64_t bytes, int64_t instance) {
   std::printf("%s open socket=%u arena_bytes=%u engines=conv:1,add:1,gemm:1\n", executionPrefix, ctx->instance, ctx->bytes);
   return reinterpret_cast<intptr_t>(ctx);
 }
+extern "C" int64_t esp_op_open(int64_t bytes,int64_t instance) {
+  return openContext(bytes,instance,0);
+}
+extern "C" int64_t esp_op_open_packed(int64_t bytes,int64_t instance,int64_t width) {
+  if(width<=0 || width>UINT32_MAX || !sodap::DmaTransport{unsigned(width)}.valid())fail("invalid DMA width");
+  return openContext(bytes,instance,unsigned(width));
+}
+extern "C" void esp_op_tensor(int64_t handle,int64_t offset,int64_t elements,int64_t cols) {
+  Context &ctx=lookup(handle);
+  if(!ctx.dmaWidth || ctx.running || offset<0 || offset%(ctx.dmaWidth/8) ||
+      elements<=0 || cols<=0 || elements%cols)fail("invalid packed tensor registration");
+  uint64_t rowWords,bytes;
+  if(!sodap::DmaTransport{ctx.dmaWidth}.rowWords(cols,rowWords) || rowWords>ctx.bytes/4 ||
+      __builtin_mul_overflow(uint64_t(elements/cols),rowWords*4,&bytes) ||
+      uint64_t(offset)>ctx.bytes-OP_HEADER_BYTES || bytes>ctx.bytes-OP_HEADER_BYTES-offset)
+    fail("packed tensor registration exceeds arena");
+  TensorLayout *entry=ctx.layouts;
+  while(entry && entry->offset!=offset)entry=entry->next;
+  if(!entry) {
+    entry=static_cast<TensorLayout *>(allocate(sizeof(TensorLayout)));
+    entry->next=ctx.layouts;ctx.layouts=entry;
+  }
+  entry->offset=offset;entry->elements=elements;entry->columns=cols;
+  entry->rowWords=rowWords;entry->bytes=bytes;
+}
+extern "C" void esp_op_repack(int64_t handle,int64_t a,int64_t c,int64_t elements) {
+  Context &ctx=lookup(handle);
+  auto ae=check(ctx,a,product({elements})),ce=check(ctx,c,product({elements}));
+  disjoint(a,ae,c,ce);
+  for(int64_t i=0;i<elements;++i)write(ctx,c,i,read(ctx,a,i));
+}
+
 extern "C" void esp_op_close(int64_t handle) {
   Context &ctx = lookup(handle);
   if (ctx.running) fail("cannot close a running socket");
@@ -277,6 +352,7 @@ extern "C" void esp_op_close(int64_t handle) {
   release(ctx.pages);
   release(ctx.devices);
 #endif
+  while(ctx.layouts) {auto *next=ctx.layouts->next;release(ctx.layouts);ctx.layouts=next;}
   release(ctx.arena);
   release(&ctx);
 #ifdef SODAP_OP_CPU_ARENA_BYTES
@@ -304,6 +380,7 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
   std::memcpy(&alpha,&bits,4);
   if (!std::isfinite(alpha) || alpha < 0 || alpha > 1) fail("invalid LeakyReLU slope");
   Context &ctx = lookup(handle);
+  columns(ctx,a,ic);columns(ctx,w,ic);columns(ctx,bias,oc);columns(ctx,c,oc);
   auto ae = check(ctx,a,product({n,ih,iw,ic}));
   auto we = check(ctx,w,product({oc,kh,kw,ic}));
   auto be = check(ctx,bias,product({oc}));
@@ -311,13 +388,13 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
   disjoint(a,ae,c,ce); disjoint(w,we,c,ce); disjoint(bias,be,c,ce);
   spatial({sh,sw,dh,dw}); spatial({pt,pl},true);
   header(ctx,OP_CONV_MAGIC);
-  if (mode == OP_ACT_LEAKY_RELU) field(ctx,1,CONV_VERSION);
+  if (!ctx.dmaWidth && mode == OP_ACT_LEAKY_RELU) field(ctx,1,CONV_VERSION);
   const int64_t dims[] = {n,ih,iw,ic,oc,kh,kw,oh,ow,sh,sw,pt,pl,dh,dw,mode};
   for (unsigned i=0;i<16;++i) field(ctx,CONV_N+i,dims[i]);
-  field(ctx,CONV_A,address(a)); field(ctx,CONV_W,address(w));
-  field(ctx,CONV_BIAS,address(bias)); field(ctx,CONV_C,address(c));
+  field(ctx,CONV_A,wireAddress(ctx,a)); field(ctx,CONV_W,wireAddress(ctx,w));
+  field(ctx,CONV_BIAS,wireAddress(ctx,bias)); field(ctx,CONV_C,wireAddress(ctx,c));
   field(ctx,CONV_ALPHA,bits);
-  if (!launch(ctx,"conv",c,(ce-c)/8)) {
+  if (!launch(ctx,"conv",c,product({n,oh,ow,oc}))) {
     for (int64_t batch=0;batch<n;++batch)
       for (int64_t y=0;y<oh;++y)
         for (int64_t x=0;x<ow;++x)
@@ -347,9 +424,14 @@ extern "C" void esp_op_add(int64_t handle, int64_t a, int64_t b, int64_t c,
   Context &ctx=lookup(handle);
   auto size=product({count}), ae=check(ctx,a,size), be=check(ctx,b,size), ce=check(ctx,c,size);
   disjoint(a,ae,c,ce); disjoint(b,be,c,ce); flag(relu);
+  if(ctx.dmaWidth) {
+    columns(ctx,b,layout(ctx,a).columns);columns(ctx,c,layout(ctx,a).columns);
+    if(uint64_t(count)%layout(ctx,a).columns)fail("addition count must contain complete packed rows");
+  }
   header(ctx,OP_ADD_MAGIC);
-  field(ctx,ADD_COUNT,count); field(ctx,ADD_A,address(a)); field(ctx,ADD_B,address(b));
-  field(ctx,ADD_C,address(c)); field(ctx,ADD_RELU,relu);
+  if(ctx.dmaWidth)field(ctx,ADD_COLUMNS,layout(ctx,a).columns);
+  field(ctx,ADD_COUNT,count); field(ctx,ADD_A,wireAddress(ctx,a)); field(ctx,ADD_B,wireAddress(ctx,b));
+  field(ctx,ADD_C,wireAddress(ctx,c)); field(ctx,ADD_RELU,relu);
   if (!launch(ctx,"add",c,count))
     for (int64_t i=0;i<count;++i) write(ctx,c,i,activation(read(ctx,a,i)+read(ctx,b,i),relu));
   complete(ctx);
@@ -357,14 +439,22 @@ extern "C" void esp_op_add(int64_t handle, int64_t a, int64_t b, int64_t c,
 extern "C" void esp_op_gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
     int64_t m, int64_t n, int64_t k) {
   Context &ctx=lookup(handle);
+  columns(ctx,a,k);columns(ctx,b,n);columns(ctx,c,n);
   auto ae=check(ctx,a,product({m,k})), be=check(ctx,b,product({k,n})), ce=check(ctx,c,product({m,n}));
   disjoint(a,ae,c,ce); disjoint(b,be,c,ce);
   header(ctx,GEMM_MAGIC);
   field(ctx,GEMM_FIELD_M,m); field(ctx,GEMM_FIELD_N,n); field(ctx,GEMM_FIELD_K,k);
-  field(ctx,GEMM_FIELD_A,address(a)); field(ctx,GEMM_FIELD_B,address(b)); field(ctx,GEMM_FIELD_C,address(c));
-  field(ctx,GEMM_FIELD_LDA,k*2); field(ctx,GEMM_FIELD_LDB,n*2); field(ctx,GEMM_FIELD_LDC,n*2);
+  field(ctx,GEMM_FIELD_A,wireAddress(ctx,a)); field(ctx,GEMM_FIELD_B,wireAddress(ctx,b)); field(ctx,GEMM_FIELD_C,wireAddress(ctx,c));
+  if(ctx.dmaWidth) {
+    field(ctx,GEMM_FIELD_VERSION,GEMM_PACKED_VERSION);field(ctx,GEMM_FIELD_DMA_WIDTH,ctx.dmaWidth);
+    field(ctx,GEMM_FIELD_LDA,layout(ctx,a).rowWords*4);
+    field(ctx,GEMM_FIELD_LDB,layout(ctx,b).rowWords*4);
+    field(ctx,GEMM_FIELD_LDC,layout(ctx,c).rowWords*4);
+  } else {
+    field(ctx,GEMM_FIELD_LDA,k*2);field(ctx,GEMM_FIELD_LDB,n*2);field(ctx,GEMM_FIELD_LDC,n*2);
+  }
   field(ctx,GEMM_FIELD_ALPHA,0x3f800000); field(ctx,GEMM_FIELD_BETA,0);
-  if (!launch(ctx,"gemm",c,(ce-c)/8))
+  if (!launch(ctx,"gemm",c,product({m,n})))
     for (int64_t i=0;i<m;++i)
       for (int64_t j=0;j<n;++j) {
         float sum=0;

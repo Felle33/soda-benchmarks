@@ -22,6 +22,7 @@ class Simulator {
   uint64_t outputBegin=0,outputEnd=0,cycles=0,reads=0,writes=0;
   uint64_t readyAt=0,latency=0;
   unsigned invocation=0,stallMask=0;
+  bool packed=false;
   uint64_t maxCycles=2000000000ull;
   void tick() {
     bool idle=!readLeft && !writeLeft;
@@ -51,7 +52,7 @@ class Simulator {
     dut.eval();
     if(rd) { ++readAt; --readLeft; ++reads; }
     if(wd) {
-      if(data>>32) fail("nonzero DMA64 padding");
+      if(!packed && data>>32) fail("nonzero DMA64 padding");
       memory[writeAt*2]=uint32_t(data); memory[writeAt*2+1]=uint32_t(data>>32);
       ++writeAt; --writeLeft; ++writes;
     }
@@ -74,12 +75,23 @@ public:
     if(readLeft || writeLeft) fail("previous invocation has outstanding DMA");
     memory=arena; beats=bytes/8;
     auto f=[&](unsigned index)->uint64_t{return arena[index*2];};
-    uint64_t elements=0;
-    if(f(0)==OP_CONV_MAGIC) { outputBegin=f(CONV_C)/2; elements=f(CONV_N)*f(CONV_OH)*f(CONV_OW)*f(CONV_OC); }
-    else if(f(0)==OP_ADD_MAGIC) { outputBegin=f(ADD_C)/2; elements=f(ADD_COUNT); }
-    else if(f(0)==GEMM_MAGIC) { outputBegin=f(GEMM_FIELD_C)/2; elements=f(GEMM_FIELD_M)*f(GEMM_FIELD_N); }
-    else fail("unknown descriptor magic");
-    outputEnd=outputBegin+elements;
+    uint64_t elements=0,columns=0,rows=0,rowBeats=0;
+    packed=f(1)==OP_PACKED_VERSION || (f(0)==GEMM_MAGIC && f(1)==GEMM_PACKED_VERSION);
+    if(packed && f(f(0)==GEMM_MAGIC?GEMM_FIELD_DMA_WIDTH:OP_DMA_WIDTH)!=64)
+      fail("unsupported packed descriptor width");
+    if(f(0)==OP_CONV_MAGIC) {
+      outputBegin=f(CONV_C)/(packed?8:2);columns=f(CONV_OC);rows=f(CONV_N)*f(CONV_OH)*f(CONV_OW);
+    } else if(f(0)==OP_ADD_MAGIC) {
+      outputBegin=f(ADD_C)/(packed?8:2);columns=packed?f(ADD_COLUMNS):f(ADD_COUNT);
+      if(!columns || f(ADD_COUNT)%columns)fail("invalid addition rows");
+      rows=f(ADD_COUNT)/columns;
+    } else if(f(0)==GEMM_MAGIC) {
+      outputBegin=f(GEMM_FIELD_C)/(packed?8:2);columns=f(GEMM_FIELD_N);rows=f(GEMM_FIELD_M);
+      rowBeats=packed?f(GEMM_FIELD_LDC)/8:f(GEMM_FIELD_LDC)/2;
+    } else fail("unknown descriptor magic");
+    elements=rows*columns;
+    if(!rowBeats)rowBeats=packed?(columns+1)/2:columns;
+    outputEnd=outputBegin+(rows-1)*rowBeats+(packed?(columns+1)/2:columns);
     uint64_t start=cycles,oldReads=reads,oldWrites=writes;
     dut.conf_done=1; tick(); dut.conf_done=0;
     do {
@@ -87,7 +99,7 @@ public:
       if(cycles-start>maxCycles) fail("invocation exceeded cycle budget");
     } while(!dut.acc_done);
     if(readLeft || writeLeft) fail("completion precedes DMA drain");
-    if(writes-oldWrites!=elements) fail("incorrect number of output elements");
+    if(!packed && writes-oldWrites!=elements) fail("incorrect number of output elements");
     uint64_t elapsed=cycles-start;
     for(unsigned i=0;i<4;++i) tick();
     std::printf("NN_RTL invocation=%u cycles=%llu read_beats=%llu write_beats=%llu\n",

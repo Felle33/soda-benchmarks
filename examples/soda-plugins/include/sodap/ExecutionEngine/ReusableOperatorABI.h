@@ -4,11 +4,14 @@
 #include <stdint.h>
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
 
-// One instance of each engine shares an ESP socket and a DMA arena. Each header
-// field and f32 occupies the low word of a DMA64 slot. Addresses on the wire
-// count 32-bit words. Public APIs use byte offsets into the DATA area; the
-// runtime adds the private header size. GEMM retains its existing wire format.
+// One instance of each engine shares an ESP socket and a DMA arena. Header
+// fields always occupy the low 32 bits of eight-byte slots. Legacy v1/v2
+// tensors use one FP32 per eight bytes and wire addresses count 32-bit words.
+// Packed v3 tensors use beat-aligned packed rows and byte addresses; field 31
+// records the DMA width. GEMM uses its matching v1/v2 descriptor format.
+// Public APIs use byte offsets into the DATA area; the runtime adds the header.
 enum {
+  OP_PACKED_VERSION = 3, OP_DMA_WIDTH = 31, ADD_COLUMNS = 7,
   OP_VERSION = 1, OP_SLOT_BYTES = 8, OP_HEADER_FIELDS = 32,
   OP_HEADER_BYTES = OP_HEADER_FIELDS * OP_SLOT_BYTES,
   OP_CONV_MAGIC = 0x434f4e56, OP_ADD_MAGIC = 0x41444431,
@@ -24,6 +27,11 @@ enum {
 extern "C" {
 #endif
 int64_t esp_op_open(int64_t data_bytes, int64_t instance);
+int64_t esp_op_open_packed(int64_t data_bytes, int64_t instance, int64_t dma_width);
+// Bind a logical tensor to its physical packed row layout before copying or
+// invoking it. Rebinding an offset is legal after the previous tensor dies.
+void esp_op_tensor(int64_t context, int64_t offset, int64_t elements, int64_t columns);
+void esp_op_repack(int64_t context, int64_t source, int64_t target, int64_t elements);
 void esp_op_close(int64_t context);
 void esp_op_copy_in(int64_t context, int64_t offset, int64_t rank, void *descriptor);
 void esp_op_copy_out(int64_t context, int64_t offset, int64_t rank, void *descriptor);

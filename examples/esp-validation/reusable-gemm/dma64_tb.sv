@@ -37,9 +37,11 @@ module reusable_gemm_tb #(parameter TIMEOUT_CYCLES=2000000, parameter real TOL=0
     cycles<=cycles+1;
     if(cycles>INVOCATIONS*TIMEOUT_CYCLES+1000) $fatal(1,"adapter timeout");
     hold_read<=rdvalid&&!rdready;
+`ifndef SODAP_PACKED_DMA
     if($test$plusargs("trace_config") && cycles<120 && dut.read_full && dut.core_read_ready)
       $display("CONFIG_READ cycle=%0d half=%0d data=%h",cycles,dut.read_half,
                dut.read_half ? dut.read_buffer[63:32] : dut.read_buffer[31:0]);
+`endif
     if(rv&&rr) begin
       if(rl==0 || 2*(ri+rl)>WORDS) $fatal(1,"read bounds");
       raddr<=ri;rleft<=rl;

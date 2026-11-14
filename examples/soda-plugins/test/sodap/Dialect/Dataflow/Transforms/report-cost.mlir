@@ -1,3 +1,5 @@
+// RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-dataflow-report-cost{file=%t.packed.json dma-data-width=64})" -o /dev/null
+// RUN: python3 -c "import json; t=json.load(open('%t.packed.json'))['packed_transport']; assert t['useful_bytes']==96 and t['physical_bytes_min']==t['physical_bytes_max']==96 and t['beats_min']==12 and t['requests_max']==3 and t['rmw_reads_max']==0"
 // RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-dataflow-report-cost{file=%t.json dma-word-stride=2})" -o /dev/null
 // RUN: FileCheck %s < %t.json
 // CHECK: "dma_cycles": 240

@@ -21,7 +21,7 @@ extern "C" {
 namespace {
 struct Context {
   uint32_t *arena;
-  uint32_t bytes, instance, invocations;
+  uint32_t bytes, instance, invocations, dmaWidth;
   bool running;
   Context *next;
 #ifdef __riscv
@@ -50,9 +50,11 @@ void trace(const Context &ctx, const char *kind) {
   if (!file) std::abort();
   uint32_t base = ctx.arena[2 * GEMM_FIELD_C];
   uint32_t stride = ctx.arena[2 * GEMM_FIELD_LDC];
+  if (ctx.dmaWidth) { base /= 4; stride /= 4; }
+  unsigned elementWords = ctx.dmaWidth ? 1 : GEMM_WORD_STRIDE;
   for (unsigned i = 0; i < ctx.bytes / 4; ++i) {
     bool output = i >= base && (i - base) / stride < ctx.arena[2 * GEMM_FIELD_M] &&
-        (i - base) % stride < 2 * ctx.arena[2 * GEMM_FIELD_N] && (i - base) % 2 == 0;
+        (i - base) % stride < elementWords * ctx.arena[2 * GEMM_FIELD_N] && (i - base) % elementWords == 0;
     std::fprintf(file, "%x\n", output ? 2 : 0);
   }
   std::fclose(file);
@@ -99,29 +101,38 @@ void fence() {
 }
 uint64_t endOf(Context &ctx, int64_t offset, int64_t rows,
                int64_t cols, int64_t stride) {
-  if (offset < GEMM_HEADER_BYTES || offset % GEMM_SLOT_BYTES ||
+  const unsigned alignment = ctx.dmaWidth ? ctx.dmaWidth / 8 : GEMM_SLOT_BYTES;
+  const unsigned elementBytes = ctx.dmaWidth ? 4 : GEMM_SLOT_BYTES;
+  if (offset < GEMM_HEADER_BYTES || offset % alignment ||
       rows <= 0 || cols <= 0 || rows > UINT32_MAX || cols > UINT32_MAX ||
-      stride <= 0 || stride % GEMM_SLOT_BYTES || stride > ctx.bytes ||
-      uint64_t(stride) < uint64_t(cols) * GEMM_SLOT_BYTES)
+      stride <= 0 || stride % alignment || stride > ctx.bytes ||
+      uint64_t(stride) < uint64_t(cols) * elementBytes)
     fail("invalid matrix descriptor");
   // Factors are bounded above before multiplication, so this fits uint64_t.
   uint64_t end = uint64_t(offset) + uint64_t(rows - 1) * stride +
-                 uint64_t(cols) * GEMM_SLOT_BYTES;
+                 uint64_t(cols) * elementBytes;
   if (offset > ctx.bytes || end > ctx.bytes) fail("matrix exceeds arena");
   return end;
 }
 void copy(int64_t handle, int64_t offset, int64_t rank, void *descriptor, bool in) {
   Context &ctx = lookup(handle);
-  if (ctx.running || offset < GEMM_HEADER_BYTES || offset % GEMM_SLOT_BYTES ||
-      !sodap::copyMemRefF32(rank, descriptor, ctx.arena, ctx.bytes / 4,
-                            offset / 4, in, GEMM_WORD_STRIDE))
+  if (ctx.running || offset < GEMM_HEADER_BYTES ||
+      (ctx.dmaWidth ? !sodap::copyMemRefF32Packed(rank, descriptor, ctx.arena,
+                           ctx.bytes, offset, in, ctx.dmaWidth)
+                    : offset % GEMM_SLOT_BYTES ||
+                      !sodap::copyMemRefF32(rank, descriptor, ctx.arena, ctx.bytes / 4,
+                                           offset / 4, in, GEMM_WORD_STRIDE)))
     fail("invalid shared-memory copy");
 }
 } // namespace
 
-extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
+static int64_t openContext(int64_t bytes, int64_t instance, unsigned width) {
+  if (width && !sodap::DmaTransport{width}.valid()) fail("invalid DMA width");
+#ifdef __riscv
+  if (width && width != 64) fail("ESP backend supports packed DMA64 only");
+#endif
   if (bytes < GEMM_HEADER_BYTES || bytes > (1 << 30) ||
-      bytes % GEMM_SLOT_BYTES || instance < 0 || instance > UINT32_MAX)
+      bytes % (width ? width / 8 : GEMM_SLOT_BYTES) || instance < 0 || instance > UINT32_MAX)
     fail("invalid arena size or instance");
   for (Context *p = live; p; p = p->next)
     if (p->instance == instance) fail("device instance already owned");
@@ -129,6 +140,7 @@ extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
   *ctx = {};
   ctx->bytes = bytes;
   ctx->instance = instance;
+  ctx->dmaWidth = width;
 #ifdef __riscv
   esp_device *devices = nullptr;
   int count = probe(&devices, VENDOR_SLD, SODAP_ESP_DEVICE_ID, SODAP_ESP_DEVICE_NAME);
@@ -159,8 +171,17 @@ extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
   ctx->next = live;
   live = ctx;
   std::printf("REUSABLE_GEMM open instance=%u arena_bytes=%u abi=%u\n",
-              ctx->instance, ctx->bytes, GEMM_VERSION);
+              ctx->instance, ctx->bytes, width ? GEMM_PACKED_VERSION : GEMM_VERSION);
   return reinterpret_cast<intptr_t>(ctx);
+}
+
+extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
+  return openContext(bytes, instance, 0);
+}
+extern "C" int64_t esp_gemm_open_packed(int64_t bytes, int64_t instance, int64_t width) {
+  if (width <= 0 || width > UINT32_MAX || !sodap::DmaTransport{unsigned(width)}.valid())
+    fail("invalid DMA width");
+  return openContext(bytes, instance, unsigned(width));
 }
 
 extern "C" void esp_gemm_copy_in(int64_t ctx, int64_t offset,
@@ -184,16 +205,18 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
     fail("output overlaps an input");
   uint32_t descriptor[GEMM_FIELD_COUNT] = {};
   descriptor[GEMM_FIELD_MAGIC] = GEMM_MAGIC;
-  descriptor[GEMM_FIELD_VERSION] = GEMM_VERSION;
+  descriptor[GEMM_FIELD_VERSION] = ctx.dmaWidth ? GEMM_PACKED_VERSION : GEMM_VERSION;
+  descriptor[GEMM_FIELD_DMA_WIDTH] = ctx.dmaWidth;
+  const unsigned addressUnit = ctx.dmaWidth ? 1 : 4;
   descriptor[GEMM_FIELD_M] = m;
   descriptor[GEMM_FIELD_N] = n;
   descriptor[GEMM_FIELD_K] = k;
-  descriptor[GEMM_FIELD_A] = a / 4;
-  descriptor[GEMM_FIELD_B] = b / 4;
-  descriptor[GEMM_FIELD_C] = c / 4;
-  descriptor[GEMM_FIELD_LDA] = lda / 4;
-  descriptor[GEMM_FIELD_LDB] = ldb / 4;
-  descriptor[GEMM_FIELD_LDC] = ldc / 4;
+  descriptor[GEMM_FIELD_A] = a / addressUnit;
+  descriptor[GEMM_FIELD_B] = b / addressUnit;
+  descriptor[GEMM_FIELD_C] = c / addressUnit;
+  descriptor[GEMM_FIELD_LDA] = lda / addressUnit;
+  descriptor[GEMM_FIELD_LDB] = ldb / addressUnit;
+  descriptor[GEMM_FIELD_LDC] = ldc / addressUnit;
   std::memcpy(&descriptor[GEMM_FIELD_ALPHA], &alpha, sizeof(float));
   std::memcpy(&descriptor[GEMM_FIELD_BETA], &beta, sizeof(float));
   for (unsigned i = 0; i < GEMM_FIELD_COUNT; ++i) {
@@ -217,7 +240,7 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
   // compiler isolation and arena lifetimes independently of HLS/simulation.
   auto read = [&](int64_t base, int64_t row, int64_t col, int64_t ld) {
     float value;
-    std::memcpy(&value, reinterpret_cast<char *>(ctx.arena) + base + row * ld + col * 8, 4);
+    std::memcpy(&value, reinterpret_cast<char *>(ctx.arena) + base + row * ld + col * (ctx.dmaWidth ? 4 : 8), 4);
     return value;
   };
   for (int64_t i = 0; i < m; ++i)
@@ -227,9 +250,9 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
         sum = sum + read(a, i, q, lda) * read(b, q, j, ldb);
       float value = alpha * sum;
       if (beta != 0) value = value + beta * read(c, i, j, ldc);
-      char *slot = reinterpret_cast<char *>(ctx.arena) + c + i * ldc + j * 8;
+      char *slot = reinterpret_cast<char *>(ctx.arena) + c + i * ldc + j * (ctx.dmaWidth ? 4 : 8);
       std::memcpy(slot, &value, 4);
-      std::memset(slot + 4, 0, 4);
+      if (!ctx.dmaWidth) std::memset(slot + 4, 0, 4);
     }
 #endif
   trace(ctx, "expected");

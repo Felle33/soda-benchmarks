@@ -4,12 +4,16 @@
 
 #include <stdint.h>
 
-// Shared by the MLIR generator and runtime. Each field occupies the low word
-// of one DMA64 slot. Matrix locations/strides on the wire are 32-bit words;
-// the host API uses bytes. No schedule choices occur in this interface.
+// Shared by the MLIR generator and runtime. Descriptor fields always occupy
+// the low 32 bits of an eight-byte slot, independently of the transport width.
+// v1 matrix locations/strides count 32-bit words, with one FP32 per eight bytes.
+// v2 locations/strides count bytes; FP32 rows are packed and beat aligned, and
+// field 13 records the DMA width. Host APIs use bytes in both versions.
+// No schedule choices occur in this interface.
 enum {
   GEMM_MAGIC = 0x47454d4d,
   GEMM_VERSION = 1,
+  GEMM_PACKED_VERSION = 2,
   GEMM_SLOT_BYTES = 8,
   GEMM_WORD_STRIDE = 2,
   GEMM_FIELD_MAGIC = 0,
@@ -25,6 +29,7 @@ enum {
   GEMM_FIELD_LDC,
   GEMM_FIELD_ALPHA,
   GEMM_FIELD_BETA,
+  GEMM_FIELD_DMA_WIDTH, // v2 only; byte addresses/strides, packed FP32 rows.
   GEMM_FIELD_COUNT = 16,
   GEMM_HEADER_BYTES = GEMM_FIELD_COUNT * GEMM_SLOT_BYTES
 };
@@ -33,6 +38,7 @@ enum {
 extern "C" {
 #endif
 int64_t esp_gemm_open(int64_t arena_bytes, int64_t instance);
+int64_t esp_gemm_open_packed(int64_t arena_bytes, int64_t instance, int64_t dma_width);
 void esp_gemm_close(int64_t context);
 void esp_gemm_copy_in(int64_t context, int64_t offset_bytes,
                       int64_t rank, void *descriptor);

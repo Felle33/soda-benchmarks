@@ -115,6 +115,13 @@ def StreamWriteOp : DataflowOp<"stream_write", []> {
   let hasVerifier = 1;
 }
 
+def StreamAvailableOp : DataflowOp<"stream_available", []> {
+  let summary = "Non-consuming readiness probe for one stream element";
+  let arguments = (ins AnyStream:$channel);
+  let results = (outs I1:$result);
+  let assemblyFormat = "$channel attr-dict `:` type($channel)";
+}
+
 def StreamPeekOp : DataflowOp<"stream_peek", []> {
   let summary = "Peek a stream channel";
   let description = [{

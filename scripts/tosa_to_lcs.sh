@@ -29,6 +29,11 @@
 #
 # Environment:
 #   LCS_TRANSFORM        schedules, default scripts/lcs/transform.mlir
+#   LCS_REGISTER_BLOCK   optional compute register block, e.g. 8,8 (off by default)
+#   LCS_COMPUTE_LANES    optional matmul lane budget; choose a balanced factor pair
+#                        unless LCS_REGISTER_BLOCK is explicit (64 gives 8,8)
+#   LCS_BANK_LOCAL       cyclic banking for that block (default true)
+#   LCS_FP_UNITS         FP mul/add units allowed per compute task (block area by default)
 #   LCS_TILES            kernel (default): the whole kernel on one tile
 #                        (sodap-tosa-outline-kernel); operators: one accelerator
 #                        per operator, today tosa.matmul, launched once per
@@ -131,6 +136,16 @@ case "$REUSE_BUFFER_BUDGET:$TOTAL_PLM_BYTES" in *[!0-9:]*) echo 'Memory budgets 
 case "$OVERLAP" in true|false) ;; *) echo 'LCS_OVERLAP must be true or false' >&2; exit 1 ;; esac
 [ "$SEQUENTIAL" = true ] && OVERLAP=false
 [ "$OVERLAP" = false ] && SEQUENTIAL=true
+# ABI is explicit; keep legacy generation reproducible. New campaigns select packed.
+DMA_ABI=${LCS_DMA_ABI:-legacy}
+DMA_WIDTH=0
+case "$DMA_ABI" in
+  legacy) if [[ -n ${LCS_DMA_DATA_WIDTH:-} ]]; then echo 'LCS_DMA_DATA_WIDTH requires LCS_DMA_ABI=packed' >&2; exit 1; fi ;;
+  packed)
+    DMA_WIDTH=${LCS_DMA_DATA_WIDTH:-64}
+    case "$DMA_WIDTH" in 64) ;; 128|256|512) echo 'Bambu backend supports packed DMA width 64 only; use MLIR passes for wider layout tests' >&2; exit 1 ;; *) echo 'DMA width must be 64/128/256/512' >&2; exit 1 ;; esac ;;
+  *) echo 'LCS_DMA_ABI must be legacy or packed' >&2; exit 1 ;;
+esac
 WORD_STRIDE=${LCS_DMA_WORD_STRIDE:-2}
 case "$WORD_STRIDE" in 1|2) ;; *) echo "LCS_DMA_WORD_STRIDE must be 1 or 2" >&2; exit 1 ;; esac
 if [ "$TILES" = operators ] && [ "$WORD_STRIDE" != 2 ]; then
@@ -146,6 +161,7 @@ case "$SEQUENTIAL" in true|false) ;; *) echo "LCS_SEQUENTIAL must be true or fal
 [ "$TILES" = operators ] && OUTSTANDING_LOADS=false
 printf 'dma_word_stride=%s\nprofile=%s\noutstanding_loads=%s\nsequential=%s\n' \
   "$WORD_STRIDE" "$PROFILE" "$OUTSTANDING_LOADS" "$SEQUENTIAL" > layout.txt
+printf 'dma_abi=%s\ndma_data_width=%s\n' "$DMA_ABI" "$DMA_WIDTH" >> layout.txt
 printf 'reuse_buffer_budget=%s\nplm_budget=%s\noverlap=%s\n' "$REUSE_BUFFER_BUDGET" "$TOTAL_PLM_BYTES" "$OVERLAP" >> layout.txt
 # Rank proposals using the actual scheduled IR, with the same overlap/reuse
 # policy for both ablation variants. Explicit tile sizes remain reproducible.
@@ -164,6 +180,9 @@ elif [ -n "${_LCS_PROPOSAL_MAX_TILE:-}" ]; then
   TILE_ATTRS="max_tile_size = $_LCS_PROPOSAL_MAX_TILE : i64"
 else
   TILE_ATTRS="plm_bytes = ${_LCS_PROPOSAL_PLM_BYTES:-65536} : i64, dma_request_cycles = ${LCS_DMA_REQUEST_CYCLES:-64} : i64, dma_word_cycles = ${LCS_DMA_WORD_CYCLES:-1} : i64"
+fi
+if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  TILE_ATTRS="$TILE_ATTRS, compute_lanes = $LCS_COMPUTE_LANES : i64"
 fi
 if [ -n "$TILE_ATTRS" ]; then
   TILE_PATTERN='tile_and_fuse %tasks {[^}]*}'
@@ -287,7 +306,7 @@ step "$ACC_DUMP" mlir-opt bufferized.mlir $PLUGIN --pass-pipeline="builtin.modul
 
 { grep 'remark: reuse_buffer ' "$ACC_DUMP" || true; } | sed 's/^.*remark: / /' > reuse_decisions.txt
 section "$ACC_DUMP" "Scheduled DMA work and total logical storage"
-REPORT_COST="sodap-dataflow-report-cost{file=schedule_cost.json request-cycles=${LCS_DMA_REQUEST_CYCLES:-64} word-cycles=${LCS_DMA_WORD_CYCLES:-1} dma-word-stride=$WORD_STRIDE plm-bytes=$TOTAL_PLM_BYTES}"
+REPORT_COST="sodap-dataflow-report-cost{dma-data-width=$DMA_WIDTH file=schedule_cost.json request-cycles=${LCS_DMA_REQUEST_CYCLES:-64} word-cycles=${LCS_DMA_WORD_CYCLES:-1} dma-word-stride=$WORD_STRIDE plm-bytes=$TOTAL_PLM_BYTES}"
 COST_LINE='import json,sys; c=json.load(open(sys.argv[1])); print(sys.argv[2] + "dma_cycles = %d, plm_bytes = %d" % (c["dma_cycles"], c["plm_bytes"]))'
 if [ "$TILES" = kernel ]; then
   step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module($REPORT_COST)" -o /dev/null
@@ -300,19 +319,75 @@ else
     python3 -c "$COST_LINE" "$dir/schedule_cost.json" "$(basename "$dir"): "
   done > tile_cost.txt
 fi
-[ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ] && exit 0
+
 
 # The passes taking top-func find the kernel by the tile's name, and write
 # their files in $TILE.
 section "$ACC_DUMP" "Tile: to nodes and LLVM, mlir-opt"
+# Apply Tommaso's register-blocked organization with explicit lanes and tails,
+# without changing the memory schedule or the reduction order.
+# The block is a hardware configuration, independent of the external shapes.
+REGISTER_TRANSFORM=
+COMPUTE_PREPARE=
+BANK_PREPARE=
+MEMREF_BACKEND=finalize-memref-to-llvm
+COMPUTE_SELECTION=explicit
+if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  BLOCK_FROM_BUDGET=$(python3 "$REPO_DIR/scripts/lcs/compute_budget.py" "$LCS_COMPUTE_LANES")
+  if [[ -z ${LCS_REGISTER_BLOCK:-} ]]; then
+    LCS_REGISTER_BLOCK=$BLOCK_FROM_BUDGET
+    COMPUTE_SELECTION=balanced_factorization
+  fi
+  COMPUTE_PREPARE="sodap-prepare-compute-budget{lanes=$LCS_COMPUTE_LANES report=$PWD/compute_plan.json},"
+  LCS_FP_UNITS=${LCS_FP_UNITS:-$LCS_COMPUTE_LANES}
+  if [[ ! $LCS_FP_UNITS =~ ^[1-9][0-9]*$ ]] || (( LCS_FP_UNITS > LCS_COMPUTE_LANES )); then
+    echo 'FP units exceed the requested matmul compute budget' >&2; exit 1
+  fi
+fi
+# Explicitly disable the configuration when reusing an output directory that
+# previously held an optimized build; stale metadata must not alter HLS.
+printf '{"enabled":false}\n' > compute_config.json
+if [[ -n ${LCS_REGISTER_BLOCK:-} ]]; then
+  if [[ ! $LCS_REGISTER_BLOCK =~ ^([1-9][0-9]*),([1-9][0-9]*)$ ]]; then
+    echo 'LCS_REGISTER_BLOCK must be positive rows,columns' >&2; exit 1
+  fi
+  MR=${BASH_REMATCH[1]}; NR=${BASH_REMATCH[2]}
+  FP_UNITS=${LCS_FP_UNITS:-$((MR * NR))}
+  if [[ ! $FP_UNITS =~ ^[1-9][0-9]*$ ]] || (( MR * NR > 256 || FP_UNITS > 256 )); then
+    echo 'Register block and FP unit count must be in 1..256' >&2; exit 1
+  fi
+  REGISTER_TRANSFORM="sodap-register-block-matmul{rows=$MR cols=$NR}, canonicalize, cse,"
+  case ${LCS_BANK_LOCAL:-true} in
+    true)
+      BANK_PREPARE="sodap-bank-matmul-buffers{rows=$MR cols=$NR plm-bytes=$TOTAL_PLM_BYTES report=$PWD/compute_storage.json},"
+      MEMREF_BACKEND=sodap-finalize-banked-memrefs-to-llvm ;;
+    false) ;;
+    *) echo 'LCS_BANK_LOCAL must be true or false' >&2; exit 1 ;;
+  esac
+  printf '{"enabled":true,"selection":"%s","register_rows":%s,"register_columns":%s,"fp_units_per_task":%s,"bank_local":%s}\n' \
+    "$COMPUTE_SELECTION" "$MR" "$NR" "$FP_UNITS" "${LCS_BANK_LOCAL:-true}" > compute_config.json
+fi
+if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
+  if [[ -n $COMPUTE_PREPARE ]]; then
+    step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(builtin.module(
+      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH},
+      $OUTSTANDING_LOAD func.func(sodap-dataflow-tasks-to-nodes),
+      sodap-dataflow-nodes-to-func, $COMPUTE_PREPARE ${BANK_PREPARE%,}
+    ))" -o /dev/null
+  fi
+  exit 0
+fi
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     builtin.module(
-      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE},
+      sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH},
       $OUTSTANDING_LOAD
       func.func(
         sodap-dataflow-tasks-to-nodes
       ),
       sodap-dataflow-nodes-to-func,
+      $COMPUTE_PREPARE
+      $BANK_PREPARE
+      $REGISTER_TRANSFORM
       func.func(
         convert-linalg-to-loops
       ),
@@ -322,12 +397,13 @@ step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
       func.func(
         promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}
       ),
+      $([[ -n $BANK_PREPARE ]] && echo 'func.func(fold-memref-alias-ops),')
       lower-affine,
       convert-scf-to-cf,
       convert-math-to-llvm,
       expand-strided-metadata,
       lower-affine,
-      finalize-memref-to-llvm,
+      $MEMREF_BACKEND,
       convert-func-to-llvm{use-bare-ptr-memref-call-conv=true},
       convert-index-to-llvm,
       convert-cf-to-llvm,
@@ -351,7 +427,7 @@ step "$HOST_DUMP" mlir-opt acc.mlir $PLUGIN --pass-pipeline="builtin.module(
       tosa-to-linalg
     ),
     $BUFFERIZE,
-    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE}
+    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH}
   )" -o host.mlir
 # forward_kernel's arguments are @forward's, then its results.
 N_ARGS=$(grep -m1 -oE "func.func @$TOP\([^)]*\)" host.mlir | grep -oE '%arg[0-9]+:' | wc -l)

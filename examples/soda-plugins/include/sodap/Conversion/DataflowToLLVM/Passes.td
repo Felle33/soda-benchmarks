@@ -67,4 +67,48 @@ def EmitBambuArchitecture :
   let dependentDialects = ["::mlir::sodap::dataflow::DataflowDialect"];
 }
 
+def PrepareComputeBudget : Pass<"sodap-prepare-compute-budget", "::mlir::ModuleOp"> {
+  let summary = "Normalize FP32 contractions and allocate one shared compute budget";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "Whole-accelerator contraction lane budget">,
+    Option<"report", "report", "std::string", "\"\"", "Optional allocation report JSON">
+  ];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect", "::mlir::linalg::LinalgDialect"];
+}
+
+def BankMatmulBuffers : Pass<"sodap-bank-matmul-buffers", "::mlir::ModuleOp"> {
+  let summary = "Mark matmul local memories for cyclic banking before register blocking";
+  let options = [
+    Option<"rows", "rows", "unsigned", "8", "A row banks">,
+    Option<"cols", "cols", "unsigned", "8", "B and C column banks">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "0", "Physical local array bytes after padding, zero disables check">,
+    Option<"report", "report", "std::string", "\"\"", "Optional physical storage report JSON">
+  ];
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect",
+    "::mlir::arith::ArithDialect", "::mlir::memref::MemRefDialect"];
+}
+
+def FinalizeBankedMemRefsToLLVM :
+    Pass<"sodap-finalize-banked-memrefs-to-llvm", "::mlir::ModuleOp"> {
+  let summary = "Lower static identity memrefs with array-shaped allocas and full GEPs";
+  let description = [{
+    Opt-in backend for banked memories. Run fold-memref-alias-ops first so
+    subview accesses address the original array with all dimensions. This
+    preserves the shape required by Bambu CSROA. Other memrefs use the standard
+    MLIR conversion. Does not change the bare-pointer function ABI or DMA layout.
+  }];
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
+}
+
+def RegisterBlockMatmul : Pass<"sodap-register-block-matmul", "::mlir::ModuleOp"> {
+  let summary = "Lower matmul to a fully exposed register block with guarded tails";
+  let options = [
+    Option<"rows", "rows", "unsigned", "8", "Register block rows">,
+    Option<"cols", "cols", "unsigned", "8", "Register block columns">
+  ];
+  let dependentDialects = ["::mlir::arith::ArithDialect",
+    "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect"];
+}
+
 #endif // SODAP_CONVERSION_DATAFLOWTOLLVM_PASSES_TD
