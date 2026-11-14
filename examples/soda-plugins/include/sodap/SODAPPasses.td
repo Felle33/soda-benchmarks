@@ -284,10 +284,11 @@ def GenerateReusableGemm : Pass<"sodap-generate-reusable-gemm", "::mlir::ModuleO
     Option<"tileM", "tile-m", "int64_t", "4", "Local output row tile extent">,
     Option<"tileN", "tile-n", "int64_t", "4", "Local output column tile extent">,
     Option<"tileK", "tile-k", "int64_t", "4", "Local reduction tile extent">,
+    Option<"structuredCompute", "structured-compute", "bool", "false", "Keep static local matmul for shared compute-budget transformations; mask runtime tails">,
     Option<"schedule", "schedule", "std::string", "\"sequential\"", "sequential or lcs; independent of the runtime ABI">
   ];
   let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::func::FuncDialect",
-      "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect",
+      "::mlir::linalg::LinalgDialect", "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect",
       "::mlir::sodap::dataflow::DataflowDialect"];
 }
 
@@ -310,6 +311,7 @@ def GenerateReusableOperator : Pass<"sodap-generate-reusable-operator", "::mlir:
 def ReusableGemmToESP : Pass<"sodap-reusable-gemm-to-esp", "::mlir::ModuleOp"> {
   let summary = "Bind a straight-line GEMM graph to one reusable ESP device";
   let options = [
+    Option<"report", "report", "std::string", "\"\"", "Optional JSON invocation and buffer manifest">,
     Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"kernel", "kernel", "std::string", "\"forward_kernel\"", "Host function">,
     Option<"instance", "instance", "int64_t", "0", "Physical instance index">

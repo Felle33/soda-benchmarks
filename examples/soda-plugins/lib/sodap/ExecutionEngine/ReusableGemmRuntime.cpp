@@ -4,6 +4,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef SODAP_GEMM_PROFILE
+#include "sodap/ExecutionEngine/esp_prof.h"
+#include "sodap/ExecutionEngine/ReusableGemmProfile.h"
+extern "C" __attribute__((weak)) void esp_gemm_profile_event(uint32_t, uint32_t) {}
+struct ProfileRegion {
+  uint32_t id;
+  explicit ProfileRegion(uint32_t value) : id(value) { esp_prof_begin(id); }
+  ~ProfileRegion() { esp_prof_end(id); }
+};
+#define GEMM_PROFILE(id) ProfileRegion profileRegion(id)
+#define GEMM_EVENT(begin, invocation) esp_gemm_profile_event(begin, invocation)
+#else
+#define GEMM_PROFILE(id) ((void)0)
+#define GEMM_EVENT(begin, invocation) ((void)0)
+#endif
+#ifdef SODAP_GEMM_QUIET
+#define GEMM_LOG(...) ((void)0)
+#else
+#define GEMM_LOG(...) std::printf(__VA_ARGS__)
+#endif
 
 #ifdef __riscv
 extern "C" {
@@ -127,6 +147,7 @@ void copy(int64_t handle, int64_t offset, int64_t rank, void *descriptor, bool i
 } // namespace
 
 static int64_t openContext(int64_t bytes, int64_t instance, unsigned width) {
+  GEMM_PROFILE(ESP_PROF_ALLOC);
   if (width && !sodap::DmaTransport{width}.valid()) fail("invalid DMA width");
 #ifdef __riscv
   if (width && width != 64) fail("ESP backend supports packed DMA64 only");
@@ -170,7 +191,7 @@ static int64_t openContext(int64_t bytes, int64_t instance, unsigned width) {
   std::memset(ctx->arena, 0, bytes);
   ctx->next = live;
   live = ctx;
-  std::printf("REUSABLE_GEMM open instance=%u arena_bytes=%u abi=%u\n",
+  GEMM_LOG("REUSABLE_GEMM open instance=%u arena_bytes=%u abi=%u\n",
               ctx->instance, ctx->bytes, width ? GEMM_PACKED_VERSION : GEMM_VERSION);
   return reinterpret_cast<intptr_t>(ctx);
 }
@@ -186,10 +207,12 @@ extern "C" int64_t esp_gemm_open_packed(int64_t bytes, int64_t instance, int64_t
 
 extern "C" void esp_gemm_copy_in(int64_t ctx, int64_t offset,
                                  int64_t rank, void *descriptor) {
+  GEMM_PROFILE(ESP_PROF_PACK);
   copy(ctx, offset, rank, descriptor, true);
 }
 extern "C" void esp_gemm_copy_out(int64_t ctx, int64_t offset,
                                   int64_t rank, void *descriptor) {
+  GEMM_PROFILE(ESP_PROF_UNPACK);
   copy(ctx, offset, rank, descriptor, false);
 }
 
@@ -197,6 +220,8 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
     int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
     int64_t ldc, float alpha, float beta) {
   Context &ctx = lookup(handle);
+  GEMM_PROFILE(ESP_PROF_ACCEL);
+  GEMM_EVENT(1, ctx.invocations);
   if (ctx.running) fail("instance is already running");
   uint64_t ae = endOf(ctx, a, m, k, lda), be = endOf(ctx, b, k, n, ldb);
   uint64_t ce = endOf(ctx, c, m, n, ldc);
@@ -225,7 +250,7 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
   }
   ctx.running = true;
   trace(ctx, "initial");
-  std::printf("REUSABLE_GEMM launch=%u instance=%u M=%u N=%u K=%u A=%u B=%u C=%u\n",
+  GEMM_LOG("REUSABLE_GEMM launch=%u instance=%u M=%u N=%u K=%u A=%u B=%u C=%u\n",
       ctx.invocations, ctx.instance, unsigned(m), unsigned(n), unsigned(k),
       unsigned(a), unsigned(b), unsigned(c));
 #ifdef __riscv
@@ -257,14 +282,15 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
 #endif
   trace(ctx, "expected");
   ctx.running = false;
+  GEMM_EVENT(0, ctx.invocations);
   ++ctx.invocations;
-  std::printf("REUSABLE_GEMM complete=%u instance=%u\n", ctx.invocations, ctx.instance);
+  GEMM_LOG("REUSABLE_GEMM complete=%u instance=%u\n", ctx.invocations, ctx.instance);
 }
 
 extern "C" void esp_gemm_close(int64_t handle) {
   Context &ctx = lookup(handle);
   if (ctx.running) fail("cannot close a running instance");
-  std::printf("REUSABLE_GEMM close instance=%u invocations=%u\n", ctx.instance, ctx.invocations);
+  GEMM_LOG("REUSABLE_GEMM close instance=%u invocations=%u\n", ctx.instance, ctx.invocations);
   Context **link = &live;
   while (*link != &ctx) link = &(*link)->next;
   *link = ctx.next;

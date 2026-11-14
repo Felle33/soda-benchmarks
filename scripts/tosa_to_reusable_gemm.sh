@@ -30,6 +30,22 @@ case "$abi" in
     ;;
   *) echo 'LCS_DMA_ABI must be legacy or packed' >&2; exit 1 ;;
 esac
+structured=false
+compute_pipeline=
+memref_backend=finalize-memref-to-llvm
+if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  python3 "$repo/scripts/lcs/reusable_gemm_config.py" "$LCS_COMPUTE_LANES" "${LCS_PLM_BYTES:-327680}" > hardware_selection.json
+  read -r selected_m selected_n selected_k < <(python3 -c 'import json; c=json.load(open("hardware_selection.json")); print(c["tile_m"],c["tile_n"],c["tile_k"])')
+  : "${LCS_GEMM_TILE_M:=$selected_m}" "${LCS_GEMM_TILE_N:=$selected_n}" "${LCS_GEMM_TILE_K:=$selected_k}"
+  structured=true
+  block=$(python3 "$repo/scripts/lcs/compute_budget.py" "$LCS_COMPUTE_LANES")
+  mr=${block%,*}; nr=${block#*,}
+  compute_pipeline="sodap-prepare-compute-budget{lanes=$LCS_COMPUTE_LANES report=$PWD/compute_plan.json},sodap-bank-matmul-buffers{rows=$mr cols=$nr plm-bytes=${LCS_PLM_BYTES:-327680} report=$PWD/compute_storage.json},sodap-register-block-matmul{rows=$mr cols=$nr},canonicalize,cse,func.func(convert-linalg-to-loops),"
+  memref_backend=sodap-finalize-banked-memrefs-to-llvm
+  printf '{"enabled":true,"fp_units_per_task":%s,"selection":"shared_compute_budget"}\n' "$LCS_COMPUTE_LANES" > compute_config.json
+else
+  printf '{"enabled":false}\n' > compute_config.json
+fi
 tm=${LCS_GEMM_TILE_M:-4}
 tn=${LCS_GEMM_TILE_N:-4}
 tk=${LCS_GEMM_TILE_K:-4}
@@ -56,7 +72,7 @@ $DOCKER_RUN soda-opt outlined.mlir -soda-generate-bambu-accelcode=no-aa -canonic
 # No scheduling options enter this pass. Inspect host.mlir for each invocation
 # and its explicit binding to instance zero.
 $DOCKER_RUN mlir-opt kernel.mlir "${plugins[@]}" \
-  --pass-pipeline="builtin.module(sodap-reusable-gemm-to-esp{dma-data-width=$width})" -o host.mlir
+  --pass-pipeline="builtin.module(sodap-reusable-gemm-to-esp{dma-data-width=$width report=$PWD/invocations.json})" -o host.mlir
 cp kernel.mlir cpu.mlir
 if [[ "$profile" == true ]]; then
   for ir in host cpu; do
@@ -75,15 +91,16 @@ $DOCKER_RUN mlir-translate --mlir-to-llvmir cpu-llvm.mlir -o 05_cpu_baseline.ll
 # Hardware depends only on the common ABI and the selected implementation.
 printf 'module {}\n' > empty.mlir
 $DOCKER_RUN mlir-opt empty.mlir "${plugins[@]}" \
-  --pass-pipeline="builtin.module(sodap-generate-reusable-gemm{dma-data-width=$width tile-m=$tm tile-n=$tn tile-k=$tk schedule=$schedule},canonicalize,cse)" \
+  --pass-pipeline="builtin.module(sodap-generate-reusable-gemm{dma-data-width=$width tile-m=$tm tile-n=$tn tile-k=$tk schedule=$schedule structured-compute=$structured},canonicalize,cse)" \
   -o accelerator.mlir
-$DOCKER_RUN mlir-opt accelerator.mlir "${plugins[@]}" --pass-pipeline='builtin.module(
+$DOCKER_RUN mlir-opt accelerator.mlir "${plugins[@]}" --pass-pipeline="builtin.module(
+  $compute_pipeline
   func.func(promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}),
   sodap-emit-bambu-architecture{top-func=forward_kernel file=architecture.xml},
-  sodap-convert-dataflow-to-llvm,lower-affine,convert-scf-to-cf,
+  sodap-convert-dataflow-to-llvm,func.func(fold-memref-alias-ops),lower-affine,convert-scf-to-cf,
   convert-math-to-llvm,expand-strided-metadata,lower-affine,
-  finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=true},
-  convert-index-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts)' -o accelerator-llvm.mlir
+  $memref_backend,convert-func-to-llvm{use-bare-ptr-memref-call-conv=true},
+  convert-index-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts)" -o accelerator-llvm.mlir
 $DOCKER_RUN mlir-translate --mlir-to-llvmir accelerator-llvm.mlir \
   | $DOCKER_RUN llvm-link -S - ac_channel_specializations.ll \
   | $DOCKER_RUN opt -passes=always-inline -S -o 05_hw_acc.ll

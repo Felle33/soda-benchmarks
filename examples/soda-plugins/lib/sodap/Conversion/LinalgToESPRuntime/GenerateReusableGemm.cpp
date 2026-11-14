@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -24,9 +25,9 @@ using namespace dataflow::packed;
 class KernelBuilder {
 public:
   KernelBuilder(OpBuilder &builder, Location location, ValueRange ports,
-                unsigned width=0, PackedClient client={})
+                unsigned width=0, PackedClient client={}, bool structured=false)
       : b(builder), loc(location), rc(ports[0]), rd(ports[1]),
-        wc(ports[2]), wd(ports[3]), width(width) {
+        wc(ports[2]), wd(ports[3]), width(width), structured(structured) {
     if(width) packed.emplace(b,loc,width,client);
   }
 
@@ -74,6 +75,20 @@ public:
   }
   void readTile(Value base, Value stride, Value row, Value col,
                 Value rows, Value cols, Value buffer) {
+    // Public dimensions remain arbitrary. Static local contractions see zeros
+    // outside the active tile; a full tile skips this initialization entirely.
+    if (structured) {
+      auto type=cast<MemRefType>(buffer.getType());
+      Value partial=b.create<arith::OrIOp>(loc,
+          b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ult,rows,idx(type.getDimSize(0))),
+          b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ult,cols,idx(type.getDimSize(1))));
+      auto pad=b.create<scf::IfOp>(loc,partial,false);
+      OpBuilder::InsertionGuard guard(b); b.setInsertionPointToStart(&pad.getThenRegion().front());
+      Value zero=b.create<arith::ConstantFloatOp>(loc,APFloat(0.0f),b.getF32Type());
+      loop(idx(0),idx(type.getDimSize(0)),idx(1),[&](Value i) {
+        loop(idx(0),idx(type.getDimSize(1)),idx(1),[&](Value j) {store(zero,buffer,i,j);});
+      });
+    }
     loop(idx(0), rows, idx(1), [&](Value i) {
       Value address = add(base, add(mul(add(row, i), stride),
                                     mul(col, idx(width ? 4 : GEMM_WORD_STRIDE))));
@@ -81,6 +96,21 @@ public:
       loop(idx(0), cols, idx(1), [&](Value j) {
         store(b.create<arith::BitcastOp>(loc, b.getF32Type(), readWord()),
               buffer, i, j);
+      });
+    });
+  }
+
+  void contract(Value a, Value rhs, Value accum, Value rows, Value cols, Value depth) {
+    if (structured) {
+      b.create<linalg::MatmulOp>(loc,ValueRange{a,rhs},ValueRange{accum});
+      return;
+    }
+    loop(idx(0),rows,idx(1),[&](Value i) {
+      loop(idx(0),cols,idx(1),[&](Value j) {
+        loop(idx(0),depth,idx(1),[&](Value q) {
+          Value product=b.create<arith::MulFOp>(loc,load(a,i,q),load(rhs,q,j));
+          store(b.create<arith::AddFOp>(loc,load(accum,i,j),product),accum,i,j);
+        });
       });
     });
   }
@@ -127,21 +157,14 @@ public:
         Value rows = bound(m, ii, tm);
         loop(idx(0), n, idx(tn), [&](Value jj) {
           Value cols = bound(n, jj, tn);
-          loop(idx(0), rows, idx(1), [&](Value i) {
-            loop(idx(0), cols, idx(1), [&](Value j) { store(zero, accum, i, j); });
+          loop(idx(0), structured ? idx(tm) : rows, idx(1), [&](Value i) {
+            loop(idx(0), structured ? idx(tn) : cols, idx(1), [&](Value j) { store(zero, accum, i, j); });
           });
           loop(idx(0), k, idx(tk), [&](Value kk) {
             Value depth = bound(k, kk, tk);
             readTile(baseA, lda, ii, kk, rows, depth, a);
             readTile(baseB, ldb, kk, jj, depth, cols, rhs);
-            loop(idx(0), rows, idx(1), [&](Value i) {
-              loop(idx(0), cols, idx(1), [&](Value j) {
-                loop(idx(0), depth, idx(1), [&](Value q) {
-                  Value product = b.create<arith::MulFOp>(loc, load(a, i, q), load(rhs, q, j));
-                  store(b.create<arith::AddFOp>(loc, load(accum, i, j), product), accum, i, j);
-                });
-              });
-            });
+            contract(a,rhs,accum,rows,cols,depth);
           });
           auto readC = b.create<scf::IfOp>(loc, hasC, false);
           {
@@ -185,6 +208,7 @@ protected:
   Location loc;
   Value rc, rd, wc, wd;
   unsigned width;
+  bool structured;
   std::optional<PackedAccess> packed;
 };
 
@@ -292,18 +316,11 @@ public:
     Value accum=allocate(tm,tn);
     condition(valid,[&] {
       outputs(tm,tn,[&](Value ii,Value jj,Value rows,Value cols) {
-        fill(accum,rows,cols);
+        fill(accum,structured ? idx(tm) : rows,structured ? idx(tn) : cols);
         loop(idx(0),k,idx(tk),[&](Value kk) {
           Value depth=bound(k,kk,tk);
           tile([&] {
-            loop(idx(0),rows,idx(1),[&](Value i) {
-              loop(idx(0),cols,idx(1),[&](Value j) {
-                loop(idx(0),depth,idx(1),[&](Value q) {
-                  Value product=b.create<arith::MulFOp>(loc,load(a,i,q),load(rhs,q,j));
-                  store(b.create<arith::AddFOp>(loc,load(accum,i,j),product),accum,i,j);
-                });
-              });
-            });
+            contract(a,rhs,accum,rows,cols,depth);
           });
         });
         tile([&] {
@@ -395,7 +412,7 @@ public:
         if(dmaDataWidth) {client.task=op;clients[op]=client;}
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToStart(&op.getBody().front());
-        PipelineBuilder builder(b,module.getLoc(),top.getArguments(),dmaDataWidth,client);
+        PipelineBuilder builder(b,module.getLoc(),top.getArguments(),dmaDataWidth,client,structuredCompute);
         body(builder);
         b.create<dataflow::YieldOp>(module.getLoc());
       };
@@ -432,7 +449,7 @@ public:
     }
     auto engine = b.create<func::FuncOp>(module.getLoc(), "gemm_engine", type);
     b.setInsertionPointToStart(engine.addEntryBlock());
-    KernelBuilder(b, module.getLoc(), engine.getArguments()).build(tileM, tileN, tileK);
+    KernelBuilder(b, module.getLoc(), engine.getArguments(),0,{},structuredCompute).build(tileM, tileN, tileK);
     b.create<func::ReturnOp>(module.getLoc());
     b.setInsertionPointToEnd(module.getBody());
     auto top = b.create<func::FuncOp>(module.getLoc(), topName, type);
