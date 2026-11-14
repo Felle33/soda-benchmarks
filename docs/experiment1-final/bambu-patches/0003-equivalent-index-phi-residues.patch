@@ -1,0 +1,41 @@
+--- a/etc/clang_plugin/plugin_customSROA.cpp
++++ b/etc/clang_plugin/plugin_customSROA.cpp
+@@ -534,8 +534,27 @@
+    ///
+    /// Assuming the recurrence runs long enough to close the coset over-approximates it for a
+    /// short loop, which is the safe direction.
+-   std::optional<std::vector<uint64_t>> residueSet(const SCEV* s, uint64_t modulus, ScalarEvolution& SE, uint64_t cap)
+-   {
++   std::optional<std::vector<uint64_t>> residueSet(const SCEV* s, uint64_t modulus, ScalarEvolution& SE, uint64_t cap, unsigned depth = 0)
++   {
++      if(depth > 16) return std::nullopt;
++      // Branch-local casts can have different poison flags but identical
++      // mathematical SCEVs. A merge of those values has the same residues;
++      // treating it as an unknown creates an unnecessary runtime bank mux.
++      if(auto* unknown = dyn_cast<SCEVUnknown>(s))
++      {
++         if(auto* phi = dyn_cast<PHINode>(unknown->getValue()))
++         {
++            const SCEV* common = nullptr;
++            for(Value* incoming : phi->incoming_values())
++            {
++               const SCEV* expression = SE.getSCEV(incoming);
++               if(expression == s || (common && common != expression)) return std::nullopt;
++               common = expression;
++            }
++            if(common) return residueSet(common, modulus, SE, cap, depth + 1);
++         }
++      }
++
+       if(auto value = constantSCEVValue(s))
+       {
+          return std::vector<uint64_t>{*value % modulus};
+@@ -553,7 +572,7 @@
+       {
+          return std::nullopt;
+       }
+-      auto starts = residueSet(addRec->getStart(), modulus, SE, cap);
++      auto starts = residueSet(addRec->getStart(), modulus, SE, cap, depth + 1);
+       if(!starts)
+       {
+          return std::nullopt;

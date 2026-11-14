@@ -1,0 +1,142 @@
+{
+  "status": "PASS",
+  "verified_at": "2026-11-14T10:52:47.383499-05:00",
+  "last_board_completion": "2026-11-14T05:30:36.841344-05:00",
+  "last_bitstream_completion": "2026-11-14T05:05:55.617830-05:00",
+  "cases": 20,
+  "mini_system_pass": 20,
+  "large_component_pass": 20,
+  "fpga_timing_closed": 20,
+  "fpga_full_output_pass": 20,
+  "overlap_wins_vs_spectra": 9,
+  "overlap_speedup_min": 0.5779537704311688,
+  "overlap_speedup_max": 36.368601313398734,
+  "primary_measurement": "Accelerator start/wait interval including DMA and polling/acknowledgement; excludes host packing and unpacking",
+  "baseline_scope": "Locally synthesized SPECTRA-derived FP32 LARGE baseline on VC707-03; not published paper timings",
+  "rtl_scope": "MINI full-system; LARGE component checks use selected tiles for larger kernels; FPGA checks all output elements",
+  "sampling_scope": "Two GEMM calibration runs per mode; one run for each other case after calibration",
+  "csv_sha256": "f08a7064cea079f66140d334d119be64a9b0585578ceae3ef1eef49ef3e82ff1",
+  "evidence": {
+    "gemm-overlap": {
+      "board_result_sha256": "8ef3dd552a35dcbebb65dffa95b4c346490c3621be84bc1c37230916af53926c",
+      "build_result_sha256": "3e32f1c17f64515f5276701c0cf64df31ae980a2a8cac3ad071c9e24c181d107",
+      "bitstream_sha256": "09545d1372ada469c5ebfc566e4c0f3736ae367882e628ea2805bdc212b934d7",
+      "capacity_sha256": "6f6c0a03e079183882ff3e732e473793d7c818209fcb73d91e53cf6135c843b3"
+    },
+    "gemm-nonoverlap": {
+      "board_result_sha256": "0e402c4b3daca8341826cc0c96f2533ae99c2fa89aa742b00f4c91f363a76ab1",
+      "build_result_sha256": "66dd36f2bee26d4c6d0711be760a5f68bea7b4914ac511c6795935b132e36926",
+      "bitstream_sha256": "5b9cff08de8d39f0552aa887150af98a2e711b80f88b14e45b60a9977afa651e",
+      "capacity_sha256": "be20bcf6e6589d89899221b7754145428d55454f7aaa4c1d63315d9f8da34af9"
+    },
+    "twomm-overlap": {
+      "board_result_sha256": "7b899e83e422119c097853e04f70801458daf3154d8c0d22847e58e1c582d0f1",
+      "build_result_sha256": "76231568d0dea130c9ed08b9c53e0eaf062ee213cba9877b2d474a8c514c375e",
+      "bitstream_sha256": "002528e6246360653c10a20461eacb8a2a8a180a8f6dc392638dc1447d35efbe",
+      "capacity_sha256": "73e74c11c3660187cdca041c2d10d58ed3f8f373e849f266bc9453b1f035214e"
+    },
+    "twomm-nonoverlap": {
+      "board_result_sha256": "3115c99dcf131f2e994359567453895029dd1a5c2da2e9f8961cce3aaca11e1e",
+      "build_result_sha256": "bfceafabe2bcd9f00360ff251577148fdbd728e96a7049d647ef93b04289c73e",
+      "bitstream_sha256": "230e68197d8b0180b6d7f9bc39d0a3e9a6b20274f87a5845c2a3b070a0cbc85e",
+      "capacity_sha256": "c3472451c54c2c62a6de9da213b0b4341c986b8493abb2ec3be3bdca7c63f814"
+    },
+    "threemm-overlap": {
+      "board_result_sha256": "e06a929b1d1cc45e421003b7893688831be8c43f27e9daffb45d5ea70af3025b",
+      "build_result_sha256": "874395e3e2d74c9b940245838aa64f8edd80ee0128b75d5f63fb1dab25686b0f",
+      "bitstream_sha256": "336fb7225a3adad23014b0f15726135418ceb22969f8a24699d8af6b65d4de58",
+      "capacity_sha256": "dfe13638fc45e1a78556c8eed2c1dafd5059e82cf65751048d909ac1654e0efc"
+    },
+    "threemm-nonoverlap": {
+      "board_result_sha256": "cefe9c07e4ed102eedfdce263eb4918ebe3ef19aaa2ec547e7a72c0e8e38e5c0",
+      "build_result_sha256": "d2f8089e6b6c85654290d36e6e448cd19232ca04e0a2c63330d8acd9a6d5f68d",
+      "bitstream_sha256": "45fad66dc5d2eed9b539c4e9881e51aa4e8d4b5e8ce78389e990ae22b1fd044c",
+      "capacity_sha256": "46c83c631beb5e9c39d45b8ae4e1f29a329395cc0a328e33d16392d1ab2ee2f8"
+    },
+    "syrk-overlap": {
+      "board_result_sha256": "ec41e2bf1a6859351c6c00fcd9a61d50fc7a0f1517eeca8496a5736001e1784a",
+      "build_result_sha256": "18712f6f2b77f475b2e42d65d64827ee0752a18649a2b7e9b77f3f95ac866177",
+      "bitstream_sha256": "a32802b9b4c7516cf8a3874cfac22ce18217663c9b207591dfeb02c5df200ba7",
+      "capacity_sha256": "ab83b08ec665e10058f87debd277604a1c0be3fd21d611dd82c7499be17882bc"
+    },
+    "syrk-nonoverlap": {
+      "board_result_sha256": "e374a644eb63be7087e497c4e29b808aa0082f7403873af14fb69a043ffc2823",
+      "build_result_sha256": "f0524ea107d272399c9564fefa34ff8532e3477afe37adcdc9561fa34cc6a4cb",
+      "bitstream_sha256": "c96ab050323127d03316701e587c8bcaf9811b1b82bd997ed43c682483f0beaf",
+      "capacity_sha256": "6520f0702a3f063c917348715ad89d513b867a656453965a17c74430a0f2bd82"
+    },
+    "syr2k-overlap": {
+      "board_result_sha256": "6153b3ee1edf577d4e15b52fde36c0ec2c4ae12a3d8dc7a31e24717b81a6d172",
+      "build_result_sha256": "32f3b756e41942543111b0a6eaaf6467a2c4d8ffec0b5d3820f22368cf39eb56",
+      "bitstream_sha256": "d55ca67f6c5ac263e51d22bd4cb60dde85292a38b446857bb113d81e75c5693c",
+      "capacity_sha256": "46804ebdcd7e19897f59c338a6128d31edee5492f845e8b84afa2f1899a77526"
+    },
+    "syr2k-nonoverlap": {
+      "board_result_sha256": "aa4b5bb7dacce24922fc281b653c116b3ba6580a129febac562d4686d892af88",
+      "build_result_sha256": "079f83e91beb4b241ba41d775ec8a62aa7b9a6ad22af9d723e808d72ad72d584",
+      "bitstream_sha256": "dde65ffe51a3018f7160843c860ccbeebc9e4217c299368f06902cceeb4e0e1d",
+      "capacity_sha256": "5711c7a69f4990d28f07a2422398a353855c5f85ef4588d6279dfe5b1983d675"
+    },
+    "symm-overlap": {
+      "board_result_sha256": "15bb3d6ca6c37baa46b7d9c21f4ed1188a0c7c50a9198db46411c477807da824",
+      "build_result_sha256": "f96d4438554bf529b369ae11bcc66511b49457d3023defad8afa4a67a8a03900",
+      "bitstream_sha256": "9241257d76870379237979a9e3c2ff32c630f3d403e5168bdcb54633d4f186d9",
+      "capacity_sha256": "2f3834f146f2abeec48e3b76f42c92e7c4bc7f4b92b846da24de2eb73dd6e111"
+    },
+    "symm-nonoverlap": {
+      "board_result_sha256": "346d9edb6efb2149424f61daf8450559048c59d27c24056087d273ee01227153",
+      "build_result_sha256": "b74cc55c7951fd9a6848a303f70b92e75ca742063928be5c63c321fa75978799",
+      "bitstream_sha256": "39961c1aa1bf4d10f758de968a0f7a6a5ab2ab74bb0a82f921c50507ecdee0ae",
+      "capacity_sha256": "0fe4d8172b6de065d4fce3c9a677a594f0adb6b15587ef007ab9c0eeb4eafbdf"
+    },
+    "trmm-overlap": {
+      "board_result_sha256": "d016452de66fecabee41e2f6701a16672aef89905e6acaa438c4b7ee4c08ed22",
+      "build_result_sha256": "06d1cd3765c26fd261c043fb347c24c43072b24512db8e9acb9e2a15d4e766e5",
+      "bitstream_sha256": "2173fac56d3090cd61189623b6214a5efe9a76634f26828c671f50402371f3bb",
+      "capacity_sha256": "92cd78567d6be65edaab2287e6891afbeb5fb35c94567b0e3292d5bea421c4d0"
+    },
+    "trmm-nonoverlap": {
+      "board_result_sha256": "aff4fccf5a7df9817b35ebc175321e3e4218b39d47c95b7c871a961f8ae718e4",
+      "build_result_sha256": "bbde4df6e9e9c84c08bac57e0e2fc81265fb4bb5a3c07c2e3020831a8ec265e8",
+      "bitstream_sha256": "fa41eb6c64b454d8d6dfed33b3edea825e19f7de1f949f91b23eae0afeea00c6",
+      "capacity_sha256": "0f328ea6d3a5183976926c6c366ec9e3f1592adb9375a146007f3662ab90a67c"
+    },
+    "atax-overlap": {
+      "board_result_sha256": "4fc3e27581cb67eb3abffe6b10a1d9eb40815fc07d03bb04fc0e86699231a03d",
+      "build_result_sha256": "6682733d1620b7f64be094dc62b7bb58030cea005a43d51c9d31b4ffb2f44490",
+      "bitstream_sha256": "ee15178697341dc0e571c33c76a5483febf224a29d02e34fc88ec18e10afbf50",
+      "capacity_sha256": "554e8d48b4fdfe4ce313c4cce662a5f1817102839006cf7a5122af194de47a0c"
+    },
+    "atax-nonoverlap": {
+      "board_result_sha256": "cae26d4984db7ee07404845847db5e8735fc67de84c04747a610a752da903bcf",
+      "build_result_sha256": "2500c689895386ec19464c85dd15dd2259e535b8dd0b51e0a31e5f567597ba39",
+      "bitstream_sha256": "1942d30e436b6378a067c2f7b1e398c9664ac024c227547bafdcdec9d02ebe38",
+      "capacity_sha256": "aced2ad66818137e9e4f126edb3903e2198338f779e5ac94c490adae25cb54f0"
+    },
+    "gesummv-overlap": {
+      "board_result_sha256": "d2ee23dc8eeb59e12da291df143e980838637488b3e14e5b64125ecd3778a7bd",
+      "build_result_sha256": "0b6ec596f8c7b935244415a48097e65bb215c2261f39765f8399c499e6f0748f",
+      "bitstream_sha256": "982732580141fdbed545d1bf27eaaa60bcd70f8028a59dcc9c4f8a38e278ae87",
+      "capacity_sha256": "c301aa358b1a5c3a7e278d860ed3e65f1aad0de94dd12ef88653f70c11985ec3"
+    },
+    "gesummv-nonoverlap": {
+      "board_result_sha256": "1712ec79dca4d93966c1fa9b966579451a7bb2e4e06bc1c640b2c3bc4f912b89",
+      "build_result_sha256": "44df7f937369b3f48a32ce17b2f9755e53ea6c5e60f665fadaf371b52bf210c7",
+      "bitstream_sha256": "51ecaa315e010c7b92fdd10a84f43993a8b2d99817ad9ee84ba9bbdc8a93eb6f",
+      "capacity_sha256": "1ed797eb35d36d81a7cf0d1c13d6eec795e35f676b1a789f877debb0c851b02e"
+    },
+    "doitgen-overlap": {
+      "board_result_sha256": "71f1c6554ddca4dbbb0ecf47d180076d5daf0e374b6e5e2cc7fcd162ca1155f9",
+      "build_result_sha256": "1719f2e80d26e56ad086b61b512d185e667053990e4cbffd0f102c80cc952906",
+      "bitstream_sha256": "d9ea5f408babf9d20962f519da762af45c00557e098cad2374ca8220b77e17bf",
+      "capacity_sha256": "5606569baf54ce3ea9a9bf94d62adccbb9ff402aa767f1471165b3a24107054b"
+    },
+    "doitgen-nonoverlap": {
+      "board_result_sha256": "81c25db19940a2bfad1337d7c1f986194df8533883f2d732cf4af5452fd15b44",
+      "build_result_sha256": "18b85828fa080836e68cf6c15b0f452c7bd8b4ff95035842dc5dd0ee586d0163",
+      "bitstream_sha256": "6125762c62f0b41b2f3793519e8f676ffc43eaa1169343d2ad83589f01436483",
+      "capacity_sha256": "a3425408e5946f9929c2705d2e57999ba7fb5ed935a9a1e3f4100b3570bdd753"
+    }
+  },
+  "resource_scope": "Routed accelerator plus interface adapter hierarchy; excludes CPU, NoC, native DMA socket and other SoC infrastructure. BRAM36 equivalents equal RAMB36 + RAMB18/2."
+}
