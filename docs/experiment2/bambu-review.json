@@ -1,0 +1,88 @@
+{
+  "base_bambu_commit": "cda4db2",
+  "prerequisites": "docs/experiment1-final/bambu-patches/series",
+  "additional_patch": "bambu-patches/0008-dp-array-port-order.patch",
+  "trigger": "Shared dual-port array is first discovered by its reader; subsequent write-port insertion order differs from enum order in ReadWriteDPArrayHDLGenerator.cpp.",
+  "before": {
+    "path": "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v2",
+    "hardware_llvm_sha256": "92b7057b064ceead1b6555d8b9b1af7956e5a029c5202a35189cbc5fdd18b4cd",
+    "rtl_sha256": "97813a07243448fcc544022f8e2aab7e89974ac12aa7d08ae25823967995cf8d",
+    "gemm_result": {
+      "status": "FAIL",
+      "hardware_llvm": "92b7057b064ceead1b6555d8b9b1af7956e5a029c5202a35189cbc5fdd18b4cd",
+      "sources": {
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v2/bambu_syn/forward_kernel.v": "97813a07243448fcc544022f8e2aab7e89974ac12aa7d08ae25823967995cf8d",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v2/bambu_syn/panda_libtech.v": "d02780014fc9b12a74fb42948f791d2b37b102cdcc43f867480468f97b4ce020",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/compiler/examples/esp-validation/native-dma/packed_dma64.sv": "aee01e0b9287d04768f31bf86b4c451a75e4c54fca814aa4a608dd511300c742",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/cases/MINI/gemm/rtl/tb.sv": "e96f62029a189c2f08c6dc2a38f75c0e1c9806819b49a1cb8b058bffa9437acc"
+      },
+      "runs": [],
+      "error": "CalledProcessError(1, ['vvp', 'test.vvp', '+gemm_stall=0'])",
+      "seconds": 13.505423784255981
+    }
+  },
+  "after": {
+    "path": "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v4",
+    "hardware_llvm_sha256": "92b7057b064ceead1b6555d8b9b1af7956e5a029c5202a35189cbc5fdd18b4cd",
+    "rtl_sha256": "956ec95d477c5407a027fd45c536ac1d0fab4bde0467e50bf968fe92f580a4fb",
+    "gemm_result": {
+      "status": "PASS",
+      "hardware_llvm": "92b7057b064ceead1b6555d8b9b1af7956e5a029c5202a35189cbc5fdd18b4cd",
+      "sources": {
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v4/bambu_syn/forward_kernel.v": "956ec95d477c5407a027fd45c536ac1d0fab4bde0467e50bf968fe92f580a4fb",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v4/bambu_syn/panda_libtech.v": "de6e62245ada4e87892aaa1d96f59ef0a6ff02ebcd2aa6059f37b6bab3605b83",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/compiler/examples/esp-validation/native-dma/packed_dma64.sv": "aee01e0b9287d04768f31bf86b4c451a75e4c54fca814aa4a608dd511300c742",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/cases/MINI/gemm/rtl-v4/tb.sv": "e96f62029a189c2f08c6dc2a38f75c0e1c9806819b49a1cb8b058bffa9437acc"
+      },
+      "runs": [
+        {
+          "stall": 0,
+          "cycles": [
+            41189
+          ],
+          "log_sha256": "02b1b7f9ae15887d06b1bf911494c6a52bebc6eb350925afd8a608e1b6e69c9b"
+        },
+        {
+          "stall": 50000,
+          "cycles": [
+            51930
+          ],
+          "log_sha256": "f958eaa755a6c06b567231160653522d755082c517cf66481c58256428632e62"
+        }
+      ],
+      "seconds": 25.7311110496521
+    },
+    "stress_result": {
+      "status": "PASS",
+      "hardware_llvm": "92b7057b064ceead1b6555d8b9b1af7956e5a029c5202a35189cbc5fdd18b4cd",
+      "sources": {
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v4/bambu_syn/forward_kernel.v": "956ec95d477c5407a027fd45c536ac1d0fab4bde0467e50bf968fe92f580a4fb",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/hardware-v4/bambu_syn/panda_libtech.v": "de6e62245ada4e87892aaa1d96f59ef0a6ff02ebcd2aa6059f37b6bab3605b83",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/compiler/examples/esp-validation/native-dma/packed_dma64.sv": "aee01e0b9287d04768f31bf86b4c451a75e4c54fca814aa4a608dd511300c742",
+        "/home/william/bambu-esp-example/experiments/exp2-reuse-20261114/stress/rtl-v4/tb.sv": "e96f62029a189c2f08c6dc2a38f75c0e1c9806819b49a1cb8b058bffa9437acc"
+      },
+      "runs": [
+        {
+          "stall": 0,
+          "cycles": [
+            276638,
+            382881,
+            458141
+          ],
+          "log_sha256": "1a2e2f1b170fc8df9119d89d9e93bc4e13138e2a8abba303f486f4ad67d39ca8"
+        },
+        {
+          "stall": 50000,
+          "cycles": [
+            276638,
+            382881,
+            458141
+          ],
+          "log_sha256": "1a2e2f1b170fc8df9119d89d9e93bc4e13138e2a8abba303f486f4ad67d39ca8"
+        }
+      ],
+      "seconds": 434.50534534454346
+    }
+  },
+  "semantics": "Select write-enable and write-data output ports by their semantic suffix. No arithmetic, schedule, memory capacity or wrapper change."
+}
