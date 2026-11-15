@@ -5,7 +5,7 @@ here=$(cd -- "$(dirname -- "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 generated=$(realpath "${1:?Usage: run-adapter.sh generated-output fixture-directory}")
 fixtures=$(realpath "${2:?Native SODAP_GEMM_TRACE_DIR required}")
-grep -q '^mechanism=reusable-gemm$' "$generated/layout.txt"
+grep -qE '^(mechanism=reusable-gemm|tiles=operators)$' "$generated/layout.txt"
 test -s "$fixtures/parameters.svh"
 shopt -s nullglob
 memories=("$generated/bambu_syn/"*.mem)

@@ -39,8 +39,7 @@
 #                        per operator, today tosa.matmul, launched once per
 #                        invocation with its shapes (sodap-tosa-outline-operators,
 #                        sodap-join-multiple-tiles); always without
-#                        outstanding loads, stride 2; always without
-#                        outstanding loads, stride 2
+#                        outstanding loads; stride 2 unless LCS_DMA_ABI=packed
 #   LCS_ENTRY            the partition to run, default tasks (ops chained through
 #                        their inits share a task); tasks_trmm is trmm's from the plan
 #   LCS_DMA_WORD_STRIDE  32-bit words per element in shared memory, 2 (default) or 1.
@@ -148,8 +147,9 @@ case "$DMA_ABI" in
 esac
 WORD_STRIDE=${LCS_DMA_WORD_STRIDE:-2}
 case "$WORD_STRIDE" in 1|2) ;; *) echo "LCS_DMA_WORD_STRIDE must be 1 or 2" >&2; exit 1 ;; esac
-if [ "$TILES" = operators ] && [ "$WORD_STRIDE" != 2 ]; then
-  echo "LCS_TILES=operators needs LCS_DMA_WORD_STRIDE=2 (the descriptor's ABI)" >&2
+# Packed DMA lays out rows in beats (DmaTransport.h); the stride is unused.
+if [ "$TILES" = operators ] && [ "$DMA_ABI" = legacy ] && [ "$WORD_STRIDE" != 2 ]; then
+  echo "LCS_TILES=operators needs LCS_DMA_WORD_STRIDE=2 (the descriptor's ABI) or LCS_DMA_ABI=packed" >&2
   exit 1
 fi
 case "$PROFILE" in true|false) ;; *) echo "LCS_PROFILE must be true or false" >&2; exit 1 ;; esac
@@ -162,6 +162,9 @@ case "$SEQUENTIAL" in true|false) ;; *) echo "LCS_SEQUENTIAL must be true or fal
 printf 'dma_word_stride=%s\nprofile=%s\noutstanding_loads=%s\nsequential=%s\n' \
   "$WORD_STRIDE" "$PROFILE" "$OUTSTANDING_LOADS" "$SEQUENTIAL" > layout.txt
 printf 'dma_abi=%s\ndma_data_width=%s\n' "$DMA_ABI" "$DMA_WIDTH" >> layout.txt
+# Only in operators mode, so kernel mode's layout.txt stays as it is. The
+# reusable-GEMM harness (examples/esp-validation/reusable-gemm) takes it.
+[ "$TILES" = operators ] && printf 'tiles=operators\n' >> layout.txt
 printf 'reuse_buffer_budget=%s\nplm_budget=%s\noverlap=%s\n' "$REUSE_BUFFER_BUDGET" "$TOTAL_PLM_BYTES" "$OVERLAP" >> layout.txt
 # Rank proposals using the actual scheduled IR, with the same overlap/reuse
 # policy for both ablation variants. Explicit tile sizes remain reproducible.
