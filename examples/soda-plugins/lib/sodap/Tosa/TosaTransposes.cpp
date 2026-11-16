@@ -14,9 +14,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "sodap/Tosa/Gemm.h"
 #include "sodap/Tosa/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Tosa/Transforms/Passes.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -508,9 +511,79 @@ static Value reshape(OpBuilder &b, Location loc, Value v, Type type) {
                                    b.getDenseI64ArrayAttr(t.getShape()));
 }
 
-/// One tile per operator: each tosa.matmul becomes a launch of a tile. Ops
-/// with the same signature launch the same tile: one accelerator, several
-/// invocations.
+/// `v`'s only user, if it has one use.
+static Operation *onlyUser(Value v) {
+  return v.hasOneUse() ? *v.user_begin() : nullptr;
+}
+
+/// The tensor of one f32 that `v`, of one element, reshapes (a model's
+/// scalar argument), or null.
+static Value scalarOf(Value v) {
+  auto type = dyn_cast<RankedTensorType>(v.getType());
+  if (!type || !type.hasStaticShape() || type.getNumElements() != 1 ||
+      !type.getElementType().isF32())
+    return {};
+  while (auto r = v.getDefiningOp<tosa::ReshapeOp>())
+    v = r.getInput1();
+  return v;
+}
+
+/// `x` of `mul`, a tosa.mul of `x` by a scalar, and the scalar.
+static std::optional<std::pair<Value, Value>> scaled(tosa::MulOp mul) {
+  if (!mul || mul.getShift() != 0)
+    return std::nullopt;
+  for (auto [s, x] : {std::pair(mul.getInput1(), mul.getInput2()),
+                      std::pair(mul.getInput2(), mul.getInput1())})
+    if (Value scalar = scalarOf(s); scalar && x.getType() == mul.getType())
+      return std::pair(x, scalar);
+  return std::nullopt;
+}
+
+/// A GEMM around a tosa.matmul: D = alpha * A.B + beta * C, each part
+/// optional, as torch-mlir writes it (reshape, mul by a scalar, add of a mul
+/// by a scalar). It grows only through values with one use: an intermediate
+/// another op reads stays the GEMM's result.
+struct Gemm {
+  tosa::MatMulOp matmul;
+  SmallVector<Operation *> ops; // matmul to the op giving D, in order
+  Value c, alpha, beta;         // null when missing: none, 1, 0
+  Operation *betaMul = nullptr; // beta * C, folded into the GEMM
+};
+
+static Gemm matchGemm(tosa::MatMulOp op) {
+  Gemm g{op, {op}};
+  auto r = dyn_cast_or_null<tosa::ReshapeOp>(onlyUser(op.getResult()));
+  if (!r || r.getType() != squeezed(op.getType()))
+    return g;
+  g.ops.push_back(r);
+  Value d = r.getResult();
+  if (auto s = scaled(dyn_cast_or_null<tosa::MulOp>(onlyUser(d)));
+      s && s->first == d) {
+    g.alpha = s->second;
+    g.ops.push_back(*d.user_begin());
+    d = g.ops.back()->getResult(0);
+  }
+  auto add = dyn_cast_or_null<tosa::AddOp>(onlyUser(d));
+  if (!add || add.getType() != d.getType() ||
+      add.getInput1() == add.getInput2())
+    return g;
+  Value x = add.getInput1() == d ? add.getInput2() : add.getInput1();
+  g.ops.push_back(add);
+  g.c = x;
+  auto mul = x.getDefiningOp<tosa::MulOp>();
+  if (auto s = scaled(mul); s && x.hasOneUse()) {
+    g.c = s->first;
+    g.beta = s->second;
+    g.betaMul = mul;
+  } else {
+    g.beta = Value(); // C as it is: beta = 1
+  }
+  return g;
+}
+
+/// One tile per operator: each GEMM (matchGemm) becomes a launch of a tile.
+/// GEMMs with the same signature launch the same tile: one accelerator,
+/// several invocations.
 struct TosaOutlineOperators
     : impl::TosaOutlineOperatorsBase<TosaOutlineOperators> {
   void runOnOperation() final {
@@ -523,50 +596,78 @@ struct TosaOutlineOperators
       return signalPassFailure();
     }
     OpBuilder builder(ctx);
+    Type f32 = builder.getF32Type();
     DenseMap<FunctionType, std::string> tiles;
     for (tosa::MatMulOp op : ops) {
       Location loc = op.getLoc();
+      Gemm g = matchGemm(op);
       // The tile's interface drops tosa.matmul's batch dimension of 1, as
       // torch-mlir's reshapes do: in the tile they fold into the matmul, on
       // the host they meet the model's reshapes and cancel (canonicalize).
-      SmallVector<Type> inTypes = llvm::map_to_vector(
-          op->getOperandTypes(), [](Type t) { return squeezed(t); });
-      Type outType = squeezed(op.getType());
-      auto signature = FunctionType::get(ctx, inTypes, outType);
+      Type aType = squeezed(op.getA().getType()),
+           bType = squeezed(op.getB().getType());
+      auto dType = cast<RankedTensorType>(squeezed(op.getType()));
+      if (dType.getRank() != 2) {
+        op.emitError("expected a matmul with a batch of 1");
+        return signalPassFailure();
+      }
+      auto signature =
+          FunctionType::get(ctx, {aType, bType, dType, f32, f32}, dType);
       auto [it, isNew] = tiles.try_emplace(
-          signature, ("matmul_" + Twine(tiles.size())).str());
+          signature, ("gemm_" + Twine(tiles.size())).str());
       std::string name = it->second;
       if (isNew) {
         builder.setInsertionPoint(op->getParentOfType<func::FuncOp>());
         auto tile = builder.create<ModuleOp>(loc, name);
         tile->setAttr("sodap.tile", builder.getI64IntegerAttr(tiles.size() - 1));
         tile->setAttr("sodap.tile_dir", builder.getStringAttr("tiles/" + name));
-        tile->setAttr("sodap.operator", builder.getStringAttr("matmul"));
+        tile->setAttr("sodap.operator", builder.getStringAttr("gemm"));
         builder.setInsertionPointToStart(tile.getBody());
         auto fn = builder.create<func::FuncOp>(loc, name, signature);
         Block *body = fn.addEntryBlock();
         builder.setInsertionPointToStart(body);
-        SmallVector<Value> operands;
-        for (auto [arg, type] :
-             llvm::zip_equal(body->getArguments(), op->getOperandTypes()))
-          operands.push_back(reshape(builder, loc, arg, type));
-        Operation *clone = builder.clone(*op);
-        clone->setOperands(operands);
-        builder.create<func::ReturnOp>(
-            loc, reshape(builder, loc, clone->getResult(0), outType));
+        auto arg = [&](int i) { return body->getArgument(i); };
+        Value d = buildGemmBody(
+            builder, loc, reshape(builder, loc, arg(0), op.getA().getType()),
+            reshape(builder, loc, arg(1), op.getB().getType()), arg(2), arg(3),
+            arg(4));
+        builder.create<func::ReturnOp>(loc, d);
       }
 
-      builder.setInsertionPoint(op);
-      SmallVector<Value> inputs;
-      for (auto [v, type] : llvm::zip_equal(op->getOperands(), inTypes))
-        inputs.push_back(reshape(builder, loc, v, type));
+      // The launch replaces the op giving D, after every operand.
+      Operation *last = g.ops.back();
+      builder.setInsertionPoint(last);
+      auto scalar = [&](Value t, float missing) -> Value {
+        if (!t)
+          return builder.create<arith::ConstantOp>(
+              loc, builder.getF32FloatAttr(missing));
+        auto type = cast<RankedTensorType>(t.getType());
+        SmallVector<Value> zeros(
+            type.getRank(), builder.create<arith::ConstantIndexOp>(loc, 0));
+        return builder.create<tensor::ExtractOp>(loc, t, zeros);
+      };
+      Value c = g.c ? g.c
+                    : builder.create<tensor::EmptyOp>(loc, dType.getShape(),
+                                                      dType.getElementType())
+                          .getResult();
+      SmallVector<Value> inputs = {
+          reshape(builder, loc, op.getA(), aType),
+          reshape(builder, loc, op.getB(), bType), c,
+          scalar(g.alpha, 1.0f),
+          // C without a mul is beta = 1; no C, beta = 0.
+          scalar(g.beta, g.c ? 1.0f : 0.0f)};
       auto launch = builder.create<dataflow::LaunchOp>(
-          loc, TypeRange{outType},
+          loc, TypeRange{dType},
           SymbolRefAttr::get(ctx, name, {FlatSymbolRefAttr::get(ctx, name)}),
           inputs, ValueRange());
-      op.replaceAllUsesWith(
-          reshape(builder, loc, launch.getResult(0), op.getType()));
-      op.erase();
+      Value result = launch.getResult(0);
+      if (last == op.getOperation())
+        result = reshape(builder, loc, result, op.getType());
+      last->getResult(0).replaceAllUsesWith(result);
+      for (Operation *dead : llvm::reverse(g.ops))
+        dead->erase();
+      if (g.betaMul)
+        g.betaMul->erase();
     }
   }
 };

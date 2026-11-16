@@ -61,6 +61,26 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  // GEMM from LCS_TILES=operators: the matmul with its consumer, the
+  // alpha/beta epilogue, in one task, as the measured engine (the fill joins
+  // them through its init). Tile sizes [[M, N, K]]: the epilogue's M and N,
+  // then K of the fused matmul. The epilogue's loops end at tensor.dim of the
+  // untiled matmul: canonicalization folds them to M and N (the shapes are
+  // arguments), and the untiled matmul goes.
+  transform.named_sequence @tasks_gemm(%root: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+    %matmul = transform.structured.match ops{["linalg.matmul"]} in %func : (!transform.any_op) -> !transform.any_op
+    %consumer = transform.get_consumers_of_result %matmul[0] : (!transform.any_op) -> !transform.any_op
+    %compute = transform.merge_handles %matmul, %consumer : !transform.any_op
+    %dispatch = transform.sodap.create_tasks %func groups(%compute)
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.include @tile_tasks failures(propagate) (%func) : (!transform.any_op) -> ()
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.yield
+  }
+
   // Each task gets its own nest, its sizes from the cost model (64 KiB of
   // buffers; a DMA request 64 cycles, a word 1). LCS_TILE_SIZES and
   // LCS_PLM_BYTES, LCS_DMA_REQUEST_CYCLES, LCS_DMA_WORD_CYCLES in

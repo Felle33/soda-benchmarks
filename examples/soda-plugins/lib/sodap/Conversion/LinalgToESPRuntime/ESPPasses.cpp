@@ -698,22 +698,44 @@ static void forwardOutParams(dataflow::LaunchOp launch) {
   }
 }
 
-/// The launches of a tile from sodap-join-multiple-tiles, matmul's for now:
+/// C of a GEMM launch when it holds nothing: the allocation of a
+/// tensor.empty (no C, beta = 0), which only the launch touches.
+static bool isEmptyC(Value c, dataflow::LaunchOp launch) {
+  auto alloc = c.getDefiningOp<memref::AllocOp>();
+  return alloc && llvm::all_of(alloc->getUsers(), [&](Operation *user) {
+           return user == launch.getOperation() || isa<memref::DeallocOp>(user);
+         });
+}
+
+/// The launches of a tile from sodap-join-multiple-tiles, GEMM's for now:
 /// William's reusable-GEMM calls (ReusableGemmABI.h). One arena for the
 /// whole host, its header then each buffer a launch uses; the host's
 /// arguments a launch reads are copied in before the first launch, those it
 /// writes copied out after the last; a buffer between two launches stays in
-/// the arena. Each launch passes its shapes, addresses and row strides.
+/// the arena. Each launch passes its shapes, addresses, row strides, alpha
+/// and beta. The accelerator writes D over C: C, unless empty, is copied
+/// into D's place, with the other copies in when it is a host argument (no
+/// launch but its own writes D), else just before its launch.
 static LogicalResult lowerInvocations(ModuleOp module,
                                       MutableArrayRef<dataflow::LaunchOp> launches, unsigned width) {
   SetVector<Value> buffers, read, written;
   for (dataflow::LaunchOp launch : launches) {
-    // A matmul: (A, B, M, K, N) outs(C).
-    if (launch.getInputs().size() != 5 || launch.getOuts().size() != 1)
-      return launch.emitOpError("expected a matmul launch: (A, B, M, K, N) "
-                                "outs(C)");
+    // A GEMM: (A, B, C, M, K, N, alpha, beta) outs(D).
+    if (launch.getInputs().size() != 8 || launch.getOuts().size() != 1 ||
+        !launch.getInputs()[6].getType().isF32() ||
+        !launch.getInputs()[7].getType().isF32())
+      return launch.emitOpError("expected a gemm launch: (A, B, C, M, K, N, "
+                                "alpha, beta) outs(D)");
+    Value c = launch.getInputs()[2], d = launch.getOuts()[0];
+    if (c.getType() != d.getType())
+      return launch.emitOpError("expected C of D's type");
+    // ponytail: C from another launch would need a copy inside the arena.
+    if (llvm::any_of(launches, [&](dataflow::LaunchOp other) {
+          return llvm::is_contained(other.getOuts(), c);
+        }))
+      return launch.emitOpError("expected C from the host, not from a launch");
     SmallVector<Value> matrices{launch.getInputs()[0], launch.getInputs()[1],
-                                launch.getOuts()[0]};
+                                d};
     for (auto [i, m] : llvm::enumerate(matrices)) {
       auto type = dyn_cast<MemRefType>(m.getType());
       if (!type || type.getRank() != 2 || !type.hasStaticShape() ||
@@ -776,10 +798,11 @@ static LogicalResult lowerInvocations(ModuleOp module,
   auto i64Of = [&](Value index) -> Value {
     return b.create<arith::IndexCastOp>(loc, i64, index);
   };
-  auto copy = [&](StringRef name, Value context, Value buffer) {
+  auto copy = [&](StringRef name, Value context, Value buffer,
+                  std::optional<int64_t> at = std::nullopt) {
     b.create<func::CallOp>(
         loc, name, TypeRange{},
-        ValueRange{context, constant(offset[buffer]),
+        ValueRange{context, constant(at ? *at : offset[buffer]),
                    b.create<memref::CastOp>(loc, unranked, buffer)});
   };
 
@@ -789,14 +812,15 @@ static LogicalResult lowerInvocations(ModuleOp module,
   Value context = b.create<func::CallOp>(loc, openName, TypeRange{i64}, openArgs).getResult(0);
   for (Value arg : read)
     copy("esp_gemm_copy_in", context, arg);
-  Value one = b.create<arith::ConstantFloatOp>(loc, APFloat(1.0f),
-                                               cast<FloatType>(f32));
-  Value zero = b.create<arith::ConstantFloatOp>(loc, APFloat(0.0f),
-                                                cast<FloatType>(f32));
+  for (dataflow::LaunchOp launch : launches)
+    if (Value c = launch.getInputs()[2]; isa<BlockArgument>(c))
+      copy("esp_gemm_copy_in", context, c, offset[launch.getOuts()[0]]);
   for (dataflow::LaunchOp launch : launches) {
     b.setInsertionPoint(launch);
     ValueRange in = launch.getInputs();
     Value a = in[0], rhs = in[1], c = launch.getOuts()[0];
+    if (!isa<BlockArgument>(in[2]) && !isEmptyC(in[2], launch))
+      copy("esp_gemm_copy_in", context, in[2], offset[c]);
     auto ld = [&](Value m) {
       int64_t cols = cast<MemRefType>(m.getType()).getDimSize(1);
       uint64_t words = 0;
@@ -809,15 +833,24 @@ static LogicalResult lowerInvocations(ModuleOp module,
     b.create<func::CallOp>(
         launch.getLoc(), "esp_gemm_invoke", TypeRange{},
         ValueRange{context, constant(offset[a]), constant(offset[rhs]),
-                   constant(offset[c]), i64Of(in[2]), i64Of(in[4]),
-                   i64Of(in[3]), ld(a), ld(rhs), ld(c), one, zero});
+                   constant(offset[c]), i64Of(in[3]), i64Of(in[5]),
+                   i64Of(in[4]), ld(a), ld(rhs), ld(c), in[6], in[7]});
   }
   b.setInsertionPointAfter(launches.back().getOperation());
   for (Value arg : written)
     copy("esp_gemm_copy_out", context, arg);
   b.create<func::CallOp>(loc, "esp_gemm_close", TypeRange{}, context);
+  SmallVector<Value> emptyCs;
+  for (dataflow::LaunchOp launch : launches)
+    if (isEmptyC(launch.getInputs()[2], launch))
+      emptyCs.push_back(launch.getInputs()[2]);
   for (dataflow::LaunchOp launch : launches)
     launch.erase();
+  for (Value buffer : emptyCs) {
+    for (Operation *user : llvm::make_early_inc_range(buffer.getUsers()))
+      user->erase();
+    buffer.getDefiningOp()->erase();
+  }
   for (Value buffer : buffers)
     if (auto alloc = buffer.getDefiningOp<memref::AllocOp>()) {
       for (Operation *user : llvm::make_early_inc_range(alloc->getUsers()))

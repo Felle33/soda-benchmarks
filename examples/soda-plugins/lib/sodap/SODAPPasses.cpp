@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
@@ -27,6 +28,7 @@ namespace mlir::sodap {
 #define GEN_PASS_DEF_TAGOPS
 #define GEN_PASS_DEF_LINALGRANKREDUCECONTRACTIONS
 #define GEN_PASS_DEF_LINALGCONSTANTSTOINDICES
+#define GEN_PASS_DEF_LINALGFOLDRUNTIMEBROADCASTS
 #include "sodap/SODAPPasses.h.inc"
 
 namespace {
@@ -140,6 +142,166 @@ struct LinalgRankReduceContractions
   void runOnOperation() final {
     RewritePatternSet patterns(&getContext());
     linalg::populateContractionOpRankReducingPatterns(patterns);
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
+                                            std::move(patterns))))
+      signalPassFailure();
+  }
+};
+} // namespace
+
+namespace {
+/// Dim `i` of the tensor `t`, through tensor.empty and destination-style ops
+/// and their tensor.dim: a constant, or the value giving it.
+static OpFoldResult sizeOf(Value t, int64_t i, int depth = 0) {
+  auto type = cast<RankedTensorType>(t.getType());
+  Builder b(t.getContext());
+  if (!type.isDynamicDim(i))
+    return b.getIndexAttr(type.getDimSize(i));
+  for (; depth < 16; ++depth) {
+    if (auto empty = t.getDefiningOp<tensor::EmptyOp>())
+      return empty.getMixedSizes()[i];
+    auto dps = t.getDefiningOp<DestinationStyleOpInterface>();
+    if (!dps)
+      break;
+    t = dps.getTiedOpOperand(cast<OpResult>(t))->get();
+  }
+  return t.getDefiningOp() || isa<BlockArgument>(t) ? OpFoldResult() : t;
+}
+
+static bool sameSize(OpFoldResult a, OpFoldResult b);
+
+/// `size` with any tensor.dim it is replaced by the size it reads, and
+/// tosa-to-linalg's maxui of equal sizes by the size.
+static OpFoldResult normalized(OpFoldResult size) {
+  for (int depth = 0; depth < 16; ++depth) {
+    auto v = dyn_cast_if_present<Value>(size);
+    if (!v)
+      return size;
+    if (auto max = v.getDefiningOp<arith::MaxUIOp>()) {
+      if (!sameSize(max.getLhs(), max.getRhs()))
+        return size;
+      size = max.getLhs();
+      continue;
+    }
+    auto dim = v.getDefiningOp<tensor::DimOp>();
+    std::optional<int64_t> i = dim ? dim.getConstantIndex() : std::nullopt;
+    if (!i)
+      return size;
+    OpFoldResult next = sizeOf(dim.getSource(), *i);
+    if (!next)
+      return size;
+    size = next;
+  }
+  return size;
+}
+
+static bool sameSize(OpFoldResult a, OpFoldResult b) {
+  a = normalized(a);
+  b = normalized(b);
+  if (!a || !b)
+    return false;
+  std::optional<int64_t> ca = getConstantIntValue(a), cb = getConstantIntValue(b);
+  if (ca || cb)
+    return ca && cb && *ca == *cb;
+  return cast<Value>(a) == cast<Value>(b);
+}
+
+/// tosa-to-linalg's `scf.if (dim(x, i) == 1) { broadcast x } else { x }`,
+/// with a result of x's sizes, is x.
+struct FoldRuntimeBroadcast : OpRewritePattern<scf::IfOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(scf::IfOp op,
+                                PatternRewriter &rewriter) const final {
+    if (op.getNumResults() != 1 || op.getElseRegion().empty())
+      return failure();
+    Value x = op.elseYield().getOperand(0);
+    auto type = dyn_cast<RankedTensorType>(x.getType());
+    if (!type || x.getParentRegion() == &op.getElseRegion())
+      return failure();
+    auto generic =
+        op.thenYield().getOperand(0).getDefiningOp<linalg::GenericOp>();
+    if (!generic || generic->getParentOp() != op.getOperation() ||
+        generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1 ||
+        generic.getDpsInputs()[0] != x ||
+        generic.getNumLoops() != type.getRank() ||
+        generic.getNumParallelLoops() != generic.getNumLoops())
+      return failure();
+    // A copy of the input: the body yields it.
+    Block &body = generic.getRegion().front();
+    auto yield = cast<linalg::YieldOp>(body.getTerminator());
+    if (body.getOperations().size() != 1 ||
+        yield.getOperand(0) != body.getArgument(0))
+      return failure();
+    // The output map the identity, the input's the identity but for dims
+    // read at 0: those broadcast.
+    SmallVector<AffineMap> maps = generic.getIndexingMapsArray();
+    if (!maps[1].isIdentity())
+      return failure();
+    SmallVector<int64_t> broadcast;
+    for (auto [i, e] : llvm::enumerate(maps[0].getResults())) {
+      if (auto c = dyn_cast<AffineConstantExpr>(e); c && c.getValue() == 0)
+        broadcast.push_back(i);
+      else if (e != rewriter.getAffineDimExpr(i))
+        return failure();
+    }
+    if (broadcast.size() != 1)
+      return failure();
+    int64_t i = broadcast.front();
+    // The condition: x's dim i is 1.
+    auto cmp = op.getCondition().getDefiningOp<arith::CmpIOp>();
+    if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::eq ||
+        !isConstantIntValue(cmp.getRhs(), 1) ||
+        !sameSize(cmp.getLhs(), sizeOf(x, i)))
+      return failure();
+    // The result has x's sizes.
+    Value init = generic.getDpsInits()[0];
+    for (int64_t d = 0, e = type.getRank(); d < e; ++d)
+      if (!sameSize(sizeOf(init, d), sizeOf(x, d)))
+        return failure();
+    if (op.getResult(0).getType() != x.getType())
+      return failure();
+    rewriter.replaceOp(op, x);
+    return success();
+  }
+};
+
+/// A rank-0 input built from a scalar (tensor.from_elements) is the scalar,
+/// used in the body: a run-time alpha or beta as FoldScalarOrSplatConstant
+/// makes a constant one.
+struct InlineScalarInput : OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(linalg::GenericOp op,
+                                PatternRewriter &rewriter) const final {
+    for (OpOperand *input : op.getDpsInputOperands()) {
+      auto from = input->get().getDefiningOp<tensor::FromElementsOp>();
+      if (!from || from.getType().getRank() != 0)
+        continue;
+      unsigned i = input->getOperandNumber();
+      Value scalar = from.getElements().front();
+      SmallVector<AffineMap> maps = op.getIndexingMapsArray();
+      maps.erase(maps.begin() + i);
+      Block &body = op.getRegion().front();
+      rewriter.modifyOpInPlace(op, [&] {
+        rewriter.replaceAllUsesWith(body.getArgument(i), scalar);
+        body.eraseArgument(i);
+        op.getInputsMutable().erase(i);
+        op.setIndexingMapsAttr(rewriter.getAffineMapArrayAttr(maps));
+      });
+      return success();
+    }
+    return failure();
+  }
+};
+
+struct LinalgFoldRuntimeBroadcasts
+    : impl::LinalgFoldRuntimeBroadcastsBase<LinalgFoldRuntimeBroadcasts> {
+  void runOnOperation() final {
+    MLIRContext *ctx = &getContext();
+    RewritePatternSet patterns(ctx);
+    patterns.add<FoldRuntimeBroadcast, InlineScalarInput>(ctx);
+    tensor::DimOp::getCanonicalizationPatterns(patterns, ctx);
+    tensor::EmptyOp::getCanonicalizationPatterns(patterns, ctx);
+    scf::IfOp::getCanonicalizationPatterns(patterns, ctx);
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns))))
       signalPassFailure();

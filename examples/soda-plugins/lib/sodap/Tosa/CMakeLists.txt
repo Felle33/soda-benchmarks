@@ -11,6 +11,7 @@ add_mlir_library(MLIRSODAPTosa
         LINK_LIBS PUBLIC
         MLIRIR
         MLIRPass
+        MLIRArithDialect
         MLIRFuncDialect
         MLIRTensorDialect
         MLIRTosaDialect

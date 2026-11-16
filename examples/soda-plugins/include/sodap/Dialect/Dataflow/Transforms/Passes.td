@@ -147,6 +147,25 @@ def Schedule :
   ];
 }
 
+def GuardReads :
+    Pass<"sodap-dataflow-guard-reads", "::mlir::func::FuncOp"> {
+  let summary = "Read an argument only when a scalar argument isn't 0";
+  let description = [{
+    An argument with `sodap.read_unless_zero = i` is read only when the f32
+    argument `i` isn't 0: GEMM's C, read only when beta isn't 0
+    (`sodap-join-multiple-tiles`), as the measured engine's
+    `hasC = beta UNE 0`. Each `memref.copy` out of the argument, or out of a
+    subview of it, runs under `scf.if (arith.cmpf une, %i, 0.0)`; a NaN
+    reads. The compute must not need what it doesn't read: GEMM's body
+    selects `alpha * A.B` when beta is 0. Run before `sodap-dataflow-tails`,
+    which cuts the guarded copies, and their padding, inside the `scf.if`.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
 def Tails :
     Pass<"sodap-dataflow-tails", "::mlir::func::FuncOp"> {
   let summary = "Cut the tiles of run-time shapes to the part inside them";

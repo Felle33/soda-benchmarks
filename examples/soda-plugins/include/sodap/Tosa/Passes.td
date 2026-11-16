@@ -126,17 +126,31 @@ def TosaOutlineKernel : Pass<"sodap-tosa-outline-kernel", "::mlir::ModuleOp"> {
 }
 
 def TosaOutlineOperators : Pass<"sodap-tosa-outline-operators", "::mlir::ModuleOp"> {
-  let summary = "Move each operator into a tile module of its own";
+  let summary = "Move each GEMM into a tile module of its own";
   let description = [{
     The per-operator alternative to `sodap-tosa-outline-kernel`. Each
-    `tosa.matmul`, in program order, becomes the only op of
-    `module @matmul_<i> attributes {sodap.tile = i, sodap.tile_dir =
-    "tiles/matmul_<i>"}` holding `@matmul_<i>`, and is replaced by a
-    `dataflow.launch` of it. Everything else (reshapes, transposes,
-    elementwise ops) stays in its function, the host, run by the CPU.
+    `tosa.matmul`, in program order, with the ops around it that make a GEMM,
+    `D = alpha * A.B + beta * C`, as torch-mlir writes it:
+
+    - the matmul's reshape to a matrix (its batch of 1 dropped);
+    - a `tosa.mul` of that by a tensor of one f32 (alpha), optional;
+    - a `tosa.add` of that and C, optional, where C may be a `tosa.mul` by a
+      tensor of one f32 (beta) with no other use;
+
+    becomes the only computation of `module @gemm_<i> attributes {sodap.tile
+    = i, sodap.tile_dir = "tiles/gemm_<i>", sodap.operator = "gemm"}` holding
+    `@gemm_<i>(A, B, C, alpha, beta) -> D`, and is replaced by a
+    `dataflow.launch` of it. A missing alpha is 1; a missing beta is 1 with C,
+    0 without, and then C is a `tensor.empty`. The GEMM grows only through
+    values with one use: an intermediate another op reads is the GEMM's
+    result. GEMMs with the same types launch the same tile. Everything else
+    (transposes, other elementwise ops) stays in its function, the host, run
+    by the CPU.
   }];
   let dependentDialects = [
+    "::mlir::arith::ArithDialect",
     "::mlir::sodap::dataflow::DataflowDialect",
+    "::mlir::tensor::TensorDialect",
     "::mlir::tosa::TosaDialect"
   ];
 }
@@ -155,7 +169,10 @@ def JoinMultipleTiles : Pass<"sodap-join-multiple-tiles", "::mlir::ModuleOp"> {
     (`ReusableGemmABI.h`), and the module `sodap.invocations`, the dimensions
     of every launch, for the tile sizes' cost model.
 
-    Only `matmul` today: `(A: MxK, B: KxN, M, K, N) -> C: MxN`.
+    Only `gemm` today: `(A: MxK, B: KxN, C: MxN, M, K, N, alpha, beta) -> D:
+    MxN`, `D = alpha * A.B + beta * C`. C and D share the descriptor's C: the
+    accelerator writes D over C. C has `sodap.read_unless_zero` = beta's
+    argument (`sodap-dataflow-guard-reads`).
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",

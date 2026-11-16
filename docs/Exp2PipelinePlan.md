@@ -8,7 +8,7 @@ still 1.73× slower than SPECTRA. Built on `LCS_TILES=operators`.
 
 | # | Decision | Consequence |
 |---|---|---|
-| D1 | Tile chosen as in the last Experiment 2 run: from the hardware budget only, `reusable_gemm_config.py` with `LCS_COMPUTE_LANES=64`, `LCS_PLM_BYTES=327680` → 128×64×64 | Same tile for every workload; run-time tails are required. This replaces the divisors-of-100 choice below (and step 3's 100×100×100) once operators mode has tails; until then the sizes must still divide every invocation |
+| D1 | Tile chosen as in the last Experiment 2 run: from the hardware budget only, `reusable_gemm_config.py` with `LCS_COMPUTE_LANES=64`, `LCS_PLM_BYTES=327680` → 128×64×64 | Same tile for every workload; run-time tails are required (done, see the status below). This replaces the divisors-of-100 choice below (and step 3's 100×100×100) |
 | D2 | C loaded as in the last Experiment 2 run: the C tile is read only when `beta ≠ 0` | Hardware guard on beta |
 | D3 | The ping-pong schedule is Experiment 1's, unchanged: the variant that loads A and B before publishing tokens is not applied on this branch and is not planned | Operators mode keeps Experiment 1's dataflow schedule; cycle counts measured with that variant are not reported here |
 
@@ -89,6 +89,47 @@ Two further limits:
   place this combination runs.
 - The register-block tail pads local buffers and leaves some lanes idle
   (see above); step 3 checks the PLM.
+
+## Status 2026-11-16: GEMM operator, D1 tile and D2 C policy (branch `exp2-operators-packed`)
+
+Operators mode (`LCS_TILES=operators LCS_DMA_ABI=packed LCS_DMA_DATA_WIDTH=64
+LCS_COMPUTE_LANES=64`) now lowers the model's GEMMs to one accelerator:
+
+| Part | Where | State |
+|---|---|---|
+| Tile from the budget (D1) | `tosa_to_lcs.sh`: `reusable_gemm_config.py` → `hardware_selection.json` → `[[128, 64, 64]]` | Done |
+| Run-time tails (D4) | `tile_and_fuse` keeps static tiles that need not divide the invocations; `sodap-dataflow-tails` cuts each transfer to `min(size, dim − offset)` and zero-fills a local tile only when partial; `sodap-dataflow-copy-to-dma` requests the cut rows (legacy and packed, no broker) | Done |
+| GEMM outlining | `sodap-tosa-outline-operators`: matmul + optional `tosa.mul` by a scalar (alpha) + optional `tosa.add` of C or `tosa.mul(beta, C)`; missing alpha 1, missing beta 1 with C and 0 without (C a `tensor.empty`). Grows only through single-use values; other epilogues stay on the host (not rejected) | Done |
+| GEMM tile | `sodap-join-multiple-tiles`: `(A, B, C, M, K, N, alpha, beta) -> D` in TOSA, `D = select(beta == 0, alpha·AB, alpha·AB + beta·C)`; C and D on `GEMM_FIELD_C`, alpha/beta on their fields; `sodap-linalg-fold-runtime-broadcasts` removes tosa-to-linalg's run-time broadcasts of equal shapes and inlines the scalars; `@tasks_gemm` puts matmul and epilogue in one task | Done |
+| C policy (D2) | `sodap-dataflow-guard-reads`: the C tile load runs under `beta une 0`; copy-to-dma reads f32 fields as bits | Done |
+| Host | `sodap-launches-to-esp`: real alpha/beta; C copied into D's arena place (with the other copies when it is a host argument) | Done |
+
+Evidence (runs in `exp2/runs/`, all with one accelerator,
+`05_hw_acc.ll` sha256 `21db1010…28f8`):
+
+- `g3-six-2/oracles.json` (`scripts/lcs/check_gemm_oracles.py`): all six
+  fixtures PASS. Launches, arena sizes, offsets, M/N/K, alpha and beta equal
+  the release's `invocations.json`; MINI captures (descriptors, initial
+  arenas, expected outputs, masks) byte-identical to the release's;
+  scheduled storage 262,148 B, padded local arrays 262,340 B ≤ 327,680.
+- Host-native check (software GEMM model): six PASS.
+- Bambu HLS (sdk/, xc7vx485t-2ffg1761, 20 ns) of the engine: PASS. Packed
+  DMA64 RTL (iverilog): MINI gemm, 2mm, 3mm PASS at stall 0 and 50,000.
+- `g8-nan-1`: MINI gemm with beta = 0 and C all NaN: native and RTL PASS;
+  the C read is skipped in hardware (51 requests / 706 beats against 71 /
+  966 with beta ≠ 0: C's 20 rows, 260 beats).
+
+RTL cycles (one invocation each; the measured engine's MINI 3mm is
+28,011 / 57,845 / 86,496 cumulative):
+
+| MINI | Stall 0 | Stall 50,000 |
+|---|---:|---:|
+| gemm | 75,265 | 75,265 |
+| 2mm | 73,858, 147,820 | same |
+| 3mm | 73,753, 148,138, 221,992 | same |
+
+The schedule is the dataflow passes' (D3), not the generator's: about 2.6
+times the measured engine's cycles on MINI, to be explained (O3).
 
 ## Status 2026-11-16 (branch `feature/exp2-reusable-gemm`)
 

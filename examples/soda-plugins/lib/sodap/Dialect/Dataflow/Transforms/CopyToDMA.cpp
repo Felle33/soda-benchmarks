@@ -392,12 +392,13 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
         base += words;
       }
     }
-    // The index arguments read from the descriptor.
+    // The index and f32 arguments read from the descriptor (an f32 is the
+    // bits of its field's low 32 bits, as esp_gemm_invoke writes alpha).
     SmallVector<std::pair<BlockArgument, int64_t>> scalars;
     for (BlockArgument arg : top.getArguments())
       if (auto field = top.getArgAttrOfType<IntegerAttr>(
               arg.getArgNumber(), "sodap.descriptor_field")) {
-        if (isa<IndexType>(arg.getType())) {
+        if (isa<IndexType>(arg.getType()) || arg.getType().isF32()) {
           scalars.push_back({arg, field.getInt()});
           regions.set(arg.getArgNumber());
         }
@@ -481,7 +482,15 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
                                       "the tasks");
             return signalPassFailure();
           }
-          use.set(fields[task][field]);
+          Value value = fields[task][field];
+          if (arg.getType().isF32()) {
+            auto cast = value.getDefiningOp<arith::IndexCastUIOp>();
+            OpBuilder::InsertionGuard guard(b);
+            b.setInsertionPointAfter(cast);
+            value = b.create<arith::BitcastOp>(cast.getLoc(), arg.getType(),
+                                               cast.getIn());
+          }
+          use.set(value);
         }
     }
     llvm::SmallPtrSet<Operation *, 4> receivers;

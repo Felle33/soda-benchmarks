@@ -36,12 +36,14 @@
 #   LCS_FP_UNITS         FP mul/add units allowed per compute task (block area by default)
 #   LCS_TILES            kernel (default): the whole kernel on one tile
 #                        (sodap-tosa-outline-kernel); operators: one accelerator
-#                        per operator, today tosa.matmul, launched once per
-#                        invocation with its shapes (sodap-tosa-outline-operators,
-#                        sodap-join-multiple-tiles); always without
-#                        outstanding loads; stride 2 unless LCS_DMA_ABI=packed
+#                        per operator, today GEMM (tosa.matmul with its alpha and
+#                        beta*C), launched once per invocation with its shapes
+#                        (sodap-tosa-outline-operators, sodap-join-multiple-tiles);
+#                        always without outstanding loads; stride 2 unless
+#                        LCS_DMA_ABI=packed
 #   LCS_ENTRY            the partition to run, default tasks (ops chained through
-#                        their inits share a task); tasks_trmm is trmm's from the plan
+#                        their inits share a task), tasks_gemm with
+#                        LCS_TILES=operators; tasks_trmm is trmm's from the plan
 #   LCS_DMA_WORD_STRIDE  32-bit words per element in shared memory, 2 (default) or 1.
 #                        The thin 64-bit native-DMA wrapper requires 2.
 #   LCS_PROFILE=true     instrument 05_kernel_riscv.ll and 05_cpu_baseline.ll with
@@ -120,8 +122,10 @@ PLUGIN="--load-dialect-plugin=$MLIR_PLUGIN_PATH --load-pass-plugin=$MLIR_PLUGIN_
 # Never in the same call as $PLUGIN: both hold the Dataflow dialect.
 TOSA_PLUGIN="--load-pass-plugin=${SODAP_TOSA_PLUGIN:-$(dirname "$MLIR_PLUGIN_PATH")/SODATosaPlugin.so}"
 TRANSFORM="${LCS_TRANSFORM:-$REPO_DIR/scripts/lcs/transform.mlir}"
-ENTRY="${LCS_ENTRY:-tasks}"
 TILES="${LCS_TILES:-kernel}"
+DEFAULT_ENTRY=tasks
+[ "$TILES" = operators ] && DEFAULT_ENTRY=tasks_gemm
+ENTRY="${LCS_ENTRY:-$DEFAULT_ENTRY}"
 case "$TILES" in
   kernel) OUTLINE=sodap-tosa-outline-kernel ;;
   # One tile per operator, its shapes as arguments (one accelerator, one
@@ -226,8 +230,9 @@ fi
 # sizes need not divide them. Before the DMA, cut each transfer to the part
 # inside the matrix (after the cost report, which counts whole tiles: an upper
 # bound on a partial one).
+# GEMM's C is read only when beta isn't 0 (D2), before the tails cut the reads.
 TAILS=
-[ "$TILES" = operators ] && TAILS="func.func(sodap-dataflow-tails),"
+[ "$TILES" = operators ] && TAILS="func.func(sodap-dataflow-guard-reads, sodap-dataflow-tails),"
 DUMP=ir_after_each_pass.mlir
 FRONTEND_DUMP=ir_after_each_pass_frontend.mlir
 ACC_DUMP=ir_after_each_pass_acc.mlir
@@ -269,6 +274,12 @@ outline() {
     -soda-generate-bambu-accelcode=no-aa -o "$dir/kernel.mlir"
 }
 
+# Operators mode: the tile's shapes are arguments; tosa-to-linalg broadcasts
+# two operands of run-time shapes at run time, a copy when they have the
+# result's shape (sodap-linalg-fold-runtime-broadcasts), and alpha and beta
+# become scalars of the body.
+BROADCASTS=
+[ "$TILES" = operators ] && BROADCASTS="func.func(sodap-dataflow-bind-dims, sodap-linalg-fold-runtime-broadcasts),"
 FRONT_END="func.func(
       tosa-to-arith,
       tosa-to-tensor,
@@ -277,6 +288,7 @@ FRONT_END="func.func(
       sodap-linalg-rank-reduce-contractions
     ),
     linalg-fold-unit-extent-dims,
+    $BROADCASTS
     linalg-fuse-elementwise-ops,
     func.func(sodap-linalg-constants-to-indices, sodap-dataflow-bind-dims),
     canonicalize"

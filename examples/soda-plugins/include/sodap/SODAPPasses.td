@@ -88,6 +88,46 @@ def LinalgConstantsToIndices
   ];
 }
 
+def LinalgFoldRuntimeBroadcasts
+    : Pass<"sodap-linalg-fold-runtime-broadcasts"> {
+  let summary = "Drop tosa-to-linalg's run-time broadcasts of operands whose "
+                "shape is the result's";
+  let description = [{
+    An elementwise TOSA op with two operands of dynamic shape becomes, in
+    `tosa-to-linalg`, a broadcast of each operand along each dynamic dim, at
+    run time:
+    ```mlir
+    %c = arith.cmpi eq, %d, %c1 : index        // %d = dim(%x, i)
+    %y = scf.if %c -> (tensor<?x?xf32>) {
+      %e = tensor.empty(%s0, %s1) : tensor<?x?xf32>
+      %b = linalg.generic {indexing_maps = [(d0, d1) -> (0, d1), id]} ins(%x) outs(%e) {
+        linalg.yield %in
+      }
+      scf.yield %b
+    } else {
+      scf.yield %x
+    }
+    ```
+    When the sizes of `%e` are those of `%x` (the same values, through
+    `tensor.dim`, `tensor.empty`, destination-style ops and the `arith.maxui`
+    of equal sizes tosa-to-linalg computes), the broadcast
+    copies `%x`: its dim i is 1, the condition says so, and so is the
+    result's. `%y` becomes `%x`. A tile whose shapes are arguments
+    (`sodap-join-multiple-tiles`, after `sodap-dataflow-bind-dims`) then
+    keeps its elementwise ops fusable and its compute free of branches.
+
+    A rank-0 input of a `linalg.generic` built from a scalar
+    (`tensor.from_elements %s : tensor<f32>`, a run-time alpha) is dropped,
+    and the body uses `%s`, as `linalg-fuse-elementwise-ops` does for a
+    constant: no buffer and no load for a scalar.
+  }];
+  let dependentDialects = [
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::scf::SCFDialect",
+    "::mlir::tensor::TensorDialect"
+  ];
+}
+
 def ViewOpGraph : Pass<"soda-view-op-graph"> {
   let summary = "Print Graphviz visualization of an operation";
   let description = [{
