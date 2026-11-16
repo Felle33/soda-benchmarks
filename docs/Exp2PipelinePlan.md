@@ -115,6 +115,10 @@ Evidence (runs in `exp2/runs/`, all with one accelerator,
 - Host-native check (software GEMM model): six PASS.
 - Bambu HLS (sdk/, xc7vx485t-2ffg1761, 20 ns) of the engine: PASS. Packed
   DMA64 RTL (iverilog): MINI gemm, 2mm, 3mm PASS at stall 0 and 50,000.
+- `g3-six-2/rtl-fresh/tails` (`review.sh exp2 tails`): the release's
+  odd-tail case (129×65×67, 129×17×65, 31×66×9) with a 300,000-cycle write
+  stall: PASS, writes blocked in all three invocations (206,620 / 207,135 /
+  226,191 cycles), cumulative cycles 479,186 / 783,717 / 1,087,538.
 - `g8-nan-1`: MINI gemm with beta = 0 and C all NaN: native and RTL PASS;
   the C read is skipped in hardware (51 requests / 706 beats against 71 /
   966 with beta ≠ 0: C's 20 rows, 260 beats).
