@@ -69,6 +69,9 @@ struct Transfer {
   bool read;
   /// With a descriptor: the fields of the argument's address and row stride.
   int64_t baseField = -1, ldField = -1;
+  /// Packed DMA: whether a write needs its neighbours (packedNeedsBoundary),
+  /// decided before the descriptor's fields replace the index arguments.
+  std::optional<bool> boundary;
 };
 
 } // namespace
@@ -111,9 +114,12 @@ static LogicalResult collectTransfers(BlockArgument arg, int64_t base,
       transfers.push_back({copy, {}, base, copy.getSource() == arg});
       continue;
     }
+    // A tile of a matrix with a descriptor field may be cut at run time
+    // (sodap-dataflow-tails): its sizes are then values.
     auto tile = dyn_cast<memref::SubViewOp>(user);
     if (!tile || !tile.hasUnitStride() ||
-        ShapedType::isDynamicShape(tile.getStaticSizes()))
+        tile.getType().getRank() != type.getRank() ||
+        (!field && ShapedType::isDynamicShape(tile.getStaticSizes())))
       return user->emitError()
              << "argument #" << arg.getArgNumber()
              << " is used other than by a copy or a static tile with unit "
@@ -142,8 +148,11 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   // A whole argument: a tile the shape of the buffer, at 0.
   auto argType = tile ? tile.getSourceType()
                       : cast<MemRefType>(buffer.getType());
-  SmallVector<int64_t> sizes = llvm::to_vector(
-      tile ? tile.getStaticSizes() : argType.getShape());
+  // A size is a value in a tile cut at run time (sodap-dataflow-tails).
+  SmallVector<OpFoldResult> sizes =
+      getAsIndexOpFoldResult(b.getContext(), argType.getShape());
+  if (tile)
+    sizes = tile.getMixedSizes();
   SmallVector<OpFoldResult> offsets(argType.getRank(), b.getIndexAttr(0));
   if (tile)
     offsets = tile.getMixedOffsets();
@@ -160,7 +169,7 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
   SmallVector<Value> ivs;
   for (unsigned d = 0; d + 1 < rank; ++d) {
-    Value size = b.create<arith::ConstantIndexOp>(loc, sizes[d]);
+    Value size = getValueOrCreateConstantIndexOp(b, loc, sizes[d]);
     auto loop = b.create<scf::ForOp>(loc, c0, size, c1);
     b.setInsertionPointToStart(loop.getBody());
     ivs.push_back(loop.getInductionVar());
@@ -194,13 +203,25 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   }
 
   // A scalar is a row of one element, with no index.
-  int64_t length = rank ? sizes.back() : 1;
+  OpFoldResult length = rank ? sizes.back() : OpFoldResult(b.getIndexAttr(1));
+  Value rowLength = getValueOrCreateConstantIndexOp(b, loc, length);
+  Value words;
+  if (std::optional<int64_t> constant = getConstantIntValue(length))
+    words = b.create<arith::ConstantIntOp>(loc, (*constant * wordStride) << 32,
+                                           64);
+  else
+    words = b.create<arith::ShLIOp>(
+        loc,
+        b.create<arith::IndexCastOp>(
+            loc, b.getI64Type(),
+            b.create<arith::MulIOp>(
+                loc, rowLength,
+                b.create<arith::ConstantIndexOp>(loc, wordStride))),
+        b.create<arith::ConstantIntOp>(loc, 32, 64));
   Value request = b.create<arith::OrIOp>(
-      loc, b.create<arith::ConstantIntOp>(loc, (length * wordStride) << 32, 64),
-      b.create<arith::IndexCastOp>(loc, b.getI64Type(), addr));
+      loc, words, b.create<arith::IndexCastOp>(loc, b.getI64Type(), addr));
   b.create<StreamWriteOp>(loc, ctrl, request);
 
-  Value rowLength = b.create<arith::ConstantIndexOp>(loc, length);
   auto row = b.create<scf::ForOp>(loc, c0, rowLength, c1);
   b.setInsertionPointToStart(row.getBody());
   SmallVector<Value> indices(ivs);
@@ -421,9 +442,10 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
       module->setAttr("sodap.dma_data_width", b.getI32IntegerAttr(dmaDataWidth));
       llvm::SmallPtrSet<Operation*,4> tasks;
       bool boundary=false;
-      for (const auto &t:transfers) {
+      for (auto &t:transfers) {
         if(auto task=t.copy->getParentOfType<TaskOp>())tasks.insert(task);
-        boundary |= packedNeedsBoundary(t,dmaDataWidth);
+        t.boundary = packedNeedsBoundary(t,dmaDataWidth);
+        boundary |= *t.boundary;
       }
       if (boundary && tasks.size()>1) {
         SmallVector<TaskOp> owners;

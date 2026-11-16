@@ -147,6 +147,38 @@ def Schedule :
   ];
 }
 
+def Tails :
+    Pass<"sodap-dataflow-tails", "::mlir::func::FuncOp"> {
+  let summary = "Cut the tiles of run-time shapes to the part inside them";
+  let description = [{
+    A tile from `sodap-join-multiple-tiles` has its shapes as arguments
+    (`sodap.dims`), and `transform.sodap.tile_and_fuse` gives it tile sizes
+    that need not divide them: the tasks walk static tiles, and the last tile
+    of a range reaches past it. Run after `sodap-dataflow-ping-pong` (or the
+    serial schedule), on each `memref.copy` between a static, unit-stride
+    tile of an argument with a dynamic shape and a local buffer:
+
+    - the copy moves the part of the tile inside the argument:
+      `min(size, dim - offset)` along each dynamic dim, to or from the start
+      of the local tile. `sodap-dataflow-copy-to-dma` then requests rows of
+      that length;
+    - before a copy in (a load), the local tile is filled with zeros when
+      some part is smaller than its size, and only then: a whole tile pays
+      nothing. The compute tasks stay on whole static tiles; the zeros add
+      nothing to a contraction, and the rows and columns past the argument
+      are never stored.
+
+    A store copies its part out without padding. Arguments with a static
+    shape (`LCS_TILES=kernel`) are left alone.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
 def PingPong :
     Pass<"sodap-dataflow-ping-pong", "::mlir::func::FuncOp"> {
   let summary = "Synchronise the tasks of a dispatch with ping-pong buffers";

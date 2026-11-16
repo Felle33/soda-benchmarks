@@ -52,6 +52,12 @@
 #                        schedule in one task; one physical copy of each buffer,
 #                        without ping-pong or an outstanding-load task.
 #   LCS_SEQUENTIAL=true  alias for LCS_OVERLAP=false (default false)
+#                        With LCS_COMPUTE_LANES and no LCS_TILE_SIZES, operators
+#                        mode takes the tile from the hardware budget alone
+#                        (scripts/lcs/reusable_gemm_config.py with LCS_PLM_BYTES,
+#                        written to hardware_selection.json): 128x64x64 for 64
+#                        lanes and 327680 bytes. Tile sizes need not divide the
+#                        shapes: sodap-dataflow-tails cuts the transfers at run time.
 #   LCS_TILE_SIZES       tile sizes instead of the cost model's: one list per
 #                        task result, one size per loop of the op producing it
 #                        (0 = untiled), e.g. '[[10, 10, 10], [10, 10]]' on gemm
@@ -174,6 +180,14 @@ if [ -z "${LCS_TILE_SIZES:-}" ] && [ "${_LCS_INTERNAL_CANDIDATE:-false}" = false
   python3 "$REPO_DIR/scripts/lcs/select_tiles.py" "$INPUT" "$PWD" "$REPO_DIR/scripts/tosa_to_lcs.sh"
   export LCS_TILE_SIZES="$(cat selected_tile_sizes.txt)"
 fi
+# One accelerator per operator, with a compute budget: the tile comes from
+# the hardware budget alone (lanes and PLM bytes), as tosa_to_reusable_gemm.sh
+# chooses it, never from the invocations: one hardware for every workload.
+# Sizes need not divide the shapes (sodap-dataflow-tails).
+if [ "$TILES" = operators ] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  python3 "$REPO_DIR/scripts/lcs/reusable_gemm_config.py" "$LCS_COMPUTE_LANES" "$TOTAL_PLM_BYTES" > hardware_selection.json
+  LCS_TILE_SIZES=$(python3 -c 'import json; c=json.load(open("hardware_selection.json")); print("[[%d, %d, %d]]" % (c["tile_m"], c["tile_n"], c["tile_k"]))')
+fi
 # LCS_TILE_SIZES or the model's variables replace the attributes of
 # @tile_tasks's tile_and_fuse, the only one on %tasks.
 TILE_ATTRS=
@@ -208,6 +222,12 @@ else
     fold-memref-alias-ops,
     func.func(sodap-dataflow-ping-pong)"
 fi
+# One accelerator per operator: its shapes are run-time values, and the tile
+# sizes need not divide them. Before the DMA, cut each transfer to the part
+# inside the matrix (after the cost report, which counts whole tiles: an upper
+# bound on a partial one).
+TAILS=
+[ "$TILES" = operators ] && TAILS="func.func(sodap-dataflow-tails),"
 DUMP=ir_after_each_pass.mlir
 FRONTEND_DUMP=ir_after_each_pass_frontend.mlir
 ACC_DUMP=ir_after_each_pass_acc.mlir
@@ -373,6 +393,7 @@ fi
 if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
   if [[ -n $COMPUTE_PREPARE ]]; then
     step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(builtin.module(
+      $TAILS
       sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH},
       $OUTSTANDING_LOAD func.func(sodap-dataflow-tasks-to-nodes),
       sodap-dataflow-nodes-to-func, $COMPUTE_PREPARE ${BANK_PREPARE%,}
@@ -382,6 +403,7 @@ if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
 fi
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     builtin.module(
+      $TAILS
       sodap-dataflow-copy-to-dma{dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH},
       $OUTSTANDING_LOAD
       func.func(

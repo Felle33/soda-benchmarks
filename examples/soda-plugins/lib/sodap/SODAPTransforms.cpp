@@ -480,6 +480,9 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
   // tile sizes, one per loop: the tile of its function in every loop, or
   // tile_sizes below.
   llvm::MapVector<Operation *, SmallVector<int64_t>> lasts;
+  // With tile_sizes: the sizes of the reduction loops of the producers fused
+  // under a yielded op, in the order the nest has them.
+  DenseMap<Operation *, SmallVector<int64_t>> fusedSizes;
   // A tile from sodap-join-multiple-tiles: its index arguments' values in
   // each invocation. Its ranges are dynamic; the sizes must fit them all.
   SmallVector<SmallVector<int64_t>> invocations;
@@ -556,28 +559,54 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
         allRanges.push_back(loopRanges(cast<linalg::LinalgOp>(last), inv));
       SmallVector<int64_t> ranges = allRanges.front();
       auto list = dyn_cast<ArrayAttr>(attr);
-      if (!list || list.size() != ranges.size()) {
+      // After the op's own sizes: one per reduction loop of the producers
+      // fused in its nest (gemm's matmul under its epilogue).
+      unsigned fusedReductions = 0;
+      if (auto task = last->getParentOfType<sodap::dataflow::TaskOp>())
+        task->walk([&](linalg::LinalgOp op) {
+          if (op.getOperation() != last)
+            fusedReductions += op.getNumReductionLoops();
+        });
+      if (!list || (list.size() != ranges.size() &&
+                    list.size() != ranges.size() + fusedReductions)) {
         DiagnosedSilenceableFailure diag =
             emitSilenceableError() << "expected a list of " << ranges.size()
                                    << " sizes, one per loop of the op";
+        if (fusedReductions)
+          diag << ", or " << ranges.size() + fusedReductions
+               << " with the reduction loops of its fused producers";
         diag.attachNote(last->getLoc()) << "op";
         return diag;
       }
       for (auto [d, element] : llvm::enumerate(list)) {
         auto value = dyn_cast<IntegerAttr>(element);
         int64_t tile = value ? value.getInt() : -1;
-        bool divides = llvm::all_of(allRanges, [&](ArrayRef<int64_t> r) {
-          return tile && r[d] % tile == 0;
-        });
+        if (d >= ranges.size()) {
+          if (tile <= 0) {
+            DiagnosedSilenceableFailure diag =
+                emitSilenceableError()
+                << "expected a positive size #" << d
+                << " for a fused producer's reduction loop";
+            diag.attachNote(last->getLoc()) << "op";
+            return diag;
+          }
+          fusedSizes[last].push_back(tile);
+          continue;
+        }
+        // With invocations the tiles are cut at run time
+        // (sodap-dataflow-tails): a size need not divide the ranges.
+        bool divides = !invocations.empty() ||
+                       llvm::all_of(allRanges, [&](ArrayRef<int64_t> r) {
+                         return tile && r[d] % tile == 0;
+                       });
         if (tile < 0 || (tile && !divides) ||
             (!tile && !invocations.empty())) {
           DiagnosedSilenceableFailure diag = emitSilenceableError()
                                              << "expected size #" << d
-                                             << " to be 0 or a divisor of "
-                                             << ranges[d]
                                              << (invocations.empty()
-                                                     ? ""
-                                                     : " in every invocation");
+                                                     ? " to be 0 or a divisor of "
+                                                     : " to be positive, range ")
+                                             << ranges[d];
           diag.attachNote(last->getLoc()) << "op";
           return diag;
         }
@@ -634,8 +663,10 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
   {
     InFlightDiagnostic remark = emitRemark() << "tile_sizes = [";
     llvm::interleaveComma(lasts, remark, [&](const auto &entry) {
+      SmallVector<int64_t> all(entry.second);
+      llvm::append_range(all, fusedSizes.lookup(entry.first));
       remark << "[";
-      llvm::interleaveComma(entry.second, remark);
+      llvm::interleaveComma(all, remark);
       remark << "]";
     });
     remark << "]";
@@ -689,17 +720,30 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
       if (op.getNumReductionLoops() > 0)
         reductions.push_back(op);
     });
+    SmallVector<int64_t> fusedOfLast = fusedSizes.lookup(last);
+    ArrayRef<int64_t> fusedLeft = fusedOfLast;
     for (linalg::LinalgOp op : reductions) {
       // A fused producer: the tile of the function in every loop, as `last`
-      // got. tile_sizes has no place for its reductions.
-      // ponytail: fused reductions (e.g. @tasks_trmm) need max_tile_size;
-      // append their reduction sizes to the op's list if a partition needs it.
+      // got; with tile_sizes, its reduction loops take the sizes after the
+      // yielded op's own (its parallel loops are already the tile).
       bool isLast = op.getOperation() == tiledLast;
-      if (!isLast && explicitSizes)
-        return emitDefiniteFailure()
-               << "expected the reductions in the yielded op with tile_sizes";
       SmallVector<int64_t> opSizes =
           isLast ? sizes : SmallVector<int64_t>(op.getNumLoops(), sizes[0]);
+      if (!isLast && explicitSizes) {
+        if (fusedLeft.size() < op.getNumReductionLoops())
+          return emitDefiniteFailure()
+                 << "expected the reductions in the yielded op with "
+                    "tile_sizes, or a size per reduction loop of its fused "
+                    "producers after its own";
+        for (auto [type, size] :
+             llvm::zip_equal(op.getIteratorTypesArray(), opSizes)) {
+          size = 0;
+          if (type == utils::IteratorType::reduction) {
+            size = fusedLeft.front();
+            fusedLeft = fusedLeft.drop_front();
+          }
+        }
+      }
       if (llvm::all_of(llvm::zip_equal(op.getIteratorTypesArray(), opSizes),
                        [](auto pair) {
                          return std::get<0>(pair) ==
@@ -718,11 +762,11 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     }
   }
 
-  // With invocations every size divides every range, so no tile is partial:
-  // min(step, ub - iv) on a tiled loop is the step, and the tiles keep a
-  // static shape.
-  // ponytail: tails (sizes that don't divide) keep the min and need dynamic
-  // tiles downstream.
+  // With invocations the tiles keep a static shape: min(step, ub - iv) on a
+  // tiled loop becomes the step. The last tile of a range the step doesn't
+  // divide then reaches past the range; sodap-dataflow-tails cuts every
+  // transfer of a tile of an argument to min(step, range - offset) and pads
+  // the local tile with zeros, so the tasks compute on whole tiles.
   if (!invocations.empty()) {
     for (func::FuncOp func : funcs)
       func.walk([&](affine::AffineMinOp min) {

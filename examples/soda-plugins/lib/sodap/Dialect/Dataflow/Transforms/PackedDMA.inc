@@ -33,6 +33,36 @@ static bool packedNeedsBoundary(Transfer t, unsigned width) {
   bool start = c ? (*c % lanes == 0) : packedMultiple(cast<Value>(last), lanes);
   if (!start)
     return true;
+  if (ShapedType::isDynamic(length)) {
+    // A tile cut at run time (sodap-dataflow-tails): min(dim - offset, size).
+    // It ends at a whole size, which must be whole beats, or at the row's
+    // end, which owns its padding. Anything else takes the boundary path.
+    auto min = t.tile.getMixedSizes().back().get<Value>()
+                   .getDefiningOp<arith::MinUIOp>();
+    if (!min)
+      return true;
+    for (auto [left, whole] : {std::pair<Value, Value>{min.getLhs(), min.getRhs()},
+                               {min.getRhs(), min.getLhs()}}) {
+      auto size = getConstantIntValue(whole);
+      auto sub = left.getDefiningOp<arith::SubIOp>();
+      if (!size || *size % lanes || !sub)
+        continue;
+      OpFoldResult offset = getAsOpFoldResult(sub.getRhs());
+      if (offset != getAsOpFoldResult(cast<Value>(last)) &&
+          !(c && getConstantIntValue(offset) == c))
+        continue;
+      auto arg = dyn_cast<BlockArgument>(t.tile.getSource());
+      auto func = arg ? dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp())
+                      : func::FuncOp();
+      auto dims = func ? func.getArgAttrOfType<DenseI64ArrayAttr>(
+                             arg.getArgNumber(), "sodap.dims")
+                       : DenseI64ArrayAttr();
+      unsigned d = offsets.size() - 1;
+      if (dims && d < dims.size() && sub.getLhs() == func.getArgument(dims[d]))
+        return false;
+    }
+    return true;
+  }
   if (length % lanes == 0)
     return false;
   // Only a proven tensor end owns its padding.
@@ -49,14 +79,23 @@ static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
   Value buffer = t.read ? t.copy.getTarget() : t.copy.getSource();
   auto arg =
       t.tile ? t.tile.getSourceType() : cast<MemRefType>(buffer.getType());
-  auto sizes = t.tile ? llvm::to_vector(t.tile.getStaticSizes())
-                      : llvm::to_vector(arg.getShape());
+  // A size is a value in a tile cut at run time (sodap-dataflow-tails).
+  SmallVector<OpFoldResult> sizes =
+      getAsIndexOpFoldResult(b.getContext(), arg.getShape());
+  if (t.tile)
+    sizes = t.tile.getMixedSizes();
+  auto sizeOf = [&](OpFoldResult size) -> Value {
+    if (std::optional<int64_t> constant = getConstantIntValue(size))
+      return e.idx(*constant);
+    return cast<Value>(size);
+  };
   unsigned rank = sizes.size();
   SmallVector<OpFoldResult> offsets(rank, b.getIndexAttr(0));
   if (t.tile)
     offsets = t.tile.getMixedOffsets();
   // No request for an empty logical copy (zero is reserved for broker EOF).
-  if (llvm::is_contained(sizes, int64_t(0)))
+  if (llvm::any_of(sizes,
+                   [](OpFoldResult size) { return isConstantIntValue(size, 0); }))
     return;
   auto strides = t.baseField < 0 ? computeSuffixProduct(arg.getShape())
                                   : SmallVector<int64_t>(rank, 1);
@@ -68,7 +107,7 @@ static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
       strides[d] = strides[d] / arg.getShape().back() * rowWords;
   SmallVector<Value> ivs;
   for (unsigned d = 0; d + 1 < rank; ++d) {
-    auto loop = b.create<scf::ForOp>(loc, e.idx(0), e.idx(sizes[d]), e.idx(1));
+    auto loop = b.create<scf::ForOp>(loc, e.idx(0), sizeOf(sizes[d]), e.idx(1));
     b.setInsertionPointToStart(loop.getBody());
     ivs.push_back(loop.getInductionVar());
   }
@@ -82,10 +121,9 @@ static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
         : (d == 0 ? e.div(fields[t.ldField], e.idx(4)) : e.idx(1));
     addr = e.add(addr, e.mul(offset, stride));
   }
-  int64_t length = rank ? sizes.back() : 1;
   Value lanes = e.idx(width / 32), first = e.rem(addr, lanes),
         start = e.div(addr, lanes);
-  Value end = e.add(first, e.idx(length)),
+  Value end = e.add(first, rank ? sizeOf(sizes.back()) : e.idx(1)),
         count = e.div(e.add(end, e.idx(width / 32 - 1)), lanes);
   Value lastEnd = e.add(e.rem(e.sub(end, e.idx(1)), lanes), e.idx(1));
   Type element = cast<MemRefType>(buffer.getType()).getElementType();
@@ -147,7 +185,7 @@ static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
     if (notice)
       e.write(notice, e.integer(1, 8));
     e.loop(count, [&](Value beat) { e.write(dma.writeData, payload(beat)); });
-  } else if (packedNeedsBoundary(t, width)) {
+  } else if (t.boundary ? *t.boundary : packedNeedsBoundary(t, width)) {
     e.store(dma, start, count, first, lastEnd, payload);
   } else {
     // Full rows own their padding. They need no RMW or broker.
