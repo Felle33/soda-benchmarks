@@ -82,7 +82,7 @@ and the board are William's only so far.
 | Odd-tail, multi-tile, 300,000-cycle stall | Yes | Yes |
 | beta = 0 with C all NaN | Not tested | Yes; C's reads skipped (51 against 71 read requests) |
 | Full-system ESP SoC RTL, MINI gemm/2mm/3mm | Yes | Yes (on the handoff's SoC fixture, see below) |
-| Vivado routing, resources, timing | Yes | Running |
+| Vivado routing, resources, timing | Yes | Not completed (see Problems) |
 | LARGE on the VC707 board | Yes | No |
 
 Re-running William's archived RTL in our harness reproduces his recorded
@@ -177,8 +177,24 @@ compute task's time per phase, in cycles:
   cycles per case) and no board run.
 - **Area and timing closure:** William's engine routes at 41,010 LUT, 14,960
   registers, 142 DSP, 235 BRAM36 (WNS +0.555 ns). Ours has one node and 15
-  FIFOs fewer; its VC707 SoC build (William's `implement.tcl`, the handoff's
-  ESP tree) is running in `releases/exp2-operators-campaign/fpga/fpga-2`.
+  FIFOs fewer, but its VC707 SoC build has not completed (next section).
+
+## Problems met in the full-system and FPGA campaign
+
+The campaign is in `releases/exp2-operators-campaign/` (beside William's
+release, which is not modified). Problems so far, in order:
+
+| # | Problem | Cause | Status |
+|---|---|---|---|
+| 1 | William's run directory and platforms are not readable | `/home/william/bambu-esp-example` (his Experiment 2 full-system platform, and SPECTRA's 2x2 platform `spectra-baseline-20261110` that his FPGA build uses as template) is not accessible from this account | Worked around: the full-system runs and the SoC build use the 2026-11-06 handoff (`/home/tommaso/esp-handoff-20261106`): its ESP tree, its compiled `compare` SoC (Ariane, `SQR_BAMBU` with `basic_dma64`, DMA 64 bits, no L2/LLC; a 2x3 grid with two empty tiles), boot ROM and vendor simulation libraries. Numbers are therefore not on William's exact platform |
+| 2 | `fpga-1`: the SoC preparation did nothing and the build stopped with `FileNotFoundError` on `esp/integration.json` | `/opt/cad/scripts/xilinx_env.sh` starts with a loop that `shift`s away every positional argument; the wrapper's `exec "$@"` after sourcing it ran nothing and returned success | Fixed in `build-fpga.py`: the command is saved in an array before sourcing |
+| 3 | `fpga-2`: synthesis failed at once: `A valid license was not found for feature 'Synthesis' and/or device 'xc7vx485t'` (run `sgmii_synth_1`) | `xilinx_env.sh` sets `XILINXD_LICENSE_FILE=2177@goliah.cs.columbia.edu`, whose port 2177 refuses connections from this machine | `2177@espdev.cs.columbia.edu` (from `xilinx_env_20183.sh`) answers and grants the Synthesis licence for xc7vx485t under Vivado 2023.2 (checked on a one-register design; the licence's version limit is 2024.12). `build-fpga.py` now uses it, overridable with `EXP2_XILINXD_LICENSE_FILE`, and records it in `build.json` |
+| 4 | `fpga-3`, the first build with that licence, stopped by hand during the Vivado project setup | Stopped on request | Not restarted. Its `build.json` still reads `IMPLEMENTING`: the stop gave it no chance to write a final status. No Vivado process is left |
+
+A new build must use a fresh run name (`python3 build-fpga.py --run fpga-4`);
+`fpga-1` to `fpga-3` are kept as they are. Whether the `espdev` licence is the
+one to use for these builds (William's builds ran with the environment of his
+own machine) is still to be confirmed.
 
 ## Where things are
 
