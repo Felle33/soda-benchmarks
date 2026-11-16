@@ -6,8 +6,9 @@ Experiment 2's reusable GEMM accelerator is now generated from the model's
 TOSA operators by the generic dataflow passes, not by a dedicated generator.
 It runs the same launches as William's engine, with the same tile, lanes and
 storage. In component RTL it is faster in every case measured (MINI 3mm:
-80,469 cycles against 86,496). LARGE board results, routing and full-system
-RTL are not measured yet.
+80,469 cycles against 86,496), and the MINI gemm, 2mm and 3mm applications
+pass in full-system ESP RTL (3mm: 88,524 cycles of offload sequence against
+95,505). LARGE board results and routing are not measured yet.
 
 ## What changed
 
@@ -80,8 +81,8 @@ and the board are William's only so far.
 | Component RTL, MINI gemm/2mm/3mm, stall 0 and 50,000 | Yes | Yes |
 | Odd-tail, multi-tile, 300,000-cycle stall | Yes | Yes |
 | beta = 0 with C all NaN | Not tested | Yes; C's reads skipped (51 against 71 read requests) |
-| Full-system ESP SoC RTL | Yes | Started |
-| Vivado routing, resources, timing | Yes | Started |
+| Full-system ESP SoC RTL, MINI gemm/2mm/3mm | Yes | Yes (on the handoff's SoC fixture, see below) |
+| Vivado routing, resources, timing | Yes | Running |
 | LARGE on the VC707 board | Yes | No |
 
 Re-running William's archived RTL in our harness reproduces his recorded
@@ -121,6 +122,27 @@ The hardware, side by side (Bambu HLS, xc7vx485t-2ffg1761, 20 ns):
 | Epilogue | Valid elements only | Valid elements only |
 | Load order | C, then A and B | A and B, then C during the matmul |
 
+### Full-system ESP RTL
+
+The MINI applications, built from this branch's host LLVM with William's
+`baremetal.c` harness, pass in ModelSim on the complete SoC (Ariane, NoC, DMA
+64 bits, the accelerator behind the packed DMA64 adapter): `TEST PASSED`,
+every output within tolerance, one start and one completion per launch.
+Cycles per launch, at 50 MHz (accelerator: start to done; offload: the host's
+launch, including programming and polling):
+
+| MINI | William: accelerator | William: offload sequence | Ours: accelerator | Ours: offload sequence |
+|---|---|---:|---|---:|
+| gemm | 43,386 | 45,569 | 30,145 | 32,107 |
+| 2mm | 29,112 / 39,250 | 72,665 | 27,213 / 27,783 | 58,785 |
+| 3mm | 28,887 / 30,862 / 29,484 | 95,505 | 27,057 / 28,469 / 27,489 | 88,524 |
+
+The SoC fixture differs: William ran on his Experiment 2 platform; ours is
+the 2026-11-06 handoff's compiled `compare` SoC (same Ariane, `SQR_BAMBU`
+socket with `basic_dma64`, DMA 64 bits, no L2/LLC; tiles memory, CPU, I/O,
+accelerator and two empty), the only one on this machine. Runs:
+`releases/exp2-operators-campaign/systems/generated-{gemm,twomm,threemm}-1`.
+
 ## Why the numbers differ
 
 Measured with a timeline probe added to the testbench (FIFO handshakes
@@ -155,9 +177,8 @@ compute task's time per phase, in cycles:
   cycles per case) and no board run.
 - **Area and timing closure:** William's engine routes at 41,010 LUT, 14,960
   registers, 142 DSP, 235 BRAM36 (WNS +0.555 ns). Ours has one node and 15
-  FIFOs fewer, but has not been through Vivado.
-- **Full-system ESP RTL:** William ran the six MINI cases in the SoC; ours are
-  starting next to his runs.
+  FIFOs fewer; its VC707 SoC build (William's `implement.tcl`, the handoff's
+  ESP tree) is running in `releases/exp2-operators-campaign/fpga/fpga-2`.
 
 ## Where things are
 
@@ -171,4 +192,5 @@ compute task's time per phase, in cycles:
 | beta = 0 / NaN-C case | `exp2/runs/g8-nan-1/` |
 | IR after each of the 150 passes (MINI gemm) | `exp2/runs/print-after-all-1/cases/MINI/gemm/generated/passes/` |
 | Drivers and probe | `examples/esp-validation/reusable-gemm/operators/` |
+| Full-system RTL and FPGA campaign | `releases/exp2-operators-campaign/` (beside William's release; its `README.md`) |
 | William's release | `releases/exp2/` |
