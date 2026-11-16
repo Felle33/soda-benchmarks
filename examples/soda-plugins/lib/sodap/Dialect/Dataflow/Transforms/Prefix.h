@@ -17,6 +17,7 @@
 
 #include "sodap/Dialect/Dataflow/Dataflow.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -38,12 +39,116 @@ struct Step {
 };
 using Prefix = SmallVector<Step>;
 
-/// An op of a task using the buffer, through `view`.
+/// An op of a task using the buffer, through `view`. The op may be a part
+/// of a static tile (partOfTile): it then reads or writes through its users.
 struct Access {
   Operation *op;
   Value view;
   bool writes;
+  bool reads;
+  /// For a part of a tile, its last user (through views), in `op`'s block:
+  /// where the access ends.
+  Operation *end = nullptr;
+  Operation *last() const { return end ? end : op; }
 };
+
+/// The constant `size` is at most: a constant, or a min with a constant
+/// operand (tile_and_fuse's min(step, ub - iv)).
+inline std::optional<int64_t> boundOf(OpFoldResult size) {
+  if (std::optional<int64_t> c = getConstantIntValue(size))
+    return c;
+  Value v = cast<Value>(size);
+  std::optional<int64_t> bound;
+  auto take = [&](int64_t c) { bound = bound ? std::min(*bound, c) : c; };
+  if (auto min = v.getDefiningOp<affine::AffineMinOp>()) {
+    for (AffineExpr e : min.getMap().getResults())
+      if (auto c = dyn_cast<AffineConstantExpr>(e))
+        take(c.getValue());
+  } else if (isa_and_present<arith::MinUIOp, arith::MinSIOp>(v.getDefiningOp())) {
+    for (Value o : v.getDefiningOp()->getOperands())
+      if (std::optional<int64_t> c = getConstantIntValue(o); c && *c >= 0)
+        take(*c);
+  }
+  return bound;
+}
+
+inline bool atMost(OpFoldResult size, int64_t bound) {
+  std::optional<int64_t> b = boundOf(size);
+  return b && *b <= bound;
+}
+
+/// A part of a static tile: a unit-stride, rank-preserving subview at offset
+/// 0 of a view with a static shape, no larger than it (an element-wise op
+/// cut to the part of its tile inside the matrix, tile_and_fuse). The tasks'
+/// schedule moves the whole tile; sodap-dataflow-tails cuts the transfer.
+inline bool partOfTile(Operation *op) {
+  auto subview = dyn_cast<memref::SubViewOp>(op);
+  if (!subview)
+    return false;
+  auto source = subview.getSourceType();
+  if (!source.hasStaticShape() ||
+      subview.getType().getRank() != source.getRank() ||
+      !llvm::all_of(subview.getMixedOffsets(),
+                    [](OpFoldResult o) { return isConstantIntValue(o, 0); }) ||
+      !llvm::all_of(subview.getStaticStrides(),
+                    [](int64_t s) { return s == 1; }))
+    return false;
+  for (auto [size, bound] :
+       llvm::zip_equal(subview.getMixedSizes(), source.getShape()))
+    if (!atMost(size, bound))
+      return false;
+  return true;
+}
+
+/// The static tile a part of a tile is of, or `view` itself.
+inline Value tileOfPart(Value view) {
+  while (Operation *def = view.getDefiningOp()) {
+    if (!partOfTile(def))
+      break;
+    view = cast<memref::SubViewOp>(def).getSource();
+  }
+  return view;
+}
+
+/// `op` reads `view` through `target` instead. A part of a tile stays the
+/// same op (the schedule may hold it): its source becomes `target`, its type
+/// follows, and a cast gives its users the type they had.
+inline void replaceAccessedView(Operation *op, Value view, Value target) {
+  auto part = dyn_cast<memref::SubViewOp>(op);
+  if (!part || !partOfTile(op) || part.getSource() != view) {
+    op->replaceUsesOfWith(view, target);
+    return;
+  }
+  MemRefType old = part.getType();
+  part.getSourceMutable().assign(target);
+  auto type = cast<MemRefType>(memref::SubViewOp::inferResultType(
+      cast<MemRefType>(target.getType()), part.getStaticOffsets(),
+      part.getStaticSizes(), part.getStaticStrides()));
+  if (type == old)
+    return;
+  part.getResult().setType(type);
+  OpBuilder builder(op->getContext());
+  builder.setInsertionPointAfter(op);
+  auto cast = builder.create<memref::CastOp>(part.getLoc(), old, part.getResult());
+  part.getResult().replaceAllUsesExcept(cast, cast);
+}
+
+/// Whether some use of `value`, through views, has the effect.
+template <typename Effect>
+inline bool hasEffectThroughViews(Value value) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *op = use.getOwner();
+    if (auto view = dyn_cast<ViewLikeOpInterface>(op);
+        view && view.getViewSource() == value) {
+      if (hasEffectThroughViews<Effect>(op->getResult(0)))
+        return true;
+      continue;
+    }
+    if (hasEffect<Effect>(op, value))
+      return true;
+  }
+  return false;
+}
 
 /// Lower bound, upper bound and step, if constant.
 inline std::optional<std::array<int64_t, 3>> boundsOf(scf::ForOp loop) {
@@ -201,7 +306,7 @@ accessesOf(Value buffer, DispatchOp dispatch) {
     for (OpOperand &use : view.getUses()) {
       Operation *op = use.getOwner();
       if (auto viewOp = dyn_cast<ViewLikeOpInterface>(op);
-          viewOp && viewOp.getViewSource() == view) {
+          viewOp && viewOp.getViewSource() == view && !partOfTile(op)) {
         views.push_back(op->getResult(0));
         continue;
       }
@@ -213,8 +318,25 @@ accessesOf(Value buffer, DispatchOp dispatch) {
                         "its tasks");
         return failure();
       }
-      accesses[task].push_back(
-          {op, view, hasEffect<MemoryEffects::Write>(op, view)});
+      if (partOfTile(op)) {
+        Operation *end = op;
+        SmallVector<Value> through{op->getResult(0)};
+        while (!through.empty())
+          for (Operation *user : through.pop_back_val().getUsers()) {
+            if (isa<ViewLikeOpInterface, memref::CastOp>(user))
+              through.push_back(user->getResult(0));
+            if (Operation *at = op->getBlock()->findAncestorOpInBlock(*user);
+                at && end->isBeforeInBlock(at))
+              end = at;
+          }
+        accesses[task].push_back(
+            {op, view, hasEffectThroughViews<MemoryEffects::Write>(op->getResult(0)),
+             hasEffectThroughViews<MemoryEffects::Read>(op->getResult(0)), end});
+      }
+      else
+        accesses[task].push_back({op, view,
+                                  hasEffect<MemoryEffects::Write>(op, view),
+                                  hasEffect<MemoryEffects::Read>(op, view)});
     }
   }
   return accesses;

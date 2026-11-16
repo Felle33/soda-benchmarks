@@ -672,6 +672,15 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     remark << "]";
   }
 
+  // With invocations, an element-wise yielded op (GEMM's epilogue) runs
+  // only on the part of its tile inside the matrix: its tile sizes, before
+  // they become static below, min(step, ub - iv) per loop.
+  struct ValidPart {
+    linalg::LinalgOp op;
+    SmallVector<OpFoldResult> sizes;
+  };
+  SmallVector<ValidPart> validParts;
+
   for (auto &[last, sizes] : lasts) {
     OperationName lastName = last->getName();
     scf::SCFTilingOptions parallelTiling;
@@ -760,6 +769,39 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
         return emitDefiniteFailure() << "failed to tile a reduction";
       rewriter.replaceOp(op, tiled->replacements);
     }
+
+    auto elementwise = dyn_cast<linalg::LinalgOp>(tiledLast);
+    if (!invocations.empty() && elementwise &&
+        elementwise.getNumReductionLoops() == 0 &&
+        elementwise.getNumDpsInits() == 1 && elementwise->getNumResults() == 1) {
+      // Every tensor operand a tile of the iteration domain (identity map);
+      // rank-0 operands (scalars) are left as they are.
+      bool identity = llvm::all_of(elementwise->getOpOperands(), [&](OpOperand &o) {
+        auto type = dyn_cast<RankedTensorType>(o.get().getType());
+        return !type || type.getRank() == 0 ||
+               elementwise.getMatchingIndexingMap(&o).isIdentity();
+      });
+      auto init = elementwise.getDpsInits()[0].getDefiningOp<tensor::ExtractSliceOp>();
+      if (identity && init &&
+          init.getType().getRank() == int64_t(elementwise.getNumLoops())) {
+        ValidPart part{elementwise, {}};
+        for (OpFoldResult size : init.getMixedSizes()) {
+          auto min = dyn_cast_if_present<Value>(size)
+                         ? cast<Value>(size).getDefiningOp<affine::AffineMinOp>()
+                         : affine::AffineMinOp();
+          if (!min) {
+            part.sizes.push_back(size);
+            continue;
+          }
+          // A copy that stays dynamic: the original becomes the step below.
+          rewriter.setInsertionPointAfter(min);
+          Operation *copy = rewriter.clone(*min);
+          copy->setAttr("sodap.valid_size", rewriter.getUnitAttr());
+          part.sizes.push_back(copy->getResult(0));
+        }
+        validParts.push_back(std::move(part));
+      }
+    }
   }
 
   // With invocations the tiles keep a static shape: min(step, ub - iv) on a
@@ -770,6 +812,8 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
   if (!invocations.empty()) {
     for (func::FuncOp func : funcs)
       func.walk([&](affine::AffineMinOp min) {
+        if (min->hasAttr("sodap.valid_size"))
+          return;
         for (Value operand : min.getOperands()) {
           auto loop = scf::getForInductionVarOwner(operand);
           std::optional<int64_t> step =
@@ -786,6 +830,33 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
         }
       });
   }
+  // The element-wise yielded ops on [0, 0][valid sizes] of their static
+  // tiles, inserted back: the rest of the tile is never stored
+  // (sodap-dataflow-tails cuts the store to the same part).
+  for (ValidPart &part : validParts) {
+    linalg::LinalgOp op = part.op;
+    Location loc = op.getLoc();
+    rewriter.setInsertionPoint(op);
+    int64_t rank = op.getNumLoops();
+    SmallVector<OpFoldResult> zeros(rank, rewriter.getIndexAttr(0)),
+        ones(rank, rewriter.getIndexAttr(1));
+    IRMapping mapping;
+    for (OpOperand &o : op->getOpOperands()) {
+      auto type = dyn_cast<RankedTensorType>(o.get().getType());
+      if (!type || type.getRank() != rank)
+        continue;
+      mapping.map(o.get(), rewriter.create<tensor::ExtractSliceOp>(
+                               loc, o.get(), zeros, part.sizes, ones));
+    }
+    Value init = op.getDpsInits()[0];
+    Operation *cut = rewriter.clone(*op.getOperation(), mapping);
+    cut->getResult(0).setType(mapping.lookup(init).getType());
+    Value whole = rewriter.create<tensor::InsertSliceOp>(
+        loc, cut->getResult(0), init, zeros, part.sizes, ones);
+    rewriter.replaceOp(op, whole);
+  }
+  for (func::FuncOp func : funcs)
+    func.walk([](affine::AffineMinOp min) { min->removeAttr("sodap.valid_size"); });
   return DiagnosedSilenceableFailure::success();
 }
 

@@ -76,14 +76,15 @@ FailureOr<Side> sideOf(TaskOp task, ArrayRef<Access> accesses) {
     while (!side.level->findAncestorOpInBlock(*access.op))
       side.level = side.level->getParentOp()->getBlock();
     side.writes |= access.writes;
-    side.reads |= hasEffect<MemoryEffects::Read>(access.op, access.view);
+    side.reads |= access.reads;
   }
   for (const Access &access : accesses) {
     Operation *op = side.level->findAncestorOpInBlock(*access.op);
+    Operation *end = side.level->findAncestorOpInBlock(*access.last());
     if (!side.first || op->isBeforeInBlock(side.first))
       side.first = op;
-    if (!side.last || side.last->isBeforeInBlock(op))
-      side.last = op;
+    if (!side.last || side.last->isBeforeInBlock(end))
+      side.last = end;
   }
   return side;
 }
@@ -139,10 +140,11 @@ LogicalResult reuseScope(Side &side, Value buffer, DenseI64ArrayAttr dims) {
   side.first = side.last = nullptr;
   for (const Access &access : side.accesses) {
     Operation *op = side.level->findAncestorOpInBlock(*access.op);
+    Operation *end = side.level->findAncestorOpInBlock(*access.last());
     if (!side.first || op->isBeforeInBlock(side.first))
       side.first = op;
-    if (!side.last || side.last->isBeforeInBlock(op))
-      side.last = op;
+    if (!side.last || side.last->isBeforeInBlock(end))
+      side.last = end;
   }
   return success();
 }
@@ -150,7 +152,7 @@ LogicalResult reuseScope(Side &side, Value buffer, DenseI64ArrayAttr dims) {
 LogicalResult replaceAccess(OpBuilder &builder, const Access &access,
                             Value target, DenseI64ArrayAttr reuseDims) {
   if (!reuseDims) {
-    access.op->replaceUsesOfWith(access.view, target);
+    replaceAccessedView(access.op, access.view, target);
     return success();
   }
   OpBuilder::InsertionGuard guard(builder);
@@ -167,11 +169,54 @@ LogicalResult replaceAccess(OpBuilder &builder, const Access &access,
     sizes.push_back(builder.getIndexAttr(size));
   Value view = builder.create<memref::SubViewOp>(access.op->getLoc(), target,
                                                  tile->offsets, sizes, strides);
-  access.op->replaceUsesOfWith(access.view, view);
+  replaceAccessedView(access.op, access.view, view);
   return success();
 }
 
+/// fold-memref-alias-ops merges a part of a tile (partOfTile) into its
+/// tile: subview(buffer, [o][min(s, ...)]). Split it back into the static
+/// tile, subview(buffer, [o][s]), and the part of it, so the tasks still
+/// exchange tiles of one shape.
+void splitParts(DispatchOp dispatch) {
+  OpBuilder builder(dispatch.getContext());
+  for (auto alloc : dispatch.getBody().front().getOps<memref::AllocOp>())
+    for (Operation *user : llvm::to_vector(alloc->getUsers())) {
+      auto subview = dyn_cast<memref::SubViewOp>(user);
+      if (!subview || subview.getSource() != alloc.getResult() ||
+          subview.getType().getRank() != alloc.getType().getRank() ||
+          !llvm::all_of(subview.getStaticStrides(),
+                        [](int64_t s) { return s == 1; }) ||
+          llvm::all_of(subview.getMixedSizes(), [](OpFoldResult size) {
+            return getConstantIntValue(size).has_value();
+          }))
+        continue;
+      SmallVector<OpFoldResult> tileSizes;
+      for (OpFoldResult size : subview.getMixedSizes()) {
+        std::optional<int64_t> bound = boundOf(size);
+        if (!bound)
+          break;
+        tileSizes.push_back(builder.getIndexAttr(*bound));
+      }
+      if (tileSizes.size() != subview.getMixedSizes().size())
+        continue;
+      builder.setInsertionPoint(subview);
+      Location loc = subview.getLoc();
+      int64_t rank = tileSizes.size();
+      SmallVector<OpFoldResult> ones(rank, builder.getIndexAttr(1)),
+          zeros(rank, builder.getIndexAttr(0));
+      Value tile = builder.create<memref::SubViewOp>(
+          loc, alloc, subview.getMixedOffsets(), tileSizes, ones);
+      Value part = builder.create<memref::SubViewOp>(
+          loc, tile, zeros, subview.getMixedSizes(), ones);
+      if (part.getType() != subview.getType())
+        part = builder.create<memref::CastOp>(loc, subview.getType(), part);
+      subview.replaceAllUsesWith(part);
+      subview.erase();
+    }
+}
+
 LogicalResult pingPong(DispatchOp dispatch) {
+  splitParts(dispatch);
   Block &body = dispatch.getBody().front();
   OpBuilder builder(dispatch.getContext());
   Type i8 = builder.getI8Type();

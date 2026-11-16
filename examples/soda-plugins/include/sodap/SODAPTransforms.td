@@ -79,7 +79,10 @@ def TileAndFuseOp : Op<Transform_Dialect, "sodap.tile_and_fuse",
       epilogue in one task take `[[10, 10, 10]]`, the epilogue's two loops
       then the matmul's reduction. In a tile from `sodap-join-multiple-tiles`
       (`sodap.invocations`) a size need not divide the ranges: the tiles stay
-      static and `sodap-dataflow-tails` cuts the transfers at run time.
+      static and `sodap-dataflow-tails` cuts the transfers at run time. An
+      element-wise yielded op (GEMM's epilogue) runs only on the part of its
+      tile inside the ranges: on `[0, 0][min(step, ub - iv), ...]` slices of
+      its static tiles, inserted back.
     - `plm_bytes`, a cost model: the sizes with the fewest DMA cycles whose
       buffers fit in `plm_bytes` bytes. It models the tasks as
       `sodap-dataflow-load-store` and `sodap-dataflow-copy-to-dma` will cut

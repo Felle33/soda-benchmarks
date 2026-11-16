@@ -123,8 +123,7 @@ Evidence (runs in `exp2/runs/`, all with one accelerator,
   the C read is skipped in hardware (51 requests / 706 beats against 71 /
   966 with beta ≠ 0: C's 20 rows, 260 beats).
 
-RTL cycles (one invocation each; the measured engine's MINI 3mm is
-28,011 / 57,845 / 86,496 cumulative):
+RTL cycles of that first engine (cumulative over the invocations):
 
 | MINI | Stall 0 | Stall 50,000 |
 |---|---:|---:|
@@ -132,8 +131,46 @@ RTL cycles (one invocation each; the measured engine's MINI 3mm is
 | 2mm | 73,858, 147,820 | same |
 | 3mm | 73,753, 148,138, 221,992 | same |
 
-The schedule is the dataflow passes' (D3), not the generator's: about 2.6
-times the measured engine's cycles on MINI, to be explained (O3).
+### Why 2.6 times the measured engine, and the fix (O3)
+
+Measured with a timeline probe in the packed testbench (FIFO handshakes
+between the task nodes, node start/done, DMA requests; `exp2/runs/perf-1`,
+`tools/compute-phases.py`), on our RTL and the release's `hardware-v4`:
+load, zero padding and matmul take the same time in both engines (MINI 3mm
+launch 0: 13.8k / 15.0k cycles to the A/B tiles, 10.1k matmul). The
+difference was the epilogue, about 6 cycles an element in both: ours ran it
+on the whole static 128×64 tile (8,192 elements, 49,283 cycles), the
+generator only on `min(M − i, 128) × min(N − j, 64)` (1,765 cycles).
+
+Fix: `tile_and_fuse` keeps the tile sizes `min(step, ub − iv)` for an
+element-wise yielded op (with invocations) and runs it on `[0, 0]` slices
+of its static tiles, inserted back; the matmul and every buffer stay static.
+The dataflow passes treat such a part of a static tile as an access of the
+tile (`partOfTile`, `Prefix.h`): the schedule moves whole tiles (cut by
+`sodap-dataflow-tails`), ping-pong splits the part `fold-memref-alias-ops`
+merges back out of its tile and publishes after the part's last user; the
+cost report counts it as its tile.
+
+Evidence after the fix (`exp2/runs/epi-six-2`, one accelerator for the six
+lowerings, `05_hw_acc.ll` sha256 `cd4b60e3…1c70e`; oracles PASS, same storage;
+HLS PASS; RTL PASS at stall 0 and 50,000; `review.sh exp2 tails` PASS with
+writes blocked in all three invocations; the NaN-C case PASS with C's reads
+skipped):
+
+| Cumulative cycles | Stall 0, now | Stall 0, measured | Stall 50,000, now | Stall 50,000, measured |
+|---|---:|---:|---:|---:|
+| MINI gemm | 29,023 | 41,189 | 50,989 | 51,930 |
+| MINI 2mm | 26,338, 53,358 | 28,179, 66,217 | 50,569, 101,305 | 51,125, 102,582 |
+| MINI 3mm | 26,233, 53,750, 80,469 | 28,011, 57,845, 86,496 | 50,569, 101,333, 152,013 | 51,125, 102,638, 153,983 |
+
+The stall now shows: the 50,000 cycles were hidden behind the 49k-cycle
+epilogue before. Stress case, stall 0, first launch (129×65×67): 200,703
+cycles against 276,634; per phase of the compute task, ours / measured:
+waiting for A/B 60,479 / 144,664, matmul 89,369 / 81,080, epilogue 50,838 /
+50,846. The matmul is slower than the measured engine's when loads run
+beside it (about 11k cycles a K step against 10.1k); unverified cause: the
+two slots of a ping-pong buffer are one array, whose ports load and compute
+share.
 
 ## Status 2026-11-16 (branch `feature/exp2-reusable-gemm`)
 

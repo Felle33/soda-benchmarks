@@ -209,7 +209,19 @@ struct ReportLCSCost : mlir::sodap::dataflow::impl::ReportLCSCostBase<ReportLCSC
         copies.push_back(std::move(record));
       } else if (auto linalg=dyn_cast<linalg::LinalgOp>(op)) {
         int64_t n=repetitions(op);
-        for (int64_t d:linalg.getStaticLoopRanges()) n=multiply(n,d);
+        // A part of a tile (an element-wise op cut to the matrix,
+        // tile_and_fuse) counts as its whole tile, as the transfers do.
+        SmallVector<int64_t> ranges=linalg.getStaticLoopRanges();
+        if (llvm::any_of(ranges,ShapedType::isDynamic) && linalg.getNumDpsInits()==1 &&
+            linalg.getMatchingIndexingMap(linalg.getDpsInitOperand(0)).isIdentity()) {
+          Value init=linalg.getDpsInits()[0];
+          while (auto cast=init.getDefiningOp<memref::CastOp>()) init=cast.getSource();
+          if (auto view=init.getDefiningOp<memref::SubViewOp>())
+            for (auto [d,size]:llvm::enumerate(view.getMixedSizes()))
+              if (ShapedType::isDynamic(ranges[d]))
+                if (std::optional<int64_t> b=boundOf(size)) ranges[d]=*b;
+        }
+        for (int64_t d:ranges) n=multiply(n,d);
         add(iterations,n);
         compute.push_back(llvm::json::Object{{"op",op->getName().getStringRef()},
                                             {"iterations",n},{"reduction",linalg.getNumReductionLoops()>0}});

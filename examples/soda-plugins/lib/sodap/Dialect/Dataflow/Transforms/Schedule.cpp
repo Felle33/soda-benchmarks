@@ -209,12 +209,15 @@ struct Scheduler {
         if (!isa<MemRefType>(operand.getType()))
           continue;
         Value buffer = rootOf(operand);
+        // A part of a tile (an element-wise op cut to the matrix) moves the
+        // whole tile; sodap-dataflow-tails cuts the transfer.
+        Value tile = tileOfPart(operand);
         if (sources.count(buffer)) {
           if (serial || target == loadTask)
-            load(&op, operand);
+            load(&op, tile);
         } else if (auto it = writers.find(buffer);
                    it != writers.end() && it->second.first != task) {
-          if (failed(produce(&op, operand)))
+          if (failed(produce(&op, tile)))
             return failure();
         }
       }
@@ -288,7 +291,7 @@ LogicalResult compactSerialBuffers(DispatchOp dispatch, TaskOp serialTask) {
         if (cast<MemRefType>(access.view.getType()).getShape() !=
             ArrayRef<int64_t>(footprint))
           return access.op->emitOpError("inconsistent sequential tile shapes");
-        access.op->replaceUsesOfWith(access.view, local);
+        replaceAccessedView(access.op, access.view, local);
         continue;
       }
       builder.setInsertionPoint(access.op);
@@ -304,7 +307,7 @@ LogicalResult compactSerialBuffers(DispatchOp dispatch, TaskOp serialTask) {
         sizes.push_back(builder.getIndexAttr(size));
       Value view = builder.create<memref::SubViewOp>(
           access.op->getLoc(), local, tile->offsets, sizes, strides);
-      access.op->replaceUsesOfWith(access.view, view);
+      replaceAccessedView(access.op, access.view, view);
     }
   }
   IRRewriter rewriter(dispatch.getContext());
