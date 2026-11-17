@@ -22,13 +22,14 @@ def main():
     p.add_argument('--factory', default='create_model')
     p.add_argument('--model-options', default='{}', help='JSON passed to the factory')
     p.add_argument('--output', required=True, type=Path)
-    p.add_argument('--compute-lanes', type=int, default=64)
+    p.add_argument('--compute-lanes', type=int, default=0,
+                   help='GEMM lanes; 0 selects 16 with convolution, otherwise 64 in the compiler')
     p.add_argument('--plm-bytes', type=int, default=327680)
     p.add_argument('--dma-width', type=int, choices=[64], default=64)
     p.add_argument('--network-host-only', action='store_true',
                    help='Validate compiler-owned CNN host lowering; no hardware qualification')
     p.add_argument('--network', action='store_true', help='Compile a network host and its reusable operator engines')
-    p.add_argument('--conv-lanes', type=int, default=32)
+    p.add_argument('--conv-lanes', type=int, default=64)
     p.add_argument('--add-lanes', type=int, default=4)
     p.add_argument('--atol', type=float, default=0.001)
     p.add_argument('--rtol', type=float, default=0.0001)

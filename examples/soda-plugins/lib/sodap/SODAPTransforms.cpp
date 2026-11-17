@@ -693,6 +693,8 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
 
   for (auto &[last, sizes] : lasts) {
     OperationName lastName = last->getName();
+    auto boundAxes=last->getAttrOfType<DenseI64ArrayAttr>("sodap.bound_axes");
+    auto lastIterators=cast<linalg::LinalgOp>(last).getIteratorTypesArray();
     scf::SCFTilingOptions parallelTiling;
     parallelTiling.setTileSizes(
         tileSizes(rewriter, cast<linalg::LinalgOp>(last), sizes, true));
@@ -719,6 +721,17 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     if (nest->loops.empty())
       return emitSilenceableError()
              << "expected at least one tiled parallel dimension";
+
+    // Preserve semantic axes, not a hand-selected schedule. Later lowering
+    // obtains valid local extents from the actual tiled loop bounds/origins.
+    if(boundAxes) {
+      unsigned loop=0;
+      for(unsigned d=0;d<sizes.size();++d)
+        if(sizes[d] && lastIterators[d]==utils::IteratorType::parallel) {
+          if(boundAxes[d])nest->loops[loop]->setAttr("sodap.bound_axis",rewriter.getI64IntegerAttr(boundAxes[d]));
+          ++loop;
+        }
+    }
 
     SmallVector<Operation *> replaced{last};
     llvm::append_range(replaced, nest->fusedProducers);
@@ -777,6 +790,14 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
           rewriter, cast<TilingInterface>(op.getOperation()), reductionTiling);
       if (failed(tiled))
         return emitDefiniteFailure() << "failed to tile a reduction";
+      if(auto axes=op->getAttrOfType<DenseI64ArrayAttr>("sodap.bound_axes")) {
+        unsigned loop=0;
+        for(auto [d,type]:llvm::enumerate(op.getIteratorTypesArray()))
+          if(type==utils::IteratorType::reduction && opSizes[d]) {
+            if(axes[d])tiled->loops[loop]->setAttr("sodap.bound_axis",rewriter.getI64IntegerAttr(axes[d]));
+            ++loop;
+          }
+      }
       rewriter.replaceOp(op, tiled->replacements);
     }
 

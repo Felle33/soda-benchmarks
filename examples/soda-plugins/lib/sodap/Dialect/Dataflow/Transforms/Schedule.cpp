@@ -193,6 +193,8 @@ struct Scheduler {
               loc, lb, builder.create<arith::ConstantIndexOp>(loc, size));
         }
         auto clone = builder.create<scf::ForOp>(loc, lb, ub, step);
+        if(auto axis=loop->getAttr("sodap.bound_axis"))
+          clone->setAttr("sodap.bound_axis",axis);
         map.map(loop.getInductionVar(), clone.getInductionVar());
         builder.setInsertionPoint(clone.getBody()->getTerminator());
         if (failed(walk(task, loop.getBody(), pins)))

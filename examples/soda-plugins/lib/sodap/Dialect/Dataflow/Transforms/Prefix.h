@@ -282,6 +282,8 @@ inline memref::CopyOp splitCopy(OpBuilder &builder, memref::CopyOp copy,
     auto [lb, ub, stride] = foldedBoundsOf(step.loop);
     auto loop = builder.create<scf::ForOp>(loc, bound(lb), bound(ub),
                                            bound(stride));
+    if(auto axis=step.loop->getAttr("sodap.bound_axis"))
+      loop->setAttr("sodap.bound_axis",axis);
     builder.setInsertionPoint(loop.getBody()->getTerminator());
     offsets[step.dim] = loop.getInductionVar();
     sizes[step.dim] = builder.getIndexAttr(*getConstantIntValue(stride));

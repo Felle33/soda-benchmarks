@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "sodap/Conversion/DataflowToLLVM/Passes.h"
+#include "sodap/Conversion/DataflowToLLVM/RuntimeTileBounds.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
@@ -156,6 +157,14 @@ struct RegisterBlockMatmul : sodap::impl::RegisterBlockMatmulBase<RegisterBlockM
       auto index = [&](int64_t n) -> Value { return b.create<arith::ConstantIndexOp>(loc, n); };
       Value zero = index(0), one = index(1), m = index(ct.getDimSize(0));
       Value n = index(ct.getDimSize(1)), k = index(at.getDimSize(1));
+      bool bounded=mm->hasAttr("sodap.bounded_contraction");
+      if(bounded) {
+        auto bm=sodap::runtimeTileBound(b,mm,1,ct.getDimSize(0));
+        auto bn=sodap::runtimeTileBound(b,mm,2,ct.getDimSize(1));
+        auto bk=sodap::runtimeTileBound(b,mm,3,at.getDimSize(1));
+        if(failed(bm)||failed(bn)||failed(bk))return signalPassFailure();
+        m=*bm;n=*bn;k=*bk;
+      }
       Value mr = index(rows), nr = index(cols);
       Value fzero = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0));
       auto maskedLoad = [&](OpBuilder &x, Value memory, ValueRange indices, Value valid) -> Value {
@@ -175,13 +184,13 @@ struct RegisterBlockMatmul : sodap::impl::RegisterBlockMatmulBase<RegisterBlockM
           for (unsigned r = 0; r < rows; ++r) {
             Value offset = jb.create<arith::ConstantIndexOp>(l, r);
             ri.push_back(jb.create<arith::AddIOp>(l, i, offset));
-            rv.push_back(ct.getDimSize(0) % rows ?
+            rv.push_back(bounded || ct.getDimSize(0) % rows ?
                 jb.create<arith::CmpIOp>(l, arith::CmpIPredicate::ult, ri.back(), m).getResult() : Value());
           }
           for (unsigned s = 0; s < cols; ++s) {
             Value offset = jb.create<arith::ConstantIndexOp>(l, s);
             cj.push_back(jb.create<arith::AddIOp>(l, j, offset));
-            cv.push_back(ct.getDimSize(1) % cols ?
+            cv.push_back(bounded || ct.getDimSize(1) % cols ?
                 jb.create<arith::CmpIOp>(l, arith::CmpIPredicate::ult, cj.back(), n).getResult() : Value());
           }
           for (unsigned r = 0; r < rows; ++r) for (unsigned s = 0; s < cols; ++s) {

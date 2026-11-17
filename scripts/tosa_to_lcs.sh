@@ -148,7 +148,7 @@ case "$TILES" in
         ENTRY=tasks ;;
       conv)
         [[ ${LCS_HARDWARE_ONLY:-false} == true ]] || { echo 'Network convolution uses the compiler network host; request hardware-only extraction here' >&2; exit 1; }
-        OUTLINE="sodap-tosa-outline-convolutions{lanes=${LCS_COMPUTE_LANES:-32} plm-bytes=${LCS_PLM_BYTES:-327680}}"
+        OUTLINE="sodap-tosa-outline-convolutions{lanes=${LCS_COMPUTE_LANES:-64} plm-bytes=${LCS_PLM_BYTES:-327680}}"
         ENTRY=tasks_conv ;;
       *) echo 'Unsupported operator family' >&2; exit 1 ;;
     esac ;;
@@ -331,7 +331,7 @@ step "$FRONTEND_DUMP" mlir-opt "$INPUT" $TOSA_PLUGIN --pass-pipeline="builtin.mo
     $OUTLINE $EXTRACT_HARDWARE
   )" -o outlined.mlir
 
-if [ "$TILES" = operators ] && [ "$OPERATOR_FAMILY" = gemm ] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+if [ "$TILES" = operators ] && [[ "$OPERATOR_FAMILY" = gemm || "$OPERATOR_FAMILY" = conv ]] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
   step "$FRONTEND_DUMP" mlir-opt outlined.mlir $PLUGIN \
     --pass-pipeline="builtin.module(sodap-select-reusable-hardware{lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES report=$PWD/hardware_selection.json})" \
     -o hardware_selected.mlir

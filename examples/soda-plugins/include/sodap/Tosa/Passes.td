@@ -205,7 +205,7 @@ def TosaOutlineAdditions : Pass<"sodap-tosa-outline-additions", "::mlir::ModuleO
 
 def TosaOutlineConvolutions : Pass<"sodap-tosa-outline-convolutions", "::mlir::ModuleOp"> {
   let summary = "Represent direct convolution as a structured contraction over a DMA window view";
-  let options = [Option<"lanes", "lanes", "unsigned", "32", "Convolution MAC budget">,
+  let options = [Option<"lanes", "lanes", "unsigned", "64", "Convolution MAC budget">,
     Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Total local storage budget">];
   let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::tensor::TensorDialect",
     "::mlir::func::FuncDialect", "::mlir::linalg::LinalgDialect"];
@@ -236,8 +236,8 @@ def TosaNetworkHost : Pass<"sodap-tosa-network-host", "::mlir::ModuleOp"> {
     Option<"convInstance", "conv-instance", "unsigned", "0", "Convolution device instance">,
     Option<"addInstance", "add-instance", "unsigned", "0", "Addition device instance">,
     Option<"gemmInstance", "gemm-instance", "unsigned", "0", "GEMM device instance">
-    ,Option<"convLanes", "conv-lanes", "unsigned", "32", "Default convolution MAC budget">
-    ,Option<"gemmLanes", "gemm-lanes", "unsigned", "64", "Default GEMM MAC budget">
+    ,Option<"convLanes", "conv-lanes", "unsigned", "64", "Default convolution MAC budget">
+    ,Option<"gemmLanes", "gemm-lanes", "unsigned", "0", "GEMM MAC budget; 0 selects 16 with convolution, otherwise 64">
     ,Option<"addLanes", "add-lanes", "unsigned", "4", "Default addition lane budget">
     ,Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Per-implementation local storage budget">
   ];

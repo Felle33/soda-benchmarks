@@ -102,7 +102,7 @@ struct Tails : public mlir::sodap::dataflow::impl::TailsBase<Tails> {
         partial = partial ? Value(b.create<arith::OrIOp>(loc, partial, cut))
                           : cut;
       }
-      if (read) {
+      if (read && !func->hasAttr("sodap.bounded_contractions")) {
         // Zeros outside the part, so the tasks compute on the whole tile; a
         // whole tile skips this.
         auto pad = b.create<scf::IfOp>(loc, partial, /*withElseRegion=*/false);

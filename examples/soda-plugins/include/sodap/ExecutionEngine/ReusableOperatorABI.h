@@ -23,6 +23,9 @@ enum {
   CONV_RELU, CONV_A, CONV_W, CONV_BIAS, CONV_C, CONV_ALPHA,
   CONV_ACTIVATION = CONV_RELU, CONV_VERSION = 2,
   CONV_ACTIVATION_FP = 25, // Reserved v3 slot: 0/1 FP32 for common scalar epilogue.
+  // v4 convolution keeps the geometry slots and packs weights as [KH*KW*IC,OC].
+  // Flattened extents are semantic dimensions, independent of hardware tiles.
+  CONV_MATRIX_VERSION = 4, CONV_PIXELS = 23, CONV_REDUCTION = 24,
   OP_ACT_NONE = 0, OP_ACT_RELU = 1, OP_ACT_LEAKY_RELU = 2,
   ADD_COUNT = 2, ADD_A, ADD_B, ADD_C, ADD_RELU
 };
@@ -48,6 +51,11 @@ void esp_op_close(int64_t context);
 void esp_op_copy_in(int64_t context, int64_t offset, int64_t rank, void *descriptor);
 void esp_op_copy_out(int64_t context, int64_t offset, int64_t rank, void *descriptor);
 void esp_op_conv(int64_t context, int64_t a, int64_t w, int64_t bias, int64_t c,
+    int64_t n, int64_t ih, int64_t iw, int64_t ic, int64_t oc, int64_t kh, int64_t kw,
+    int64_t oh, int64_t ow, int64_t sh, int64_t sw, int64_t pt, int64_t pl,
+    int64_t dh, int64_t dw, int64_t relu);
+// Matrix-view convolution: persistent weights packed once as [KH*KW*IC,OC].
+void esp_op_conv_matrix(int64_t context, int64_t a, int64_t w, int64_t bias, int64_t c,
     int64_t n, int64_t ih, int64_t iw, int64_t ic, int64_t oc, int64_t kh, int64_t kw,
     int64_t oh, int64_t ow, int64_t sh, int64_t sw, int64_t pt, int64_t pl,
     int64_t dh, int64_t dw, int64_t relu);

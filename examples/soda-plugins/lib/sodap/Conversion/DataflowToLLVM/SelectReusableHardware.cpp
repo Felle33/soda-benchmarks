@@ -49,15 +49,16 @@ struct SelectReusableHardware
     unsigned count = 0;
     getOperation().walk([&](ModuleOp tile) {
       auto op = tile->getAttrOfType<StringAttr>("sodap.operator");
-      if (!op || op.getValue() != "gemm") return;
-      tile->setAttr("sodap.hardware_tile_sizes", b.getArrayAttr({b.getArrayAttr({
-          b.getI64IntegerAttr(bestM), b.getI64IntegerAttr(bestN),
-          b.getI64IntegerAttr(bestK)})}));
+      if (!op || (op.getValue() != "gemm" && op.getValue() != "conv")) return;
+      SmallVector<Attribute> sizes;
+      if(op.getValue()=="conv")sizes.push_back(b.getI64IntegerAttr(1));
+      for(int64_t size:{bestM,bestN,bestK})sizes.push_back(b.getI64IntegerAttr(size));
+      tile->setAttr("sodap.hardware_tile_sizes", b.getArrayAttr({b.getArrayAttr(sizes)}));
       tile->setAttr("sodap.compute_lanes", b.getI64IntegerAttr(lanes));
       ++count;
     });
     if (!count) {
-      getOperation().emitError("expected a model-derived GEMM operator tile");
+      getOperation().emitError("expected a model-derived GEMM or convolution operator tile");
       return signalPassFailure();
     }
     if (!report.empty()) {

@@ -20,9 +20,10 @@ struct OutlineConvolutions : impl::TosaOutlineConvolutionsBase<OutlineConvolutio
       module.emitError("expected source convolutions and a 1..256 MAC budget");return signalPassFailure();
     }
     // Semantic geometry fields, independent of implementation tiles.
-    enum {A,W,Bias,N,IH,IW,IC,OC,KH,KW,OH,OW,SH,SW,PT,PL,DH,DW,Activation};
+    enum {A,W,Bias,N,IH,IW,IC,OC,KH,KW,OH,OW,SH,SW,PT,PL,DH,DW,P,R,Activation};
     int64_t fields[]={CONV_A,CONV_W,CONV_BIAS,CONV_N,CONV_IH,CONV_IW,CONV_IC,CONV_OC,
-      CONV_KH,CONV_KW,CONV_OH,CONV_OW,CONV_SH,CONV_SW,CONV_PT,CONV_PL,CONV_DH,CONV_DW,CONV_ACTIVATION_FP};
+      CONV_KH,CONV_KW,CONV_OH,CONV_OW,CONV_SH,CONV_SW,CONV_PT,CONV_PL,CONV_DH,CONV_DW,
+      CONV_PIXELS,CONV_REDUCTION,CONV_ACTIVATION_FP};
     SmallVector<Attribute> invocations;
     for(auto op:ops) {
       auto x=dyn_cast<RankedTensorType>(op.getInput().getType());
@@ -53,61 +54,59 @@ struct OutlineConvolutions : impl::TosaOutlineConvolutionsBase<OutlineConvolutio
         }
       }
       invocations.push_back(b.getDenseI64ArrayAttr({x.getDimSize(0),x.getDimSize(1),x.getDimSize(2),x.getDimSize(3),
-        w.getDimSize(0),w.getDimSize(1),w.getDimSize(2),y.getDimSize(1),y.getDimSize(2),s[0],s[1],p[0],p[2],d[0],d[1]}));
+        w.getDimSize(0),w.getDimSize(1),w.getDimSize(2),y.getDimSize(1),y.getDimSize(2),s[0],s[1],p[0],p[2],d[0],d[1],
+        y.getDimSize(1)*y.getDimSize(2),w.getDimSize(1)*w.getDimSize(2)*w.getDimSize(3)}));
     }
-    // Small bounded hardware choice. Scheduling still checks the actual
-    // physical storage, including ping-pong copies. No invocation shape enters.
-    int64_t pixels=8,channels=64,reduction=64;
-    auto storage=[&](){return uint64_t(8*(pixels*reduction+channels*reduction+pixels*channels+channels));};
-    while(storage()>plmBytes && reduction>1)reduction/=2;
-    if(storage()>plmBytes) {module.emitError("convolution PLM budget too small");return signalPassFailure();}
+    // Hardware extents are selected later by the shared GEMM resource policy.
+    // This pass specifies only the logical contraction and descriptor contract.
     b.setInsertionPointToStart(module.getBody());
     auto tile=b.create<ModuleOp>(loc,StringRef("forward_kernel"));
     tile->setAttr("sodap.tile",b.getI64IntegerAttr(0));tile->setAttr("sodap.tile_dir",b.getStringAttr("tiles/forward_kernel"));
     tile->setAttr("sodap.operator",b.getStringAttr("conv"));tile->setAttr("sodap.compute_lanes",b.getI64IntegerAttr(lanes));
     tile->setAttr("sodap.invocations",b.getArrayAttr(invocations));
-    SmallVector<Attribute> sizes;
-    for(int64_t v:{int64_t(1),int64_t(1),pixels,channels,int64_t(1),int64_t(1),reduction})sizes.push_back(b.getI64IntegerAttr(v));
-    tile->setAttr("sodap.hardware_tile_sizes",b.getArrayAttr({b.getArrayAttr(sizes)}));
+    tile->setAttr("sodap.bounded_contractions",b.getUnitAttr());
     b.setInsertionPointToStart(tile.getBody());
     auto tensor=[&](unsigned rank){return RankedTensorType::get(SmallVector<int64_t>(rank,ShapedType::kDynamic),b.getF32Type());};
-    SmallVector<Type> inputs{tensor(6),tensor(4),tensor(1)};
-    inputs.append(15,b.getIndexType());inputs.push_back(b.getF32Type());
-    auto fn=b.create<func::FuncOp>(loc,"forward_kernel",b.getFunctionType(inputs,{tensor(4)}));
+    SmallVector<Type> inputs{tensor(3),tensor(2),tensor(1)};
+    inputs.append(17,b.getIndexType());inputs.push_back(b.getF32Type());
+    auto fn=b.create<func::FuncOp>(loc,"forward_kernel",b.getFunctionType(inputs,{tensor(3)}));
+    fn->setAttr("sodap.bounded_contractions",b.getUnitAttr());
     fn->setAttr("sodap.descriptor_fields",b.getI64IntegerAttr(OP_HEADER_FIELDS));
     fn->setAttr("sodap.descriptor_magic",b.getI64IntegerAttr(OP_CONV_MAGIC));
-    fn->setAttr("sodap.descriptor_version",b.getI64IntegerAttr(OP_PACKED_VERSION));
+    fn->setAttr("sodap.descriptor_version",b.getI64IntegerAttr(CONV_MATRIX_VERSION));
     fn->setAttr("sodap.descriptor_width_field",b.getI64IntegerAttr(OP_DMA_WIDTH));
     for(auto [i,f]:llvm::enumerate(fields))fn.setArgAttr(i,"sodap.descriptor_field",b.getI64IntegerAttr(f));
-    fn.setArgAttr(A,"sodap.dims",b.getDenseI64ArrayAttr({N,OH,OW,KH,KW,IC}));
-    fn.setArgAttr(W,"sodap.dims",b.getDenseI64ArrayAttr({KH,KW,IC,OC}));
+    fn.setArgAttr(A,"sodap.dims",b.getDenseI64ArrayAttr({N,P,R}));
+    fn.setArgAttr(W,"sodap.dims",b.getDenseI64ArrayAttr({R,OC}));
     fn.setArgAttr(Bias,"sodap.dims",b.getDenseI64ArrayAttr({OC}));
-    fn.setArgAttr(A,"sodap.dma_view",b.getStringAttr("conv_window_nhwc"));
-    fn.setArgAttr(W,"sodap.dma_view",b.getStringAttr("conv_weights_ohwi"));
+    fn.setArgAttr(A,"sodap.dma_view",b.getStringAttr("conv_window_flat"));
+    fn.setArgAttr(W,"sodap.dma_view",b.getStringAttr("packed"));
     fn.setArgAttr(Bias,"sodap.dma_view",b.getStringAttr("packed"));
-    fn.setResultAttr(0,"sodap.dims",b.getDenseI64ArrayAttr({N,OH,OW,OC}));
+    fn.setResultAttr(0,"sodap.dims",b.getDenseI64ArrayAttr({N,P,OC}));
     fn.setResultAttr(0,"sodap.descriptor_field",b.getI64IntegerAttr(CONV_C));
     fn.setResultAttr(0,"sodap.dma_view",b.getStringAttr("packed"));
     b.setInsertionPointToStart(fn.addEntryBlock());
     auto arg=[&](unsigned n){return fn.getArgument(n);};
-    Value empty=b.create<tensor::EmptyOp>(loc,SmallVector<int64_t>(4,ShapedType::kDynamic),b.getF32Type(),ValueRange{arg(N),arg(OH),arg(OW),arg(OC)});
+    Value empty=b.create<tensor::EmptyOp>(loc,SmallVector<int64_t>(3,ShapedType::kDynamic),b.getF32Type(),ValueRange{arg(N),arg(P),arg(OC)});
     Value zero=b.create<arith::ConstantOp>(loc,b.getF32FloatAttr(0));
     Value filled=b.create<linalg::FillOp>(loc,ValueRange{zero},ValueRange{empty}).getResult(0);
+    filled.getDefiningOp()->setAttr("sodap.bound_axes",b.getDenseI64ArrayAttr({0,1,2}));
     auto map=[&](unsigned rank,ArrayRef<unsigned> positions){
       SmallVector<AffineExpr> dims;for(auto p:positions)dims.push_back(b.getAffineDimExpr(p));
       return AffineMap::get(rank,0,dims,&getContext());
     };
-    SmallVector<utils::IteratorType> iters(7,utils::IteratorType::parallel);
-    for(unsigned i=4;i<7;++i)iters[i]=utils::IteratorType::reduction;
-    auto conv=b.create<linalg::GenericOp>(loc,TypeRange{tensor(4)},ValueRange{arg(A),arg(W)},ValueRange{filled},
-      ArrayRef<AffineMap>{map(7,{0,1,2,4,5,6}),map(7,{4,5,6,3}),map(7,{0,1,2,3})},iters,
+    SmallVector<utils::IteratorType> iters(4,utils::IteratorType::parallel);
+    iters[3]=utils::IteratorType::reduction;
+    auto conv=b.create<linalg::GenericOp>(loc,TypeRange{tensor(3)},ValueRange{arg(A),arg(W)},ValueRange{filled},
+      ArrayRef<AffineMap>{map(4,{0,1,3}),map(4,{3,2}),map(4,{0,1,2})},iters,
       [&](OpBuilder &body,Location l,ValueRange v){
         Value product=body.create<arith::MulFOp>(l,v[0],v[1]);
         Value sum=body.create<arith::AddFOp>(l,v[2],product);body.create<linalg::YieldOp>(l,sum);
       });
     conv->setAttr("sodap.direct_convolution",b.getUnitAttr());
-    auto epilogue=b.create<linalg::GenericOp>(loc,TypeRange{tensor(4)},ValueRange{conv.getResult(0),arg(Bias)},ValueRange{empty},
-      ArrayRef<AffineMap>{map(4,{0,1,2,3}),map(4,{3}),map(4,{0,1,2,3})},SmallVector<utils::IteratorType>(4,utils::IteratorType::parallel),
+    conv->setAttr("sodap.bound_axes",b.getDenseI64ArrayAttr({0,1,2,3}));
+    auto epilogue=b.create<linalg::GenericOp>(loc,TypeRange{tensor(3)},ValueRange{conv.getResult(0),arg(Bias)},ValueRange{empty},
+      ArrayRef<AffineMap>{map(3,{0,1,2}),map(3,{2}),map(3,{0,1,2})},SmallVector<utils::IteratorType>(3,utils::IteratorType::parallel),
       [&](OpBuilder &body,Location l,ValueRange v){
         Value sum=body.create<arith::AddFOp>(l,v[0],v[1]);
         Value maximum=body.create<arith::ConstantOp>(l,body.getF32FloatAttr(FLT_MAX));
@@ -116,6 +115,7 @@ struct OutlineConvolutions : impl::TosaOutlineConvolutionsBase<OutlineConvolutio
         Value disabled=body.create<arith::CmpFOp>(l,arith::CmpFPredicate::OEQ,arg(Activation),zero);
         Value result=body.create<arith::SelectOp>(l,disabled,sum,clamped);body.create<linalg::YieldOp>(l,result);
       });
+    epilogue->setAttr("sodap.bound_axes",b.getDenseI64ArrayAttr({0,1,2}));
     b.create<func::ReturnOp>(loc,epilogue.getResult(0));
   }
 };

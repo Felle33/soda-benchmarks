@@ -531,10 +531,10 @@ extern "C" void esp_op_conv(int64_t handle, int64_t a, int64_t w, int64_t bias, 
   flag(relu);
   esp_op_conv_activation(handle,a,w,bias,c,n,ih,iw,ic,oc,kh,kw,oh,ow,sh,sw,pt,pl,dh,dw,relu,0);
 }
-extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int64_t bias, int64_t c,
+static void convActivation(int64_t handle, int64_t a, int64_t w, int64_t bias, int64_t c,
     int64_t n, int64_t ih, int64_t iw, int64_t ic, int64_t oc, int64_t kh, int64_t kw,
     int64_t oh, int64_t ow, int64_t sh, int64_t sw, int64_t pt, int64_t pl,
-    int64_t dh, int64_t dw, int64_t mode, int64_t alpha_bits) {
+    int64_t dh, int64_t dw, int64_t mode, int64_t alpha_bits, bool matrix) {
   if (mode < OP_ACT_NONE || mode > OP_ACT_LEAKY_RELU || alpha_bits < 0 || alpha_bits > UINT32_MAX)
     fail("invalid convolution activation");
   uint32_t bits=uint32_t(alpha_bits);
@@ -542,7 +542,7 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
   std::memcpy(&alpha,&bits,4);
   if (!std::isfinite(alpha) || alpha < 0 || alpha > 1) fail("invalid LeakyReLU slope");
   Context &ctx = lookup(handle);
-  columns(ctx,a,ic);columns(ctx,w,ic);columns(ctx,bias,oc);columns(ctx,c,oc);
+  columns(ctx,a,ic);columns(ctx,w,matrix?oc:ic);columns(ctx,bias,oc);columns(ctx,c,oc);
   auto ae = check(ctx,a,product({n,ih,iw,ic}));
   auto we = check(ctx,w,product({oc,kh,kw,ic}));
   auto be = check(ctx,bias,product({oc}));
@@ -550,6 +550,12 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
   disjoint(a,ae,c,ce); disjoint(w,we,c,ce); disjoint(bias,be,c,ce);
   spatial({sh,sw,dh,dw}); spatial({pt,pl},true);
   header(ctx,OP_CONV_MAGIC);
+  if(matrix) {
+    if(!ctx.dmaWidth)fail("matrix-view convolution requires packed transport");
+    field(ctx,1,CONV_MATRIX_VERSION);
+    field(ctx,CONV_PIXELS,product({oh,ow}));
+    field(ctx,CONV_REDUCTION,product({kh,kw,ic}));
+  }
   if (!ctx.dmaWidth && mode == OP_ACT_LEAKY_RELU) field(ctx,1,CONV_VERSION);
   const int64_t dims[] = {n,ih,iw,ic,oc,kh,kw,oh,ow,sh,sw,pt,pl,dh,dw,mode};
   for (unsigned i=0;i<16;++i) field(ctx,CONV_N+i,dims[i]);
@@ -567,10 +573,14 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
               int64_t sy=y*sh+ky*dh-pt;
               for (int64_t kx=0;kx<kw;++kx) {
                 int64_t sx=x*sw+kx*dw-pl;
-                if (sy<0 || sy>=ih || sx<0 || sx>=iw) continue;
+                bool valid=sy>=0 && sy<ih && sx>=0 && sx<iw;
+                if (!valid && !matrix) continue;
                 uint64_t ai=((batch*ih+sy)*iw+sx)*ic;
                 uint64_t wi=((channel*kh+ky)*kw+kx)*ic;
-                for (int64_t q=0;q<ic;++q) sum=sum+read(ctx,a,ai+q)*read(ctx,w,wi+q);
+                for (int64_t q=0;q<ic;++q) {
+                  uint64_t weight=matrix?((ky*kw+kx)*ic+q)*oc+channel:wi+q;
+                  sum=sum+(valid?read(ctx,a,ai+q):0.0f)*read(ctx,w,weight);
+                }
               }
             }
             float value=sum+read(ctx,bias,channel);
@@ -581,6 +591,19 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
           }
   }
   complete(ctx);
+}
+extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int64_t bias, int64_t c,
+    int64_t n, int64_t ih, int64_t iw, int64_t ic, int64_t oc, int64_t kh, int64_t kw,
+    int64_t oh, int64_t ow, int64_t sh, int64_t sw, int64_t pt, int64_t pl,
+    int64_t dh, int64_t dw, int64_t mode, int64_t alpha_bits) {
+  convActivation(handle,a,w,bias,c,n,ih,iw,ic,oc,kh,kw,oh,ow,sh,sw,pt,pl,dh,dw,mode,alpha_bits,false);
+}
+extern "C" void esp_op_conv_matrix(int64_t handle, int64_t a, int64_t w, int64_t bias, int64_t c,
+    int64_t n, int64_t ih, int64_t iw, int64_t ic, int64_t oc, int64_t kh, int64_t kw,
+    int64_t oh, int64_t ow, int64_t sh, int64_t sw, int64_t pt, int64_t pl,
+    int64_t dh, int64_t dw, int64_t relu) {
+  flag(relu);
+  convActivation(handle,a,w,bias,c,n,ih,iw,ic,oc,kh,kw,oh,ow,sh,sw,pt,pl,dh,dw,relu,0,true);
 }
 extern "C" void esp_op_add(int64_t handle, int64_t a, int64_t b, int64_t c,
     int64_t count, int64_t relu) {

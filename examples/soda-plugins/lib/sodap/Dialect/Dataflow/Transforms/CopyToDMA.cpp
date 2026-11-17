@@ -93,8 +93,9 @@ static LogicalResult collectTransfers(BlockArgument arg, int64_t base,
   SmallVector<int64_t> shapeFields;
   if(view) {
     auto name=view.getValue();
-    if(!field || (name!="packed" && name!="conv_window_nhwc" && name!="conv_weights_ohwi") ||
+    if(!field || (name!="packed" && name!="conv_window_nhwc" && name!="conv_weights_ohwi" && name!="conv_window_flat") ||
        (name=="conv_window_nhwc" && type.getRank()!=6) ||
+       (name=="conv_window_flat" && type.getRank()!=3) ||
        (name=="conv_weights_ohwi" && type.getRank()!=4))
       return emitError(loc,"invalid descriptor DMA view");
     auto dims=func.getArgAttrOfType<DenseI64ArrayAttr>(arg.getArgNumber(),"sodap.dims");
@@ -467,9 +468,9 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
     auto schema=descriptorSchema(top,dmaDataWidth);
     if(descriptor && failed(schema)) return signalPassFailure();
     for(const auto &t:transfers)
-      if(t.view=="conv_window_nhwc" || t.view=="conv_weights_ohwi") {
+      if(t.view=="conv_window_nhwc" || t.view=="conv_weights_ohwi" || t.view=="conv_window_flat") {
         if(!t.read || failed(schema) || schema->magic!=OP_CONV_MAGIC ||
-            schema->fields!=OP_HEADER_FIELDS || schema->version!=OP_PACKED_VERSION) {
+            schema->fields!=OP_HEADER_FIELDS || schema->version!=(t.view=="conv_window_flat"?CONV_MATRIX_VERSION:OP_PACKED_VERSION)) {
           top.emitError("convolution DMA views require read-only transfers and the convolution descriptor schema");
           return signalPassFailure();
         }
@@ -577,7 +578,7 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
         Value meta=it!=clients.end()?it->second.meta:Value();
         Value notice=it!=clients.end()?it->second.notice:Value();
         if(transfer.view.empty())lowerPackedTransfer(b,transfer,ports,dmaDataWidth,meta,notice,taskFields);
-        else lowerPackedViewTransfer(b,transfer,ports,dmaDataWidth,meta,notice,taskFields);
+        else lowerPackedViewTransfer(b,transfer,ports,dmaDataWidth,meta,notice,taskFields,mergeWindowRuns);
       } else lowerTransfer(b, transfer, dma, wordStride, taskFields);
       transfer.copy.erase();
     }

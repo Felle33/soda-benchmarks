@@ -1,6 +1,7 @@
 //===- ComputeBudget.cpp - Shared arithmetic budgets for contractions -------===//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "sodap/Conversion/DataflowToLLVM/Passes.h"
+#include "sodap/Conversion/DataflowToLLVM/RuntimeTileBounds.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -174,7 +175,10 @@ static LogicalResult normalize(linalg::LinalgOp op) {
       }
       operands.push_back(source);
     }
-    if (!failedMap) builder.create<linalg::MatmulOp>(loc, ValueRange{operands[0],operands[1]}, ValueRange{operands[2]});
+    if (!failedMap) {
+      auto mm=builder.create<linalg::MatmulOp>(loc, ValueRange{operands[0],operands[1]}, ValueRange{operands[2]});
+      if(op->hasAttr("sodap.bound_axes"))mm->setAttr("sodap.bounded_contraction",builder.getUnitAttr());
+    }
   };
   build(b, 0);
   if (failedMap) return op.emitError("contraction operand order requires unsupported transposition");
@@ -289,6 +293,33 @@ struct PrepareComputeBudget : sodap::impl::PrepareComputeBudgetBase<PrepareCompu
         {"active_lanes",r*c}, {"rows",r}, {"columns",c},
         {"row_origin_alignment",ra}, {"column_origin_alignment",ca}});
     }
+    // Initializers and epilogues, including projected/broadcast operands,
+    // execute on the same actual M/N extents as the contraction. Their static
+    // allocations are untouched, so storage admission and banking remain shared.
+    bool invalidBounds=false;
+    getOperation().walk([&](linalg::LinalgOp op) {
+      auto axes=op->getAttrOfType<DenseI64ArrayAttr>("sodap.bound_axes");
+      if(!axes || op.getNumReductionLoops())return;
+      if(axes.size()!=op.getNumLoops()) {op.emitError("invalid semantic bound axes");invalidBounds=true;return;}
+      OpBuilder builder(op);auto loc=op.getLoc();
+      auto maps=op.getIndexingMapsArray();
+      for(auto [i,operand]:llvm::enumerate(op->getOperands())) {
+        auto type=dyn_cast<MemRefType>(operand.getType());if(!type || !type.getRank())continue;
+        if(!maps[i].isProjectedPermutation() || !type.hasStaticShape()) {
+          op.emitError("bounded epilogue needs a projected static local view");invalidBounds=true;return;
+        }
+        SmallVector<OpFoldResult> sizes,zeros(type.getRank(),builder.getIndexAttr(0)),ones(type.getRank(),builder.getIndexAttr(1));
+        for(auto [d,expr]:llvm::enumerate(maps[i].getResults())) {
+          unsigned loop=cast<AffineDimExpr>(expr).getPosition();
+          auto bound=sodap::runtimeTileBound(builder,op,axes[loop],type.getDimSize(d));
+          if(failed(bound)){invalidBounds=true;return;}
+          sizes.push_back(*bound);
+        }
+        op->setOperand(i,builder.create<memref::SubViewOp>(loc,operand,zeros,sizes,ones));
+      }
+      op->removeAttr("sodap.bound_axes");
+    });
+    if(invalidBounds)return signalPassFailure();
     if (!report.empty()) {
       std::error_code error; llvm::raw_fd_ostream stream(report, error, llvm::sys::fs::OF_Text);
       if (error) { getOperation().emitError(error.message()); return signalPassFailure(); }

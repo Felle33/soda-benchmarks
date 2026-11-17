@@ -35,7 +35,7 @@ Hardware scheduling is unchanged.
 | Family | Runtime parameters | Fixed properties |
 |---|---|---|
 | GEMM | M/N/K, tensor addresses, row strides, source-expression descriptor fields | FP32, local tiles, banks, MAC budget |
-| Dense Conv2D | N/IH/IW/IC/OC, KH/KW, OH/OW, spatial strides, padding, dilation, tensor addresses, optional ReLU | FP32, NHWC activations/OHWI weights, local tiles and resources |
+| Dense Conv2D | N/IH/IW/IC/OC, KH/KW, OH/OW, spatial strides, padding, dilation, tensor addresses, optional ReLU | FP32, NHWC activations/matrix-packed persistent weights, local tiles and resources |
 | Equal-shape addition | addresses, row/column counts, packed row stride, optional ReLU | FP32, local tile and addition lanes |
 
 Bottom/right padding determine output shape; top/left padding also enter input
@@ -102,27 +102,38 @@ operation and optional activation epilogue. The common pipeline extracts and
 schedules load/compute/store tasks. A pointwise register-block pass clones the
 scalar region across banked lanes and guards partial lanes.
 
-`OutlineConvolutions.cpp` normalizes source convolution to a structured
-contraction over a **logical window view**, followed by bias/activation.
-Only requested local tiles are materialized. The DMA lowering computes:
+`OutlineConvolutions.cpp` represents convolution as
+`out[B,P,OC] = window[B,P,R] * weights[R,OC]`, followed by bias/activation,
+where `P=OH*OW` and `R=KH*KW*IC`. Batch remains a separate dimension.
+This is a logical view: no im2col allocation or GEMM-engine offload occurs.
+The common contraction, tile-selection, register-block and banking passes
+produce the datapath; the outline specifies no fixed implementation tile.
 
-```text
-input_y = output_y * stride_h + kernel_y * dilation_h - pad_top
-input_x = output_x * stride_w + kernel_x * dilation_w - pad_left
-```
+The window DMA lowering uses row/column/channel counters for stride, padding,
+dilation and row wrapping. Out-of-image elements become local zeros without a
+DMA request. With dilation one it merges contiguous kernel-row segments when
+the packed NHWC layout allows this. Odd IC leaves a physical padding lane per
+pixel, so that gap terminates a run. A local addressing pass option can disable
+run merging for verification; neither mode adds a line buffer.
 
-Out-of-image coordinates become zeros without DMA transactions. OHWI weights
-are read contiguously along IC and arranged in the local banked view. There is
-no global im2col allocation and no convolution dispatched to the GEMM engine.
-The shared compute-budget pass normalizes the local contraction with unit
-kernel-reduction dimensions for MAC register blocking. This reuses a compiler
-transformation, not a separate GEMM offload or handwritten LCS datapath.
+Persistent OHWI weights are packed once during `forward_init`: an ordinary
+strided memref view presents `[KH,KW,IC,OC]` to the existing packing runtime.
+A parameter also used by a non-convolution operation retains a separate binding.
+The host currently rejects non-persistent convolution weights. No weight
+reorder occurs inside the recurring inference interval.
 
-`CopyToDMA.cpp` now validates a descriptor schema instead of assuming GEMM's
-header. Tensor views bind dimensions to descriptor fields; convolution window
-and weight views are read-only. Conv/add use 32 eight-byte slots; GEMM retains
-its layout. Reserved v3 fields carry extra shape/activation bindings. Pure
-matmul uses the clean source-semantics flag so absent C is never read.
+Convolution descriptor version 4 retains the geometry and adds P/R at fields
+23/24, with `[R,OC]` weight rows. The descriptor has 32 eight-byte slots.
+Addition and GEMM layouts are unchanged; legacy convolution runtime entry
+points remain available for their old contract. The production network host
+uses `esp_op_conv_matrix`. The shared descriptor reader validates the version,
+so an old host cannot silently address the new weight layout.
+
+Bounded contractions preserve semantic axis tags through common tiling and
+scheduling. Compute loops, initialization, epilogues and transfers use actual
+M/N/K tail extents while allocation sizes and bank factors stay static.
+This opt-in mechanism currently applies to convolution. Experiment 2's
+64-lane GEMM and Experiment 1 lowering retain their exact LLVM hashes.
 
 The shared DMA broker retains transaction ownership and deadlock prevention.
 The native ESP socket and validated thin adapter are unchanged. FP32 min/max
@@ -132,17 +143,21 @@ the reviewed Experiment 2 toolchain and its existing patches are prerequisites.
 
 ## Resources and limits
 
-Defaults are conv32 MAC pairs, GEMM64 pairs and add4 lanes, with a 327680-byte
-array budget per implementation. These are bounded compiler choices, not a
-network performance optimizer. Convolution uses eight output pixels, 64 output
-channels and up to 64 input channels, with 1x1 local kernel reductions. The IC
-tile can shrink under a smaller storage budget. Addition uses a power-of-two
-row tile up to 4096. GEMM retains clean Experiment 2's selection.
+Network defaults are conv64 MAC pairs, GEMM16 pairs and add4 lanes, with a
+327680-byte array budget per implementation. A GEMM-only model still defaults
+to 64 lanes. Explicit driver options override these defaults; the C++ host
+planner selects the default from the operator families, not Python.
 
-Reachable HLS RTL contains conv32/32, GEMM64/64 and add0/4 FP32 multiply/add
-units, including shared epilogues. Local array allocations are respectively
-43910, 262340 and 98691 bytes. These are not routed DSP/BRAM counts. No dynamic
-integer divider module was found in this configuration's reachable RTL.
+Convolution uses the same candidate set, operand-reuse score, reduction tie-break
+and bank factors as GEMM. At this budget both select 128x64x64; convolution
+prefixes a unit batch tile and uses an 8x8 register block. Addition's selection
+is unchanged to retain its protected hardware identity.
+
+Reachable HLS RTL contains conv64/64, GEMM16/16 and add0/4 FP32 multiply/add
+units (80 multipliers total). Local arrays are respectively 197510, 262340 and
+98691 bytes; these exclude HLS replication and BRAM rounding. All meet their
+individual budget. No dynamic integer divider is reachable. Routed DSP/BRAM
+counts and achieved clock timing are separate qualification results.
 
 Supported source graphs use positive static FP32 tensors of rank 0..4 (rank zero for scalar coefficients);
 batch-one GEMM; dense Conv2D; equal-shape add; ReLU; transpose; reshape; binary
@@ -152,28 +167,33 @@ training, quantization and clean-path LeakyReLU are not advertised. Legacy
 runtime APIs do not establish support in this new hardware path.
 
 Operator dimensions are programmable but the host graph has compiled shapes.
-Partial convolution tiles and local-buffer initialization can still do work
-at fixed tile bounds; small channel counts may underutilize hardware. No old
-Experiment 3 speedup is attributed to this candidate.
+Convolution tails use actual bounds, but partial register blocks still leave
+some arithmetic lanes idle. HLS scheduling, window address generation and local
+memory work can limit utilisation. Analytical traffic reduction alone does not
+establish board performance; no previous speedup is attributed to this candidate.
+
+The separate cleanup fix skips absent device bindings in `esp_op_close`.
+SqueezeNet uses convolution alone; its old inference validated but closing an
+unbound add/GEMM device caused a misaligned MMIO store. This fix is independent
+of the convolution datapath and was checked on the existing bitstream.
 
 ## Validation
 
-The parent project's `experiments/exp-unified-20261117/README.md` holds new
-unified-host qualification evidence. The read-only
-`experiments/exp3-clean-20261116/README.md` holds original
-commands and evidence locations. Completed checks include:
+The new campaign is `experiments/exp3-conv-tiling-20261117`. Its per-gate JSON,
+raw logs and report distinguish native arithmetic oracles, HLS/component RTL,
+full-system simulation and board measurements. See
+[the convolution mechanism](ReusableConvolutionTiling.md) for replay commands.
 
-- 108 compiler regressions: descriptor schemas, extraction, explicit instance
-  bindings, rejection diagnostics, FP min/max semantics and existing tests.
-- Fresh ResNet18/34/SqueezeNet1.1 imports and compiler-host comparisons to
-  independent PyTorch outputs. Native runtime arithmetic is an oracle, not RTL.
-- Add RTL: odd rows, 4101-column tail, changing descriptors and activation.
-  Conv RTL: changing stride/padding/dilation, odd channels and IC65 crossing
-  the local tile. Both test DMA stalls; conv passes Icarus and Verilator.
-- Actual compiler-host/three-engine RTL execution, repeated twice with stalls.
-- Numerical full-system 3x3 ESP RTL using the fresh RISC-V host, CPU tensor
-  operations and five sequential hardware offloads after classifier fusion.
+All 124 inherited lit tests plus four new tests pass. New tests cover the
+flattened outline and selection, window addressing/merging on and off, bounded
+compute with poisoned tails, and persistent weights shared with other users.
+All three networks pass both frozen inputs twice with parameters preserved.
+Launch counts remain 29/53/26, with recurring repack counts 1/1/0. All eight
+Experiment 2 cases pass with identical host/hardware LLVM and no timed repacks;
+all ten Experiment 1 MINI lowerings are unchanged.
 
-All models produce identical convolution LLVM; the ResNets also share identical
-add/GEMM LLVM. GEMM remains byte-identical to qualified clean Experiment 2.
-FPGA timing/resources and new network measurements are a separate gate.
+The numerical Verilator layer tests report 29,560,893 cycles for the first
+ResNet layer and 18,955,943 for a 56x56 64-to-64 3x3 layer, against required
+baselines of 47,980,000 and 35,950,000 cycles. These no-stall component results
+are not FPGA measurements. Current full-system and board qualification status
+is recorded in the campaign evidence, not inferred from native tests.

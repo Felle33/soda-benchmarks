@@ -448,7 +448,9 @@ def CopyToDMA :
     Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
            "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"wordStride", "dma-word-stride", "unsigned", /*default=*/"1",
-           "32-bit words per shared-memory element; must match host lowering">
+           "32-bit words per shared-memory element; must match host lowering">,
+    Option<"mergeWindowRuns", "merge-window-runs", "bool", "true",
+           "Merge physically contiguous runs within a logical convolution window tile">
   ];
   let dependentDialects = [
     "::mlir::sodap::dataflow::DataflowDialect",

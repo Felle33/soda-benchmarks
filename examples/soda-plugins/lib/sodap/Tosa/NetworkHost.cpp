@@ -67,6 +67,7 @@ llvm::json::Array jsonInts(ArrayRef<int64_t> a) {
 struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   using Base::Base;
   DenseMap<Value, Buffer> buffers;
+  DenseMap<Value,SmallVector<int64_t>> matrixWeights;
   DenseMap<Value, Value> aliases;
   DenseSet<Operation *> fused;
   DenseMap<Operation *, bool> activations;
@@ -130,6 +131,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
     auto s = shape(v);
     Buffer b;
     b.id = nextID++; b.elements = product(s); b.columns = s.empty()?1:s.back();
+    if(matrixWeights.count(v))b.columns=s.front();
     int64_t beat = dmaWidth / 8;
     int64_t row = ((b.columns * 4 + beat - 1) / beat) * beat;
     b.bytes = b.elements / b.columns * row;
@@ -217,7 +219,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
         if (span<0 || out[d+1]!=span/stride[d]+1)
           return op->emitError("convolution output shape disagrees with geometry");
       }
-      kind="conv";
+      kind="conv_matrix";
       args={a,buffer(op->getOperand(1)).offset,buffer(op->getOperand(2)).offset,c,
         in[0],in[1],in[2],in[3],w[0],w[1],w[2],out[1],out[2],
         stride[0],stride[1],pad[0],pad[2],dilation[0],dilation[1],activations.lookup(op)};
@@ -301,6 +303,34 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
         }
       operations.push_back(&op);
     }
+    // Persistent convolution parameters use the same generic strided copy-in
+    // as other tensors. The physical rows are [R,OC], while source.mlir keeps
+    // the original OHWI semantics for hardware extraction. A parameter shared
+    // with another role gets a distinct constant binding, never a destructive
+    // reinterpretation of that role's storage.
+    DenseMap<Value,Value> weightBindings;
+    for(auto *op:operations)if(auto conv=dyn_cast<tosa::Conv2DOp>(op)) {
+      Value weight=conv.getWeight();
+      auto parameter=weight.getDefiningOp<tosa::ConstOp>();
+      if(!parameter) {
+        conv.emitError("matrix-view convolution requires persistent constant weights for setup-only packing");
+        return signalPassFailure();
+      }
+      auto known=weightBindings.find(weight);
+      if(known!=weightBindings.end()) {conv->setOperand(1,known->second);continue;}
+      bool shared=llvm::any_of(weight.getUses(),[](OpOperand &use) {
+        return !isa<tosa::Conv2DOp>(use.getOwner()) || use.getOperandNumber()!=1;
+      });
+      Value packed=weight;
+      if(shared) {
+        OpBuilder clone(parameter);auto c=cast<tosa::ConstOp>(clone.clone(*parameter));
+        weights.push_back(c);packed=c.getResult();conv->setOperand(1,packed);
+      }
+      weightBindings[weight]=packed;matrixWeights[packed]=shape(weight);
+    }
+    // Default network budgets are selected from semantic families here, not
+    // by frontend Python. Explicit driver/IR options remain authoritative.
+    unsigned defaultGemm=gemmLanes?unsigned(gemmLanes):(matrixWeights.empty()?64:16);
     // Analyze the unchanged source graph. Hardware extraction consumes the
     // original module; only host scheduling absorbs these expression nodes.
     for(auto *op:operations)if(auto matmul=dyn_cast<tosa::MatMulOp>(op)) {
@@ -404,7 +434,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
            llvm::any_of(name,[](unsigned char c){return !std::isalnum(c) && c!='_';})) {
           op->emitError("implementation must be a safe symbol name");return signalPassFailure();
         }
-        unsigned lanes=kind=="conv"?convLanes:kind=="gemm"?gemmLanes:addLanes;
+        unsigned lanes=kind=="conv"?unsigned(convLanes):kind=="gemm"?defaultGemm:unsigned(addLanes);
         if(auto attr=bound->getAttrOfType<IntegerAttr>("sodap.compute_lanes")) {
           if(attr.getInt()<1 || attr.getInt()>256) {op->emitError("invalid compute lane budget");return signalPassFailure();}
           lanes=attr.getInt();
@@ -463,6 +493,13 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       auto p=buffer(c.getResult()); reg(ctx,p);
       Value slice=b.create<memref::SubViewOp>(loc,init.getArgument(0),
           ArrayRef<int64_t>{p.parameter},ArrayRef<int64_t>{p.elements},ArrayRef<int64_t>{1});
+      if(auto it=matrixWeights.find(c.getResult());it!=matrixWeights.end()) {
+        auto &w=it->second;
+        SmallVector<int64_t> dims{w[1],w[2],w[3],w[0]};
+        SmallVector<int64_t> strides{w[2]*w[3],w[3],1,w[1]*w[2]*w[3]};
+        auto view=MemRefType::get(dims,b.getF32Type(),StridedLayoutAttr::get(&getContext(),p.parameter,strides));
+        slice=b.create<memref::ReinterpretCastOp>(loc,view,init.getArgument(0),p.parameter,dims,strides);
+      }
       copy(ctx,p,slice,true);
     }
     b.create<func::ReturnOp>(loc,ctx);
@@ -521,7 +558,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       for(auto v:operands(op)) ids.push_back(buffer(v).id);
       llvm::json::Object record{{"index",int64_t(records.size())},{"operator",hw?f.str():entry.first},
         {"execution",hw?"accelerator":"cpu"},{"runtime",entry.first},{"instance",hw?int64_t(instance):-1},
-        {"descriptor_version",hw?3:0},{"implementation",hw?implementation:""},{"arguments",jsonInts(entry.second)},
+        {"descriptor_version",hw?(f=="conv"?CONV_MATRIX_VERSION:3):0},{"implementation",hw?implementation:""},{"arguments",jsonInts(entry.second)},
         {"inputs",std::move(ids)},{"output",out.id},{"shape",jsonInts(shape(op->getResult(0)))},
         {"relu",activations.lookup(op)}};
       if(g!=gemms.end()) {
