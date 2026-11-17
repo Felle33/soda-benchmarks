@@ -29,6 +29,7 @@ class Node:
     data: object = None
     offset: int = -1
     name: str = ""
+    parameter_offset: int = 0
 
     @property
     def elements(self):
@@ -246,24 +247,42 @@ def storage(node):
     return node
 
 
-def plan_memory(input_node, root, directory):
+def tensor_bytes(node, dma_width=0):
+    if not dma_width:
+        return node.elements * 8
+    if dma_width not in (64,128,256,512):
+        raise ValueError("DMA width must be 64, 128, 256 or 512")
+    columns = node.shape[-1] if node.shape else 1
+    lanes = dma_width // 32
+    return (node.elements // columns) * ((columns + lanes - 1) // lanes) * lanes * 4
+
+
+def plan_memory(input_node, root, directory, dma_width=0):
     nodes = ordered(root)
+    if dma_width:
+        # A reshape that changes row padding is a physical layout conversion.
+        # Keep it explicit on the CPU; do not alias incompatible byte layouts.
+        for node in nodes:
+            if node.kind == "reshape" and (node.shape[-1] if node.shape else 1) != (storage(node.inputs[0]).shape[-1] if storage(node.inputs[0]).shape else 1):
+                node.kind = "repack"
     counts = Counter()
     for node in nodes:
         node.name = f"{node.kind}_{counts[node.kind]}"
         counts[node.kind] += 1
     constants = [n for n in nodes if n.kind == "const"]
     cursor = 0
+    parameter_elements = 0
     with (directory / "parameters.bin").open("wb") as file:
         for node in constants:
             if node.data.dtype != np.float32:
                 raise ValueError("Unexpected non-float parameter in executable graph")
             node.offset = cursor
             np.ascontiguousarray(node.data, dtype="<f4").tofile(file)
-            cursor += node.elements * 8
-    parameter_elements = cursor // 8
+            node.parameter_offset = parameter_elements
+            parameter_elements += node.elements
+            cursor += tensor_bytes(node,dma_width)
     input_node.offset = cursor
-    cursor += input_node.elements * 8
+    cursor += tensor_bytes(input_node,dma_width)
     calls = [n for n in nodes if n.kind not in ("input", "const", "reshape")]
     last = {}
     for i, node in enumerate(calls):
@@ -283,7 +302,7 @@ def plan_memory(input_node, root, directory):
                 merged.append((offset, size))
         free[:] = merged
     for i, node in enumerate(calls):
-        size = node.elements * 8
+        size = tensor_bytes(node,dma_width)
         fit = min(((s, j, o) for j, (o, s) in enumerate(free) if s >= size), default=None)
         if fit:
             capacity, index, node.offset = fit
@@ -295,7 +314,7 @@ def plan_memory(input_node, root, directory):
             cursor += size
         for parent in set(map(storage, node.inputs)):
             if parent.kind != "const" and last[parent] == i:
-                release(parent.offset, parent.elements * 8)
+                release(parent.offset, tensor_bytes(parent,dma_width))
     if cursor > (1 << 30) - 256:
         raise ValueError("Network arena exceeds the runtime interface limit")
     for node in nodes:
@@ -305,6 +324,8 @@ def plan_memory(input_node, root, directory):
 
 
 def invocation(node):
+    if node.kind == "repack":
+        return "repack", [node.inputs[0].offset,node.offset,node.elements]
     x = node.inputs[0]
     if node.kind == "conv2d":
         w, bias = node.inputs[1:]
@@ -359,7 +380,7 @@ def invocation(node):
     raise ValueError(f"No invocation contract for {node.kind}")
 
 
-def emit_host(input_node, root, calls, parameter_elements, arena_bytes, directory):
+def emit_host(input_node, root, calls, parameter_elements, arena_bytes, directory, dma_width=0):
     constants, body, declarations, records = {}, [], {}, []
     output_elements = sum(x.elements for x in roots(root))
     def constant(n):
@@ -371,15 +392,31 @@ def emit_host(input_node, root, calls, parameter_elements, arena_bytes, director
         declarations[name] = len(operands)
         body.append(f"    call @{name}({', '.join(operands)}){attrs} : "
                     f"({', '.join(['i64'] * len(operands))}) -> ()")
-    body.append(f"    %ctx = call @esp_op_open({constant(arena_bytes)}, {constant(0)}) : (i64, i64) -> i64")
-    for name, elements, offset in (("parameters", parameter_elements, 0),
-                                    ("input", input_node.elements, input_node.offset)):
-        body.append(f"    %{name}_view = memref.cast %{name} : memref<{elements}xf32> to memref<*xf32>")
-        body.append(f"    call @esp_op_copy_in(%ctx, {constant(offset)}, %{name}_view) : (i64, i64, memref<*xf32>) -> ()")
+    def register(node):
+        call("esp_op_tensor",["%ctx",constant(node.offset),constant(node.elements),
+                              constant(node.shape[-1] if node.shape else 1)])
+    if dma_width:
+        body.append(f"    %ctx = call @esp_op_open_packed({constant(arena_bytes)}, {constant(0)}, {constant(dma_width)}) : (i64, i64, i64) -> i64")
+        for index,node in enumerate(n for n in ordered(root) if n.kind=="const"):
+            register(node)
+            view_type=f"memref<{node.elements}xf32, strided<[1], offset: {node.parameter_offset}>>"
+            body.append(f"    %param{index} = memref.subview %parameters[{node.parameter_offset}] [{node.elements}] [1] : memref<{parameter_elements}xf32> to {view_type}")
+            body.append(f"    %param_view{index} = memref.cast %param{index} : {view_type} to memref<*xf32>")
+            body.append(f"    call @esp_op_copy_in(%ctx, {constant(node.offset)}, %param_view{index}) : (i64, i64, memref<*xf32>) -> ()")
+        register(input_node)
+        body.append(f"    %input_view = memref.cast %input : memref<{input_node.elements}xf32> to memref<*xf32>")
+        body.append(f"    call @esp_op_copy_in(%ctx, {constant(input_node.offset)}, %input_view) : (i64, i64, memref<*xf32>) -> ()")
+    else:
+        body.append(f"    %ctx = call @esp_op_open({constant(arena_bytes)}, {constant(0)}) : (i64, i64) -> i64")
+        for name, elements, offset in (("parameters", parameter_elements, 0),
+                                        ("input", input_node.elements, input_node.offset)):
+            body.append(f"    %{name}_view = memref.cast %{name} : memref<{elements}xf32> to memref<*xf32>")
+            body.append(f"    call @esp_op_copy_in(%ctx, {constant(offset)}, %{name}_view) : (i64, i64, memref<*xf32>) -> ()")
     for index, node in enumerate(calls):
+        if dma_width: register(node)
         kind, arguments = invocation(node)
         target = "accelerator" if kind in ("conv", "add", "gemm") else "cpu"
-        version = 2 if kind == "conv" and node.attrs.get("activation") == "leaky_relu" else 1
+        version = (2 if kind=="gemm" else 3) if dma_width else 2 if kind == "conv" and node.attrs.get("activation") == "leaky_relu" else 1
         attrs = (f' {{sodap.operator = "{kind}_f32_v{version}", sodap.instance = 0 : i64, '
                  f'sodap.invocation = {index} : i64, sodap.execution = "{target}"}}')
         function = "esp_op_conv_activation" if kind == "conv" and node.attrs.get("activation") == "leaky_relu" else f"esp_op_{kind}"
@@ -394,7 +431,7 @@ def emit_host(input_node, root, calls, parameter_elements, arena_bytes, director
             names = ["a_bytes","w_bytes","bias_bytes","c_bytes","n","ih","iw","ic","oc","kh","kw",
                      "oh","ow","stride_h","stride_w","pad_top","pad_left","dilation_h","dilation_w","activation_mode","alpha_f32_bits"]
             records[-1]["configuration"] = dict(zip(names,arguments))
-            records[-1]["descriptor_version"] = 2 if len(arguments)==21 else 1
+            records[-1]["descriptor_version"] = 3 if dma_width else 2 if len(arguments)==21 else 1
     output_offset = 0
     for i,output in enumerate(roots(root)):
         view_type = f"memref<{output.elements}xf32, strided<[1], offset: {output_offset}>>"
@@ -406,7 +443,7 @@ def emit_host(input_node, root, calls, parameter_elements, arena_bytes, director
     body.append("    return")
     declarations = [f"  func.func private @{name}({', '.join(['i64'] * count)})"
                     for name, count in declarations.items()]
-    declarations += ["  func.func private @esp_op_open(i64, i64) -> i64",
+    declarations += [("  func.func private @esp_op_open_packed(i64, i64, i64) -> i64" if dma_width else "  func.func private @esp_op_open(i64, i64) -> i64"),
                      "  func.func private @esp_op_copy_in(i64, i64, memref<*xf32>)",
                      "  func.func private @esp_op_copy_out(i64, i64, memref<*xf32>)"]
     host = ("module {\n" + "\n".join(declarations) + "\n"
@@ -419,15 +456,15 @@ def emit_host(input_node, root, calls, parameter_elements, arena_bytes, director
     return records
 
 
-def compile_network(source, directory):
+def compile_network(source, directory, dma_width=0):
     directory.mkdir(parents=True, exist_ok=True)
     with ir.Context():
         inputs, root = parse_graph(source.read_text())
         root, relus = fuse_relu(root)
-        nodes, calls, parameter_elements, arena_bytes = plan_memory(inputs, root, directory)
-        records = emit_host(inputs, root, calls, parameter_elements, arena_bytes, directory)
+        nodes, calls, parameter_elements, arena_bytes = plan_memory(inputs, root, directory, dma_width)
+        records = emit_host(inputs, root, calls, parameter_elements, arena_bytes, directory, dma_width)
     outputs = roots(root)
-    plan = {"abi": 1, "input_shape": inputs.shape,
+    plan = {"abi": 2 if dma_width else 1, "dma_data_width": dma_width, "input_shape": inputs.shape,
             "output_shape":outputs[0].shape if len(outputs)==1 else (sum(x.elements for x in outputs),),
             "outputs":[{"shape":x.shape,"offset_elements":sum(y.elements for y in outputs[:i]),
                         "arena_offset_bytes":x.offset} for i,x in enumerate(outputs)],
@@ -437,7 +474,7 @@ def compile_network(source, directory):
             "bindings": {kind: {"instance": 0, "socket": 0, "module": f"{kind}_kernel"}
                          for kind in ("conv", "add", "gemm")},
             "parameters_sha256": hashlib.sha256((directory / "parameters.bin").read_bytes()).hexdigest(),
-            "tensors": [{"name": n.name, "shape": n.shape, "offset_bytes": n.offset}
+            "tensors": [{"name": n.name, "shape": n.shape, "offset_bytes": n.offset, "physical_bytes":tensor_bytes(n,dma_width)}
                         for n in nodes if n.kind != "reshape"], "invocations": records}
     (directory / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     print(json.dumps({k: plan[k] for k in ("arena_data_bytes", "parameter_elements", "fused_relus", "operator_counts")}, indent=2))
@@ -448,5 +485,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--dma-data-width",type=int,default=0,choices=(0,64,128,256,512))
     options = parser.parse_args()
-    compile_network(options.source, options.output)
+    compile_network(options.source, options.output, options.dma_data_width)

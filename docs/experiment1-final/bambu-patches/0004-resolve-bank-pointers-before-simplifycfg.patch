@@ -1,0 +1,10 @@
+--- a/etc/clang_plugin/plugin_customSROA.cpp
++++ b/etc/clang_plugin/plugin_customSROA.cpp
+@@ -2896,6 +2896,7 @@
+                  // phi back into one copy per bank. That has to happen here, before the two
+                  // passes below: a bank whose alloca is used by a phi is neither classified
+                  // as a singleton bank nor promotable by mem2reg.
++                 MPM.addPass(llvm::PointerResolutionPass(pandaTempPath));
+                  MPM.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::SimplifyCFGPass()));
+                  MPM.addPass(llvm::PointerResolutionPass(pandaTempPath));
+                  MPM.addPass(llvm::VerifierPass());

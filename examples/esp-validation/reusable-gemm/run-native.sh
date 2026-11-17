@@ -6,7 +6,7 @@ repo=$(cd "$here/../../.." && pwd)
 generated=$(realpath "${1:?Usage: run-native.sh generated-output fixture-directory}")
 mkdir -p "${2:?Fixture directory required}"
 fixtures=$(realpath "$2")
-grep -q '^mechanism=reusable-gemm$' "$generated/layout.txt"
+grep -qE '^(mechanism=reusable-gemm|tiles=operators)$' "$generated/layout.txt"
 "${CLANG:-clang-19}" -O2 -ffp-contract=off -DSODAP_GEMM_TRACE \
   "$generated/05_kernel_riscv.ll" "$repo/scripts/lib/soda_testbench_main.c" \
   "$repo/examples/soda-plugins/lib/sodap/ExecutionEngine/ReusableGemmRuntime.cpp" \

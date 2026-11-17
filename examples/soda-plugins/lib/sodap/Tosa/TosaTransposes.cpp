@@ -14,9 +14,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "sodap/Tosa/Gemm.h"
 #include "sodap/Tosa/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
 #include "mlir/Dialect/Tosa/Transforms/Passes.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -137,10 +140,36 @@ struct SinkTranspose : RewritePattern {
   }
 };
 
+// Concatenation is not elementwise: its axis must follow the permutation.
+// Keep SSA branches intact and move only a common layout change.
+struct SinkConcatTranspose : OpRewritePattern<tosa::ConcatOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tosa::ConcatOp op,PatternRewriter &r) const override {
+    SmallVector<Value> inputs;std::optional<SmallVector<int64_t>> permutation;
+    Value permValue;
+    for(Value v:op.getOperands()) {
+      auto transpose=movable(v);if(!transpose)return failure();
+      auto p=permsOf(transpose);
+      if(!p || (permutation && *permutation!=*p))return failure();
+      permutation=p;permValue=transpose.getPerms();inputs.push_back(transpose.getInput1());
+    }
+    if(!permutation)return failure();
+    int64_t axis=op.getAxis();
+    if(axis<0 || axis>=int64_t(permutation->size()))return failure();
+    auto type=cast<RankedTensorType>(op.getType());
+    auto *concat=r.clone(*op);concat->setOperands(inputs);
+    concat->getResult(0).setType(permuted(type,inverse(*permutation)));
+    concat->setAttr("axis",r.getI32IntegerAttr((*permutation)[axis]));
+    r.replaceOpWithNewOp<tosa::TransposeOp>(op,type,concat->getResult(0),permValue);
+    return success();
+  }
+};
+
 struct TosaSinkTransposes : impl::TosaSinkTransposesBase<TosaSinkTransposes> {
   void runOnOperation() final {
     RewritePatternSet patterns(&getContext());
     patterns.add<SinkTranspose>(&getContext());
+    patterns.add<SinkConcatTranspose>(&getContext());
     tosa::TransposeOp::getCanonicalizationPatterns(patterns, &getContext());
     if (failed(
             applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
@@ -420,6 +449,12 @@ struct TosaOutlineKernel : impl::TosaOutlineKernelBase<TosaOutlineKernel> {
     auto host = builder.create<func::FuncOp>(kernel.getLoc(),
                                              kernel.getSymName(),
                                              kernel.getFunctionType());
+    // Record the public ABI before outlining/transposes obscure provenance.
+    // Bufferization appends outputs in result order; the host pass consumes it.
+    SmallVector<int64_t> argumentOrder;
+    for (unsigned i=0; i<kernel.getNumArguments()+kernel.getNumResults(); ++i)
+      argumentOrder.push_back(i);
+    host->setAttr("sodap.kernel_argument_order", builder.getDenseI64ArrayAttr(argumentOrder));
     Block *hostBody = host.addEntryBlock();
     builder.setInsertionPointToStart(hostBody);
     IRMapping map;
@@ -508,11 +543,12 @@ static Value reshape(OpBuilder &b, Location loc, Value v, Type type) {
                                    b.getDenseI64ArrayAttr(t.getShape()));
 }
 
-/// One tile per operator: each tosa.matmul becomes a launch of a tile. Ops
-/// with the same signature launch the same tile: one accelerator, several
-/// invocations.
+/// One tile per operator: each GEMM (matchGemm) becomes a launch of a tile.
+/// GEMMs with the same signature launch the same tile: one accelerator,
+/// several invocations.
 struct TosaOutlineOperators
     : impl::TosaOutlineOperatorsBase<TosaOutlineOperators> {
+  using Base::Base;
   void runOnOperation() final {
     ModuleOp module = getOperation();
     MLIRContext *ctx = module.getContext();
@@ -523,50 +559,81 @@ struct TosaOutlineOperators
       return signalPassFailure();
     }
     OpBuilder builder(ctx);
+    Type f32 = builder.getF32Type();
     DenseMap<FunctionType, std::string> tiles;
     for (tosa::MatMulOp op : ops) {
       Location loc = op.getLoc();
+      Gemm g = matchGemm(op);
       // The tile's interface drops tosa.matmul's batch dimension of 1, as
       // torch-mlir's reshapes do: in the tile they fold into the matmul, on
       // the host they meet the model's reshapes and cancel (canonicalize).
-      SmallVector<Type> inTypes = llvm::map_to_vector(
-          op->getOperandTypes(), [](Type t) { return squeezed(t); });
-      Type outType = squeezed(op.getType());
-      auto signature = FunctionType::get(ctx, inTypes, outType);
+      Type aType = squeezed(op.getA().getType()),
+           bType = squeezed(op.getB().getType());
+      auto dType = cast<RankedTensorType>(squeezed(op.getType()));
+      if (dType.getRank() != 2) {
+        op.emitError("expected a matmul with a batch of 1");
+        return signalPassFailure();
+      }
+      SmallVector<Type> inputTypes{aType, bType, dType, f32, f32};
+      if (sourceSemantics) inputTypes.push_back(f32);
+      auto signature = FunctionType::get(ctx, inputTypes, dType);
       auto [it, isNew] = tiles.try_emplace(
-          signature, ("matmul_" + Twine(tiles.size())).str());
+          signature, ("gemm_" + Twine(tiles.size())).str());
       std::string name = it->second;
       if (isNew) {
         builder.setInsertionPoint(op->getParentOfType<func::FuncOp>());
         auto tile = builder.create<ModuleOp>(loc, name);
         tile->setAttr("sodap.tile", builder.getI64IntegerAttr(tiles.size() - 1));
         tile->setAttr("sodap.tile_dir", builder.getStringAttr("tiles/" + name));
-        tile->setAttr("sodap.operator", builder.getStringAttr("matmul"));
+        tile->setAttr("sodap.operator", builder.getStringAttr("gemm"));
+        if (sourceSemantics) tile->setAttr("sodap.source_semantics", builder.getUnitAttr());
         builder.setInsertionPointToStart(tile.getBody());
         auto fn = builder.create<func::FuncOp>(loc, name, signature);
         Block *body = fn.addEntryBlock();
         builder.setInsertionPointToStart(body);
-        SmallVector<Value> operands;
-        for (auto [arg, type] :
-             llvm::zip_equal(body->getArguments(), op->getOperandTypes()))
-          operands.push_back(reshape(builder, loc, arg, type));
-        Operation *clone = builder.clone(*op);
-        clone->setOperands(operands);
-        builder.create<func::ReturnOp>(
-            loc, reshape(builder, loc, clone->getResult(0), outType));
+        auto arg = [&](int i) { return body->getArgument(i); };
+        Value d = buildGemmBody(
+            builder, loc, reshape(builder, loc, arg(0), op.getA().getType()),
+            reshape(builder, loc, arg(1), op.getB().getType()), arg(2), arg(3),
+            arg(4), sourceSemantics ? arg(5) : Value());
+        builder.create<func::ReturnOp>(loc, d);
       }
 
-      builder.setInsertionPoint(op);
-      SmallVector<Value> inputs;
-      for (auto [v, type] : llvm::zip_equal(op->getOperands(), inTypes))
-        inputs.push_back(reshape(builder, loc, v, type));
+      // The launch replaces the op giving D, after every operand.
+      Operation *last = g.ops.back();
+      builder.setInsertionPoint(last);
+      auto scalar = [&](Value t, float missing) -> Value {
+        if (!t)
+          return builder.create<arith::ConstantOp>(
+              loc, builder.getF32FloatAttr(missing));
+        auto type = cast<RankedTensorType>(t.getType());
+        SmallVector<Value> zeros(
+            type.getRank(), builder.create<arith::ConstantIndexOp>(loc, 0));
+        return builder.create<tensor::ExtractOp>(loc, t, zeros);
+      };
+      Value c = g.c ? g.c
+                    : builder.create<tensor::EmptyOp>(loc, dType.getShape(),
+                                                      dType.getElementType())
+                          .getResult();
+      SmallVector<Value> inputs = {
+          reshape(builder, loc, op.getA(), aType),
+          reshape(builder, loc, op.getB(), bType), c,
+          scalar(g.alpha, 1.0f),
+          // C without a mul is beta = 1; no C, beta = 0.
+          scalar(g.beta, g.c ? 1.0f : 0.0f)};
+      if (sourceSemantics) inputs.push_back(scalar({}, g.c ? 1.0f : 0.0f));
       auto launch = builder.create<dataflow::LaunchOp>(
-          loc, TypeRange{outType},
+          loc, TypeRange{dType},
           SymbolRefAttr::get(ctx, name, {FlatSymbolRefAttr::get(ctx, name)}),
           inputs, ValueRange());
-      op.replaceAllUsesWith(
-          reshape(builder, loc, launch.getResult(0), op.getType()));
-      op.erase();
+      Value result = launch.getResult(0);
+      if (last == op.getOperation())
+        result = reshape(builder, loc, result, op.getType());
+      last->getResult(0).replaceAllUsesWith(result);
+      for (Operation *dead : llvm::reverse(g.ops))
+        dead->erase();
+      if (g.betaMul)
+        g.betaMul->erase();
     }
   }
 };

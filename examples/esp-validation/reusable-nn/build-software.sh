@@ -19,19 +19,30 @@ cacheline=$(sed -nE 's/.*CFG_CACHE_LINE_SIZE[[:space:]]*: integer := ([0-9]+);/\
 [[ "$cacheline" =~ ^[1-9][0-9]*$ ]] || exit 1
 drivers=$esp/soft/common/drivers
 cpu=$esp/soft/ariane
-libs=$soc/soft-build/ariane/drivers
+libs=${NN_DRIVER_LIBS:-$soc/soft-build/ariane/drivers}
 flags=(-O2 -march=rv64imafdc -mabi=lp64d -mcmodel=medany -fno-common
   -fno-builtin-printf -ffp-contract=off -I"$app" -I"$repo/examples/soda-plugins/include"
   -I"$drivers/baremetal/include" -I"$drivers/common/include"
   -I"$cpu/riscv-tests/env" -I"$cpu/riscv-tests/benchmarks/common"
   -I"$cpu/bootrom" -I"$cpu/riscv-pk/machine" -I"$soc/socgen/esp")
 if [[ ${NN_TRACE:-0} == 1 ]]; then flags+=(-DSODAP_OP_TRACE); fi
+if [[ ${NN_QUIET:-0} == 1 ]]; then flags+=(-DSODAP_OP_QUIET); fi
+if [[ ${NN_SEPARATE_DEVICES:-0} == 1 ]]; then
+  flags+=(-DSODAP_OP_SEPARATE_DEVICES -DSODAP_CONV_DEVICE_ID=0x07e
+    '-DSODAP_CONV_DEVICE_NAME="sld,cnn_conv_bambu"' -DSODAP_ADD_DEVICE_ID=0x07f
+    '-DSODAP_ADD_DEVICE_NAME="sld,cnn_add_bambu"' -DSODAP_GEMM_DEVICE_ID=0x080
+    '-DSODAP_GEMM_DEVICE_NAME="sld,cnn_gemm_bambu"')
+fi
+flags+=("-DNN_STREAM_INPUTS=${NN_STREAM_INPUTS:-0}")
 if [[ "$execution" == CPU_ONLY ]]; then
   arena=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["arena_data_bytes"]+256+4096)' "$app/plan.json")
   flags+=(-DSODAP_OP_CPU_ONLY "-DSODAP_OP_CPU_ARENA_BYTES=$arena")
 fi
+for archive in "$libs/probe/libprobe.a" "$libs/monitors/libmonitors.a" "$libs/utils/baremetal/libutils.a"; do
+  [[ -r "$archive" ]] || { echo "Missing ESP driver library: $archive (build target drivers or set NN_DRIVER_LIBS)" >&2; exit 1; }
+done
 cd "$app"
-"${prefix}gcc" "${flags[@]}" -std=gnu99 -c "$here/baremetal_main.c" -o app.o
+"${prefix}gcc" "${flags[@]}" -std=gnu99 -c "${NN_MAIN_C:-$here/baremetal_main.c}" -o app.o
 "${prefix}gcc" "${flags[@]}" -c tensors.S -o tensors.o
 "${prefix}gcc" "${flags[@]}" -std=gnu99 -c "$cpu/common/syscalls.c" -o syscalls.o
 "${prefix}gcc" "${flags[@]}" -D_init=esp_init_bss -c "$cpu/riscv-tests/benchmarks/common/crt.S" -o crt.o
@@ -82,7 +93,7 @@ grep -Eq 'Entry point address: +0x80000000' elf-header.txt
 test ! -s undefined-symbols.txt
 "${prefix}objcopy" -O srec --gap-fill 0 nn_app.exe ram.srec
 "${prefix}objcopy" -O binary nn_app.exe nn_app.bin
-sha256sum nn_app.exe nn_app.bin host.o *.bin "$here/baremetal_main.c" \
+sha256sum nn_app.exe nn_app.bin host.o *.bin "${NN_MAIN_C:-$here/baremetal_main.c}" \
   "$repo/examples/soda-plugins/lib/sodap/ExecutionEngine/ReusableOperatorRuntime.cpp" \
   > software.sha256
 echo "BUILT: $app/nn_app.exe ($dram bytes target DRAM)"

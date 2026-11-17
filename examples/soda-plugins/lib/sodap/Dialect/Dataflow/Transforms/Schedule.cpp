@@ -43,6 +43,27 @@ namespace {
 /// the consumer reads, along the dim the loop steps through.
 using Pins = DenseMap<Value, std::pair<OpFoldResult, int64_t>>;
 
+// The store projects the common demand traversal into a control program. A
+// worker yields at its next work boundary, after any tile publication or
+// reuse-slab copy introduced at the end of the previous scope.
+struct Handoff {
+  Value grant;
+  Value ready;
+};
+using Handoffs = llvm::MapVector<TaskOp, Handoff>;
+
+void signalStage(OpBuilder &builder, Location loc, Value stream) {
+  auto one = builder.create<arith::ConstantIntOp>(loc, 1, 8);
+  auto signal = builder.create<StreamWriteOp>(loc, stream, one);
+  signal->setAttr("sodap.dma_ordered", builder.getUnitAttr());
+}
+
+void awaitStage(OpBuilder &builder, Location loc, Value stream) {
+  auto ready = builder.create<StreamPeekOp>(loc, builder.getI8Type(), stream);
+  ready->setAttr("sodap.dma_ordered", builder.getUnitAttr());
+  builder.create<StreamReadOp>(loc, builder.getI8Type(), stream);
+}
+
 /// Builds the nest of one task, `target`, into a block of its own.
 struct Scheduler {
   Scheduler(TaskOp target, TaskOp loadTask, Block *into, DominanceInfo &dom,
@@ -66,6 +87,20 @@ struct Scheduler {
   Block *rootBlock;
   DenseMap<Value, llvm::SmallPtrSet<Block *, 4>> produced;
   bool serial;
+  const Handoffs *handoffs = nullptr;
+  TaskOp coordinator;
+
+  void stageBoundary(TaskOp owner, Location loc) {
+    if (!handoffs || owner == coordinator) return;
+    const auto &ports = handoffs->find(owner)->second;
+    if (target == coordinator) {
+      signalStage(builder, loc, ports.grant);
+      awaitStage(builder, loc, ports.ready);
+    } else if (target == owner) {
+      signalStage(builder, loc, ports.ready);
+      awaitStage(builder, loc, ports.grant);
+    }
+  }
 
   bool available(Value value) {
     return map.contains(value) || dom.properlyDominates(value, target);
@@ -193,6 +228,8 @@ struct Scheduler {
               loc, lb, builder.create<arith::ConstantIndexOp>(loc, size));
         }
         auto clone = builder.create<scf::ForOp>(loc, lb, ub, step);
+        if(auto axis=loop->getAttr("sodap.bound_axis"))
+          clone->setAttr("sodap.bound_axis",axis);
         map.map(loop.getInductionVar(), clone.getInductionVar());
         builder.setInsertionPoint(clone.getBody()->getTerminator());
         if (failed(walk(task, loop.getBody(), pins)))
@@ -209,15 +246,20 @@ struct Scheduler {
         if (!isa<MemRefType>(operand.getType()))
           continue;
         Value buffer = rootOf(operand);
+        // A part of a tile (an element-wise op cut to the matrix) moves the
+        // whole tile; sodap-dataflow-tails cuts the transfer.
+        Value tile = tileOfPart(operand);
         if (sources.count(buffer)) {
+          stageBoundary(loadTask, op.getLoc());
           if (serial || target == loadTask)
-            load(&op, operand);
+            load(&op, tile);
         } else if (auto it = writers.find(buffer);
                    it != writers.end() && it->second.first != task) {
-          if (failed(produce(&op, operand)))
+          if (failed(produce(&op, tile)))
             return failure();
         }
       }
+      stageBoundary(task, op.getLoc());
       if (!serial && task != target)
         continue;
       // A clone maps the block arguments of its regions only if they aren't
@@ -237,15 +279,22 @@ FailureOr<std::unique_ptr<Block>> scheduleTask(
     TaskOp target, TaskOp loadTask, TaskOp store,
     const DenseMap<Value, Value> &sources,
     const DenseMap<Value, std::pair<TaskOp, SmallVector<Access>>> &writers,
-    DominanceInfo &dom) {
+    DominanceInfo &dom, const Handoffs *handoffs) {
   auto body = std::make_unique<Block>();
   Scheduler scheduler(target, loadTask, body.get(), dom);
+  scheduler.handoffs = handoffs;
+  scheduler.coordinator = store;
+  if (handoffs && target == store)
+    for (const auto &entry : *handoffs)
+      awaitStage(scheduler.builder, store.getLoc(), entry.second.ready);
   scheduler.sources = sources;
   scheduler.writers = writers;
   for (auto alloc : target.getBody().front().getOps<memref::AllocOp>())
     scheduler.builder.clone(*alloc, scheduler.map);
   if (failed(scheduler.walk(store, &store.getBody().front(), Pins())))
     return failure();
+  if (handoffs && target != store)
+    signalStage(scheduler.builder, target.getLoc(), handoffs->find(target)->second.ready);
   return body;
 }
 
@@ -288,7 +337,7 @@ LogicalResult compactSerialBuffers(DispatchOp dispatch, TaskOp serialTask) {
         if (cast<MemRefType>(access.view.getType()).getShape() !=
             ArrayRef<int64_t>(footprint))
           return access.op->emitOpError("inconsistent sequential tile shapes");
-        access.op->replaceUsesOfWith(access.view, local);
+        replaceAccessedView(access.op, access.view, local);
         continue;
       }
       builder.setInsertionPoint(access.op);
@@ -304,7 +353,7 @@ LogicalResult compactSerialBuffers(DispatchOp dispatch, TaskOp serialTask) {
         sizes.push_back(builder.getIndexAttr(size));
       Value view = builder.create<memref::SubViewOp>(
           access.op->getLoc(), local, tile->offsets, sizes, strides);
-      access.op->replaceUsesOfWith(access.view, view);
+      replaceAccessedView(access.op, access.view, view);
     }
   }
   IRRewriter rewriter(dispatch.getContext());
@@ -317,7 +366,7 @@ LogicalResult compactSerialBuffers(DispatchOp dispatch, TaskOp serialTask) {
 }
 
 LogicalResult scheduleDispatch(DispatchOp dispatch, DominanceInfo &dom,
-                               uint64_t reuseBudget, bool serial) {
+                               uint64_t reuseBudget, bool serial, bool serialTasks) {
   Block &body = dispatch.getBody().front();
   auto tasks = llvm::to_vector(body.getOps<TaskOp>());
   if (tasks.size() < 2)
@@ -516,10 +565,24 @@ LogicalResult scheduleDispatch(DispatchOp dispatch, DominanceInfo &dom,
     return compactSerialBuffers(dispatch, sequential);
   }
 
+  Handoffs handoffs;
+  if (serialTasks) {
+    OpBuilder builder = OpBuilder::atBlockBegin(&body);
+    auto token = StreamType::get(dispatch.getContext(), builder.getI8Type(), 1);
+    for (TaskOp worker : ArrayRef(tasks).drop_back()) {
+      Value grant = builder.create<StreamOp>(worker.getLoc(), token);
+      Value ready = builder.create<StreamOp>(worker.getLoc(), token);
+      handoffs.insert({worker, {grant, ready}});
+    }
+    dispatch->setAttr("sodap.serial_tasks", builder.getUnitAttr());
+    store->setAttr("sodap.serial_coordinator", builder.getUnitAttr());
+  }
+
   // Every new body first, from the old ones; then replace them.
   SmallVector<std::unique_ptr<Block>> bodies;
   for (TaskOp task : tasks) {
-    auto body = scheduleTask(task, loadTask, store, sources, writers, dom);
+    auto body = scheduleTask(task, loadTask, store, sources, writers, dom,
+                             serialTasks ? &handoffs : nullptr);
     if (failed(body))
       return failure();
     bodies.push_back(std::move(*body));
@@ -542,10 +605,14 @@ LogicalResult scheduleDispatch(DispatchOp dispatch, DominanceInfo &dom,
 struct Schedule : public mlir::sodap::dataflow::impl::ScheduleBase<Schedule> {
   using ScheduleBase::ScheduleBase;
   void runOnOperation() override {
+    if (serial && serialTasks) {
+      getOperation().emitError("fused and serial-tasks schedules are mutually exclusive");
+      return signalPassFailure();
+    }
     DominanceInfo &dom = getAnalysis<DominanceInfo>();
     for (DispatchOp dispatch :
          llvm::to_vector(getOperation().front().getOps<DispatchOp>()))
-      if (failed(scheduleDispatch(dispatch, dom, reuseBufferBudget, serial)))
+      if (failed(scheduleDispatch(dispatch, dom, reuseBufferBudget, serial, serialTasks)))
         return signalPassFailure();
   }
 };

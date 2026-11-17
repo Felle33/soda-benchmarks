@@ -1,0 +1,20 @@
+--- a/src/HLS/hdl_generators/ReadFifoHDLGenerator.cpp
++++ b/src/HLS/hdl_generators/ReadFifoHDLGenerator.cpp
+@@ -99,10 +99,14 @@
+        << "end\n\n";
+ 
+    out << "assign active = (started | " << _ports_in[i_start].name << ");\n"
+-       << "assign started_0 = active & ~" << _ports_in[i_empty_n].name << ";\n\n";
++       << "assign started_0 = active & ~(" << _ports_in[i_empty_n].name << "|(|"
++       << _ports_in[i_in2].name << "));\n\n";
+ 
+-   out << "assign " << _ports_out[o_out1].name << " = {" << _ports_in[i_empty_n].name << ", " << _ports_in[i_dout].name
+-       << "};\n";
++   // Match ac_channel's nonblocking read/peek: invalid returns zero. Merely
++   // concatenating valid=0 with an uninitialized FIFO payload propagates X
++   // into comparisons of the packed return and can break polling in RTL.
++   out << "assign " << _ports_out[o_out1].name << " = " << _ports_in[i_empty_n].name
++       << " ? {1'b1, " << _ports_in[i_dout].name << "} : {BITSIZE_out1{1'b0}};\n";
+    out << "assign " << _ports_out[o_done].name << " = active & (" << _ports_in[i_empty_n].name << "|(|"
+        << _ports_in[i_in2].name << "));\n";
+    out << "assign " << _ports_out[o_read].name << " = (1&" << _ports_in[i_in1].name << ") & active & "

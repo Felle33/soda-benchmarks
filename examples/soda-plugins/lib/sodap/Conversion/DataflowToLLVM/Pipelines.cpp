@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "sodap/Conversion/DataflowToLLVM/Passes.h"
+#include "KernelPipeline.h"
 #include "sodap/Dialect/Dataflow/Transforms/Passes.h"
 
 #include "mlir/Conversion/Passes.h"
@@ -15,6 +16,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
 
@@ -42,6 +44,42 @@ struct DataflowToLLVMPipelineOptions
   Option<std::string> includePandaPath{
       *this, "include-panda-path", llvm::cl::init(SODAP_BAMBU_INCLUDE),
       llvm::cl::desc("Directory holding ac_channel.h")};
+};
+struct ReusableOperatorBackendOptions
+    : public PassPipelineOptions<ReusableOperatorBackendOptions> {
+  Option<std::string> family{*this,"family",llvm::cl::init("gemm"),llvm::cl::desc("Operator compute family: gemm, conv or add")};
+  Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64),llvm::cl::desc("FP32 core lane budget")};
+  Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64),llvm::cl::desc("Packed DMA width")};
+  Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680),llvm::cl::desc("Local array storage budget")};
+  Option<std::string> computeReport{*this,"compute-report",llvm::cl::init("compute_plan.json")};
+  Option<std::string> storageReport{*this,"storage-report",llvm::cl::init("compute_storage.json")};
+};
+struct OperatorPipelineOptions : public PassPipelineOptions<OperatorPipelineOptions> {
+  Option<std::string> family{*this,"family",llvm::cl::init("gemm")};
+  Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64)};
+  Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64)};
+  Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680)};
+  Option<uint64_t> reuseBytes{*this,"reuse-bytes",llvm::cl::init(262144)};
+  Option<std::string> transformFile{*this,"transform-file",llvm::cl::init("")};
+  Option<std::string> directory{*this,"directory",llvm::cl::init(".")};
+};
+struct KernelHostOptions : public PassPipelineOptions<KernelHostOptions> {
+  Option<bool> profile{*this,"profile",llvm::cl::init(true)};
+  Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64)};
+  Option<std::string> directory{*this,"directory",llvm::cl::init(".")};
+};
+struct WholeKernelBackendOptions : public PassPipelineOptions<WholeKernelBackendOptions> {
+  Option<bool> singleCopyProposals{*this,"single-copy-proposals",llvm::cl::init(false)};
+  Option<std::string> schedule{*this,"schedule",llvm::cl::init("overlap")};
+  Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64)};
+  Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64)};
+  Option<unsigned> wordStride{*this,"word-stride",llvm::cl::init(2)};
+  Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680)};
+  Option<uint64_t> reuseBytes{*this,"reuse-bytes",llvm::cl::init(262144)};
+  Option<unsigned> requestCycles{*this,"request-cycles",llvm::cl::init(64)};
+  Option<unsigned> wordCycles{*this,"word-cycles",llvm::cl::init(1)};
+  Option<std::string> transformFile{*this,"transform-file",llvm::cl::init("")};
+  Option<std::string> reportDir{*this,"report-dir",llvm::cl::init(".")};
 };
 } // namespace
 
@@ -93,4 +131,105 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
         pm.addPass(createCanonicalizerPass());
         pm.addPass(createCSEPass());
       });
+  PassPipelineRegistration<ReusableOperatorBackendOptions>(
+      "sodap-reusable-operator-backend",
+      "Lower a scheduled model-derived operator tile through guarded/tail DMA, "
+      "shared compute-budget/banking passes and LLVM conversion",
+      [](OpPassManager &pm, const ReusableOperatorBackendOptions &o) {
+        // Keep the registered sequence in the compiler. The shell driver only
+        // passes target budgets and orchestrates frontends/tool invocations.
+        std::string compute;
+        if(o.family=="gemm" || o.family=="conv") compute=
+          kernel::compute(o.lanes,o.plmBytes,o.computeReport,o.storageReport)+
+          ",sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,";
+        else if(o.family=="add") compute=
+          "sodap-bank-matmul-buffers{pointwise=true rows=1 cols=" + std::to_string(o.lanes) +
+          " plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
+          "sodap-register-block-pointwise{lanes=" + std::to_string(o.lanes) + "},canonicalize,cse,";
+        else llvm::report_fatal_error("unsupported reusable operator compute family");
+        std::string pipeline =
+          "func.func(sodap-dataflow-guard-reads,sodap-dataflow-tails),"
+          "sodap-dataflow-copy-to-dma{dma-word-stride=2 dma-data-width=" + std::to_string(o.dmaWidth) + "},"
+          "func.func(sodap-dataflow-tasks-to-nodes),sodap-dataflow-nodes-to-func,"
+          + compute +
+          "func.func(convert-linalg-to-loops),sodap-legalize-fp-minmax," + kernel::llvmBackend();
+        if (failed(parsePassPipeline(pipeline, pm)))
+          llvm::report_fatal_error("cannot construct reusable operator backend pipeline");
+      });
+  PassPipelineRegistration<WholeKernelBackendOptions>(
+      "sodap-whole-kernel-backend",
+      "Select and lower whole-kernel tiles with shared compute/storage heuristics",
+      [](OpPassManager &pm, const WholeKernelBackendOptions &o) {
+        std::string dir=o.reportDir;
+        bool serialTasks = o.schedule == "serial-tasks";
+        bool fused = o.schedule == "fused" || o.schedule == "nonoverlap";
+        if (!serialTasks && !fused && o.schedule != "overlap")
+          llvm::report_fatal_error("unknown whole-kernel schedule");
+        // Freeze the overlap winner before lowering and admitting a one-slot design.
+        std::string selectionSchedule = fused ? "nonoverlap" : "overlap";
+        std::string common="dma-data-width="+std::to_string(o.dmaWidth)+
+          " request-cycles="+std::to_string(o.requestCycles)+" word-cycles="+
+          std::to_string(o.wordCycles)+" dma-word-stride="+std::to_string(o.wordStride)+
+          " plm-bytes="+std::to_string(o.plmBytes);
+        auto snapshot=[&](StringRef name) {
+          return "sodap-snapshot-kernel-ir{file="+dir+"/"+name.str()+".mlir},";
+        };
+        std::string pipeline=
+          "sodap-select-kernel-tiles{schedule="+selectionSchedule+
+          " single-copy-proposals="+(o.singleCopyProposals ? "true" : "false")+" lanes="+
+          std::to_string(o.lanes)+" plm-bytes="+std::to_string(o.plmBytes)+
+          " reuse-bytes="+std::to_string(o.reuseBytes)+" dma-width="+std::to_string(o.dmaWidth)+
+          " word-stride="+std::to_string(o.wordStride)+" request-cycles="+
+          std::to_string(o.requestCycles)+" word-cycles="+std::to_string(o.wordCycles)+
+          " transform-file="+o.transformFile.getValue()+" report-dir="+dir+"},"+
+          snapshot("tasks")+"builtin.module("+kernel::bufferize()+"),"+snapshot("bufferized")+
+          "builtin.module("+kernel::schedule(!fused,o.reuseBytes,serialTasks)+"),"+
+          snapshot("dataflow")+"sodap-dataflow-report-cost{"+common+" file="+dir+"/schedule_cost.json},"+
+          "builtin.module("+kernel::transport(!fused,o.dmaWidth,o.wordStride)+
+          kernel::compute(o.lanes,o.plmBytes,dir+"/compute_plan.json",dir+"/compute_storage.json")+
+          ",sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,"
+          "func.func(convert-linalg-to-loops),"+kernel::llvmBackend()+"),sodap-tiles-to-llvm,sodap-emit-hls-configuration{lanes="+
+          std::to_string(o.lanes)+" directory="+dir+"}";
+        if (failed(parsePassPipeline(pipeline,pm)))
+          llvm::report_fatal_error("cannot construct whole-kernel backend pipeline");
+      });
+
+  PassPipelineRegistration<OperatorPipelineOptions>("sodap-operator-pipeline",
+      "Model-derived operator frontend, transform scheduling and registered backend",
+      [](OpPassManager &pm,const OperatorPipelineOptions &o) {
+        std::string dir=o.directory;
+        std::string select;
+        if(o.family=="gemm" || o.family=="conv")
+          select="sodap-select-reusable-hardware{lanes="+std::to_string(o.lanes)+
+            " plm-bytes="+std::to_string(o.plmBytes)+" report="+dir+"/hardware_selection.json},"
+            "sodap-snapshot-kernel-ir{file="+dir+"/hardware_selected.mlir},"
+            "sodap-snapshot-kernel-ir{file="+dir+"/outlined.mlir},";
+        std::string pipeline=select+"builtin.module("+kernel::frontend(true)+"),"
+          "sodap-apply-lcs-transform{family="+o.family.getValue()+" lanes="+std::to_string(o.lanes)+
+          " transform-file="+o.transformFile.getValue()+" report-dir="+dir+"},"
+          "sodap-snapshot-kernel-ir{file="+dir+"/tasks.mlir},"
+          "builtin.module("+kernel::bufferize()+"),sodap-snapshot-kernel-ir{file="+dir+"/bufferized.mlir},"
+          "builtin.module("+kernel::schedule(true,o.reuseBytes)+"),sodap-snapshot-kernel-ir{file="+dir+"/dataflow.mlir},"
+          "builtin.module(sodap-dataflow-report-cost{dma-data-width="+std::to_string(o.dmaWidth)+
+          " file=schedule_cost.json request-cycles=64 word-cycles=1 dma-word-stride=2 plm-bytes="+std::to_string(o.plmBytes)+"}),"
+          "builtin.module(sodap-reusable-operator-backend{family="+o.family.getValue()+" lanes="+std::to_string(o.lanes)+
+          " plm-bytes="+std::to_string(o.plmBytes)+" dma-width="+std::to_string(o.dmaWidth)+
+          " compute-report="+dir+"/compute_plan.json storage-report="+dir+"/compute_storage.json}),"
+          "sodap-tiles-to-llvm,sodap-emit-hls-configuration{lanes="+std::to_string(o.lanes)+" directory="+dir+"}";
+        if(failed(parsePassPipeline(pipeline,pm))) llvm::report_fatal_error("cannot construct operator pipeline");
+      });
+  PassPipelineRegistration<>("sodap-kernel-cpu-frontend","Whole-kernel CPU reference frontend",
+      [](OpPassManager &pm) {
+        if(failed(parsePassPipeline(kernel::frontend()+","+kernel::bufferize(),pm)))
+          llvm::report_fatal_error("cannot construct CPU frontend");
+      });
+  PassPipelineRegistration<KernelHostOptions>("sodap-whole-kernel-host","Whole-kernel ESP host",
+      [](OpPassManager &pm,const KernelHostOptions &o) {
+        std::string pipeline="func.func(tosa-to-arith,tosa-to-tensor,tosa-to-linalg-named,tosa-to-linalg),"+
+          kernel::bufferize()+",sodap-launches-to-esp{host=forward_kernel profile="+
+          std::string(o.profile ? "true" : "false")+" dma-word-stride=2 dma-data-width="+std::to_string(o.dmaWidth)+
+          " invocations-file="+o.directory.getValue()+"/invocations.json argument-order-file="+o.directory.getValue()+"/argument_order.txt}";
+        if(failed(parsePassPipeline(pipeline,pm))) llvm::report_fatal_error("cannot construct kernel host pipeline");
+      });
+
 }

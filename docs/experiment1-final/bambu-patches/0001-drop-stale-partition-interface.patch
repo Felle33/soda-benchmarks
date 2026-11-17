@@ -1,0 +1,16 @@
+--- a/etc/clang_plugin/ArrPart.cpp
++++ b/etc/clang_plugin/ArrPart.cpp
+@@ -960,6 +960,13 @@
+          parm.append_attribute("array_partition_types").set_value(arrayPartitionTypesValue.c_str());
+          parm.append_attribute("array_partition_factors").set_value(arrayPartitionFactorsValue.c_str());
+       }
++      // Non-top dataflow nodes keep their symbol after signature expansion.
++      // Do not retain a second entry describing the old argument list: the
++      // architecture reader otherwise selects its stale parameter indices.
++      if(symbol != arrPartCtx.topFn->getName())
++      {
++         xmlModule.remove_child(origFnNode);
++      }
+    }
+ 
+    LLVM_DEBUG(dbgs() << "[CSROA] Saving the new architecture.xml\n");

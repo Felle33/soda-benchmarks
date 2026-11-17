@@ -21,5 +21,5 @@
 extern "C" LLVM_ATTRIBUTE_WEAK ::mlir::PassPluginLibraryInfo
 mlirGetPassPluginInfo() {
   return {MLIR_PLUGIN_API_VERSION, "SODATosaPasses", LLVM_VERSION_STRING,
-          []() { ::mlir::sodap::registerSODAPTosaPasses(); }};
+          []() { ::mlir::sodap::registerSODAPTosaPasses(); ::mlir::sodap::registerSODAPTosaPipelines(); }};
 }

@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "base": "cda4db2e724df357f749c0c41b12bdc065462ced",
+  "patches": 7,
+  "after_sources": {
+    "src/frontend_analysis/IR_analysis/InterfaceInfer.cpp": "0d8b895cd054da16521a25a87740c75f85d6e0ba3dcead952d6cbe09bc83d833",
+    "src/frontend_analysis/IR_manipulation/create_ir_manager.cpp": "7a5eb046e241aaf8c1b53e0f0e1c3ff14a42b926ce1579366afbecc9760939e0",
+    "src/HLS/hdl_generators/ReadFifoHDLGenerator.cpp": "8989d894a380b5a01f2076d5e39c1e4c97add71662645c5e5152b8bb0cbb4fd0",
+    "etc/clang_plugin/PointerResolutionPass.cpp": "e79ae299ef5ac82d23e26ed2826f9fe45380285d944550b723e7d88d4473ce6e",
+    "etc/clang_plugin/plugin_customSROA.cpp": "2774a139fda04853896481f5d624090fdcb475229723cc57ae82c76a939e4f20",
+    "etc/clang_plugin/ArrPart.cpp": "f79ef3bceca9a3ed115a5b3320f9af0185cfdba555a09f165072947d2b77f55f"
+  }
+}

@@ -88,6 +88,46 @@ def LinalgConstantsToIndices
   ];
 }
 
+def LinalgFoldRuntimeBroadcasts
+    : Pass<"sodap-linalg-fold-runtime-broadcasts"> {
+  let summary = "Drop tosa-to-linalg's run-time broadcasts of operands whose "
+                "shape is the result's";
+  let description = [{
+    An elementwise TOSA op with two operands of dynamic shape becomes, in
+    `tosa-to-linalg`, a broadcast of each operand along each dynamic dim, at
+    run time:
+    ```mlir
+    %c = arith.cmpi eq, %d, %c1 : index        // %d = dim(%x, i)
+    %y = scf.if %c -> (tensor<?x?xf32>) {
+      %e = tensor.empty(%s0, %s1) : tensor<?x?xf32>
+      %b = linalg.generic {indexing_maps = [(d0, d1) -> (0, d1), id]} ins(%x) outs(%e) {
+        linalg.yield %in
+      }
+      scf.yield %b
+    } else {
+      scf.yield %x
+    }
+    ```
+    When the sizes of `%e` are those of `%x` (the same values, through
+    `tensor.dim`, `tensor.empty`, destination-style ops and the `arith.maxui`
+    of equal sizes tosa-to-linalg computes), the broadcast
+    copies `%x`: its dim i is 1, the condition says so, and so is the
+    result's. `%y` becomes `%x`. A tile whose shapes are arguments
+    (`sodap-join-multiple-tiles`, after `sodap-dataflow-bind-dims`) then
+    keeps its elementwise ops fusable and its compute free of branches.
+
+    A rank-0 input of a `linalg.generic` built from a scalar
+    (`tensor.from_elements %s : tensor<f32>`, a run-time alpha) is dropped,
+    and the body uses `%s`, as `linalg-fuse-elementwise-ops` does for a
+    constant: no buffer and no load for a scalar.
+  }];
+  let dependentDialects = [
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::scf::SCFDialect",
+    "::mlir::tensor::TensorDialect"
+  ];
+}
+
 def ViewOpGraph : Pass<"soda-view-op-graph"> {
   let summary = "Print Graphviz visualization of an operation";
   let description = [{
@@ -279,20 +319,23 @@ def ProfileKernel : Pass<"sodap-profile-kernel", "::mlir::ModuleOp"> {
 def GenerateReusableGemm : Pass<"sodap-generate-reusable-gemm", "::mlir::ModuleOp"> {
   let summary = "Generate a tiled float32 GEMM with runtime dimensions and DMA addresses";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"topName", "top-name", "std::string", "\"forward_kernel\"", "Hardware entry point">,
     Option<"tileM", "tile-m", "int64_t", "4", "Local output row tile extent">,
     Option<"tileN", "tile-n", "int64_t", "4", "Local output column tile extent">,
     Option<"tileK", "tile-k", "int64_t", "4", "Local reduction tile extent">,
+    Option<"structuredCompute", "structured-compute", "bool", "false", "Keep static local matmul for shared compute-budget transformations; mask runtime tails">,
     Option<"schedule", "schedule", "std::string", "\"sequential\"", "sequential or lcs; independent of the runtime ABI">
   ];
   let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::func::FuncDialect",
-      "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect",
+      "::mlir::linalg::LinalgDialect", "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect",
       "::mlir::sodap::dataflow::DataflowDialect"];
 }
 
 def GenerateReusableOperator : Pass<"sodap-generate-reusable-operator", "::mlir::ModuleOp"> {
   let summary = "Generate a reusable convolution or elementwise addition engine";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"kind", "kind", "std::string", "\"conv\"", "conv or add">,
     Option<"pixels", "tile-pixels", "int64_t", "4", "Local output spatial tile">,
     Option<"lanes", "output-lanes", "int64_t", "8", "Parallel convolution output channels">,
@@ -308,6 +351,8 @@ def GenerateReusableOperator : Pass<"sodap-generate-reusable-operator", "::mlir:
 def ReusableGemmToESP : Pass<"sodap-reusable-gemm-to-esp", "::mlir::ModuleOp"> {
   let summary = "Bind a straight-line GEMM graph to one reusable ESP device";
   let options = [
+    Option<"report", "report", "std::string", "\"\"", "Optional JSON invocation and buffer manifest">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport width, 0 selects legacy">,
     Option<"kernel", "kernel", "std::string", "\"forward_kernel\"", "Host function">,
     Option<"instance", "instance", "int64_t", "0", "Physical instance index">
   ];
@@ -342,6 +387,8 @@ def KernelToESPAccelerator : Pass<"sodap-kernel-to-esp-accelerator", "::mlir::Mo
            "Function to replace">,
     Option<"profile", "profile", "bool", /*default=*/"false",
            "Measure allocation, packing, execution and unpacking">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
+           "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"dmaWordStride", "dma-word-stride", "unsigned", /*default=*/"1",
            "32-bit words per shared-memory element (1 dense, 2 padded for DMA64)">
   ];
@@ -374,10 +421,16 @@ def LaunchesToESP : Pass<"sodap-launches-to-esp", "::mlir::ModuleOp"> {
     Operands must be f32 memrefs with static shapes and the identity layout.
   }];
   let options = [
+    Option<"argumentOrderFile", "argument-order-file", "std::string", "\"\"",
+           "Write the public argument order recorded by kernel outlining">,
+    Option<"invocationsFile", "invocations-file", "std::string", "\"\"",
+           "Export the same checked operator invocation graph used by host lowering">,
     Option<"host", "host", "std::string", /*default=*/"\"forward_kernel\"",
            "New name of the function holding the launches">,
     Option<"profile", "profile", "bool", /*default=*/"false",
            "Measure allocation, packing, execution and unpacking">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
+           "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"dmaWordStride", "dma-word-stride", "unsigned", /*default=*/"1",
            "32-bit words per shared-memory element (1 dense, 2 padded for DMA64)">
   ];
@@ -414,6 +467,8 @@ def OrderKernelArguments : Pass<"sodap-order-kernel-arguments", "::mlir::ModuleO
     or with async dependencies. The soda ops are matched by name: the plugin
     doesn't link the soda dialect.
   }];
+  let options = [Option<"argumentOrderFile", "argument-order-file", "std::string", "\"\"",
+                       "Write the checked original caller argument numbers">];
 }
 
 def LinalgBatchMatmulToESP : Pass<"sodap-linalg-batch-matmul-to-esp", "::mlir::ModuleOp"> {

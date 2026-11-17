@@ -9,7 +9,10 @@ a=p.parse_args();root=a.kernel_directory.resolve();here=Path(__file__).resolve()
 rtl=root/a.variant/'bambu_syn';out=root/'components'/a.variant/a.wrapper
 out.mkdir(parents=True,exist_ok=True)
 assert json.loads((root/'capture/result.json').read_text())['status']=='PASS'
-wrapper=here/'thin_dma64.sv' if a.wrapper=='thin' else here.parent/'generated-gemm/sqr_bambu_basic_dma64.sv'
+import importlib.util
+spec=importlib.util.spec_from_file_location('contract',here.parents[2]/'scripts/lcs/native_dma_contract.py')
+contract=importlib.util.module_from_spec(spec);spec.loader.exec_module(contract)
+wrapper=contract.select(root/a.variant,a.wrapper)
 for name in ('initial.hex','expected.hex','mask.hex','parameters.svh'):shutil.copy2(root/'capture'/name,out/name)
 for f in rtl.glob('*.mem'):shutil.copy2(f,out/f.name)
 tb=(here.parent/'generated-lcs/dma64_tb.sv').read_text()

@@ -1,0 +1,20 @@
+--- a/src/frontend_analysis/IR_manipulation/create_ir_manager.cpp
++++ b/src/frontend_analysis/IR_manipulation/create_ir_manager.cpp
+@@ -331,10 +331,13 @@
+ 
+    const auto HLSMgr = GetPointer<HLS_manager>(AppM);
+    THROW_ASSERT(HLSMgr, "");
+-   const auto arch_filename =
+-       parameters->isOption(OPT_architecture_xml) ?
+-           parameters->getOption<std::string>(OPT_architecture_xml) :
+-           (parameters->getOption<std::string>(OPT_output_temporary_directory) + "/architecture.xml");
++   // CSROA can expand node arguments. Its generated architecture describes
++   // the transformed IR; the user-supplied XML only describes compiler input.
++   const auto generated_arch =
++       parameters->getOption<std::string>(OPT_output_temporary_directory) + "/architecture.xml";
++   const auto arch_filename = std::filesystem::exists(generated_arch) ? generated_arch :
++       (parameters->isOption(OPT_architecture_xml) ?
++           parameters->getOption<std::string>(OPT_architecture_xml) : generated_arch);
+    HLSMgr->module_arch = refcount<ModuleArchitecture>(new ModuleArchitecture(arch_filename));
+ 
+    for(auto& [symbol, arch] : *HLSMgr->module_arch)

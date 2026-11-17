@@ -3,6 +3,8 @@
 #include "sodap/Dialect/Dataflow/Dataflow.h"
 #include "sodap/Dialect/Dataflow/Transforms/Passes.h"
 #include "sodap/ExecutionEngine/ReusableOperatorABI.h"
+#include "sodap/ExecutionEngine/DmaTransport.h"
+#include "sodap/Dialect/Dataflow/Transforms/PackedDMA.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -15,14 +17,20 @@ namespace mlir::sodap {
 #include "sodap/SODAPPasses.h.inc"
 namespace {
 using namespace dataflow;
+using namespace dataflow::packed;
 struct Generator {
   OpBuilder &b;
   Location loc;
   Value rc, rd, wc, wd;
   SmallVector<Value> cfg;
   Value z, one, fzero;
-  Generator(OpBuilder &builder, Location location, ValueRange ports)
-      : b(builder), loc(location), rc(ports[0]), rd(ports[1]), wc(ports[2]), wd(ports[3]) {
+  unsigned width; bool isConv;
+  std::optional<PackedAccess> packed;
+  DenseMap<Value,Value> baseColumns;
+  Generator(OpBuilder &builder, Location location, ValueRange ports,
+            unsigned width=0,PackedClient client={},bool isConv=true)
+      : b(builder), loc(location), rc(ports[0]), rd(ports[1]), wc(ports[2]), wd(ports[3]),width(width),isConv(isConv) {
+    if(width)packed.emplace(b,loc,width,client);
     z=idx(0); one=idx(1);
     fzero=b.create<arith::ConstantFloatOp>(loc,APFloat(0.0f),b.getF32Type());
   }
@@ -53,7 +61,11 @@ struct Generator {
   }
   Value load(Value mem,ValueRange indices) { return b.create<memref::LoadOp>(loc,mem,indices); }
   void store(Value value,Value mem,ValueRange indices) { b.create<memref::StoreOp>(loc,value,mem,indices); }
-  void request(Value port,Value address,Value count) {
+  void request(Value port,Value address,Value count,bool descriptor=false) {
+    if(width) {
+      packed->request(port==wc,address,b.create<arith::DivUIOp>(loc,count,idx(2)),descriptor);
+      return;
+    }
     Value a=b.create<arith::IndexCastOp>(loc,b.getI64Type(),address);
     Value n=b.create<arith::IndexCastOp>(loc,b.getI64Type(),count);
     Value shift=b.create<arith::ConstantIntOp>(loc,32,64);
@@ -61,18 +73,44 @@ struct Generator {
     b.create<StreamWriteOp>(loc,port,packed);
   }
   Value readWord() {
+    if(width)return packed->read();
     Value value=b.create<StreamReadOp>(loc,b.getI32Type(),rd).getResult();
     b.create<StreamReadOp>(loc,b.getI32Type(),rd);
     return value;
   }
   Value readFloat() { return b.create<arith::BitcastOp>(loc,b.getF32Type(),readWord()); }
   void writeFloat(Value value) {
+    if(width) {packed->write(b.create<arith::BitcastOp>(loc,b.getI32Type(),value));return;}
     b.create<StreamWriteOp>(loc,wd,b.create<arith::BitcastOp>(loc,b.getI32Type(),value));
     b.create<StreamWriteOp>(loc,wd,b.create<arith::ConstantIntOp>(loc,0,32));
   }
-  Value address(Value base,Value element) { return add(base,mul(element,idx(2))); }
-  Value field(unsigned f) { return b.create<arith::IndexCastUIOp>(loc,b.getIndexType(),cfg[f]); }
+  Value address(Value base,Value element) {
+    if(!width)return add(base,mul(element,idx(2)));
+    Value cols=baseColumns.lookup(base);
+    assert(cols && "packed operand must have a logical row width");
+    Value lanes=idx(width/32);
+    Value rowWords=mul(b.create<arith::DivUIOp>(loc,add(cols,idx(width/32-1)),lanes),lanes);
+    return add(base,mul(add(mul(b.create<arith::DivUIOp>(loc,element,cols),rowWords),
+        b.create<arith::RemUIOp>(loc,element,cols)),idx(4)));
+  }
+  Value field(unsigned f) {
+    Value v=b.create<arith::IndexCastUIOp>(loc,b.getIndexType(),cfg[f]);
+    if(width) {
+      if(isConv && (f==CONV_A || f==CONV_W))baseColumns[v]=field(CONV_IC);
+      if(isConv && (f==CONV_BIAS || f==CONV_C))baseColumns[v]=field(CONV_OC);
+      if(!isConv && (f==ADD_A || f==ADD_B || f==ADD_C))baseColumns[v]=field(ADD_COLUMNS);
+    }
+    return v;
+  }
   Value validConfig(uint32_t magic) {
+    if(width) {
+      Value valid=both(cmp(arith::CmpIPredicate::eq,cfg[0],b.create<arith::ConstantIntOp>(loc,magic,32)),
+          both(cmp(arith::CmpIPredicate::eq,field(1),idx(OP_PACKED_VERSION)),
+               cmp(arith::CmpIPredicate::eq,field(OP_DMA_WIDTH),idx(width))));
+      if(isConv)valid=both(valid,cmp(arith::CmpIPredicate::ule,field(CONV_ACTIVATION),idx(OP_ACT_LEAKY_RELU)));
+      else valid=both(valid,cmp(arith::CmpIPredicate::ugt,field(ADD_COLUMNS),z));
+      return valid;
+    }
     Value version1=cmp(arith::CmpIPredicate::eq,cfg[1],b.create<arith::ConstantIntOp>(loc,OP_VERSION,32));
     Value version=version1;
     if(magic==OP_CONV_MAGIC) {
@@ -85,7 +123,7 @@ struct Generator {
   }
   Value readConfig(uint32_t magic) {
     Value config=alloc({OP_HEADER_FIELDS},b.getI32Type());
-    request(rc,z,idx(OP_HEADER_FIELDS*2));
+    request(rc,z,idx(OP_HEADER_FIELDS*2),true);
     loop(idx(OP_HEADER_FIELDS),[&](Value i){store(readWord(),config,{i});});
     for(unsigned i=0;i<OP_HEADER_FIELDS;++i) cfg.push_back(load(config,{idx(i)}));
     return validConfig(magic);
@@ -115,8 +153,11 @@ struct Generator {
     condition(valid,[&]{
       Value n=field(ADD_COUNT),baseA=field(ADD_A),baseB=field(ADD_B),baseC=field(ADD_C);
       Value activation=cmp(arith::CmpIPredicate::ne,field(ADD_RELU),z);
-      loop(z,n,idx(block),[&](Value start){
-        Value count=bound(n,start,block);
+      Value rowColumns=width?field(ADD_COLUMNS):n;
+      loop(z,n,rowColumns,[&](Value rowStart){
+      loop(z,rowColumns,idx(block),[&](Value column){
+        Value start=add(rowStart,column);
+        Value count=bound(rowColumns,column,block);
         request(rc,address(baseA,start),mul(count,idx(2)));
         loop(count,[&](Value i){store(readFloat(),a,{i});});
         request(rc,address(baseB,start),mul(count,idx(2)));
@@ -126,6 +167,7 @@ struct Generator {
           Value sum=b.create<arith::AddFOp>(loc,load(a,{i}),load(rhs,{i}));
           writeFloat(relu(sum,activation));
         });
+      });
       });
     });
   }
@@ -222,7 +264,7 @@ struct ConvPipeline : Generator {
   }
   Value config(Stage stage,Value computeConfig,Value storeConfig) {
     Value config=alloc({OP_HEADER_FIELDS},b.getI32Type());
-    if(stage==Load) request(rc,z,idx(OP_HEADER_FIELDS*2));
+    if(stage==Load) request(rc,z,idx(OP_HEADER_FIELDS*2),true);
     loop(idx(OP_HEADER_FIELDS),[&](Value i) {
       Value v=stage==Load ? readWord() :
           b.create<StreamReadOp>(loc,b.getI32Type(),stage==Compute?computeConfig:storeConfig).getResult();
@@ -333,6 +375,10 @@ public:
   using GenerateReusableOperatorBase::GenerateReusableOperatorBase;
   void runOnOperation() final {
     auto module=getOperation();
+    if(dmaDataWidth && !::sodap::DmaTransport{dmaDataWidth}.valid()) {
+      module.emitError("dma-data-width must be 64, 128, 256 or 512");
+      return signalPassFailure();
+    }
     if(schedule!="sequential" && !(schedule=="lcs" && kind=="conv")) {
       module.emitError("expected sequential schedule, or lcs for convolution");
       return signalPassFailure();
@@ -345,10 +391,14 @@ public:
     OpBuilder b(module.getContext());
     b.setInsertionPointToEnd(module.getBody());
     auto ctrl=StreamType::get(module.getContext(),b.getI64Type(),8,StreamInterface::AXIS);
-    auto data=StreamType::get(module.getContext(),b.getI32Type(),16,StreamInterface::AXIS);
+    auto data=StreamType::get(module.getContext(),b.getIntegerType(dmaDataWidth?dmaDataWidth:32),16,StreamInterface::AXIS);
     auto type=b.getFunctionType({ctrl,data,ctrl,data},{});
-    if(schedule=="lcs") {
-      auto top=b.create<func::FuncOp>(module.getLoc(),"conv_kernel",type);
+    if(dmaDataWidth) {
+      module->setAttr("sodap.dma_abi",b.getI32IntegerAttr(2));
+      module->setAttr("sodap.dma_data_width",b.getI32IntegerAttr(dmaDataWidth));
+    }
+    if(schedule=="lcs" || dmaDataWidth) {
+      auto top=b.create<func::FuncOp>(module.getLoc(),kind+"_kernel",type);
       b.setInsertionPointToStart(top.addEntryBlock());
       auto dispatch=b.create<DispatchOp>(module.getLoc(),TypeRange{});
       dispatch.getBody().push_back(new Block());
@@ -362,24 +412,43 @@ public:
       auto cfgType=StreamType::get(module.getContext(),b.getI32Type(),OP_HEADER_FIELDS);
       Value computeConfig=b.create<StreamOp>(module.getLoc(),cfgType);
       Value storeConfig=b.create<StreamOp>(module.getLoc(),cfgType);
+      DenseMap<Operation *,PackedClient> clients;
+      SmallVector<TaskOp> tasks;
       for(auto stage:{ConvPipeline::Load,ConvPipeline::Compute,ConvPipeline::Store}) {
+        if(schedule=="sequential" && stage!=ConvPipeline::Load)continue;
+        PackedClient client;
+        if(dmaDataWidth)client=createClient(b,module.getLoc(),dmaDataWidth);
         auto task=b.create<TaskOp>(module.getLoc(),TypeRange{});
         task.getBody().push_back(new Block());
+        tasks.push_back(task);
+        if(dmaDataWidth) {client.task=task;clients[task]=client;}
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToStart(&task.getBody().front());
-        ConvPipeline generator(b,module.getLoc(),top.getArguments());
-        generator.build(stage,pixels,lanes,channels,a,weights,bias,result,computeConfig,storeConfig);
+        ConvPipeline generator(b,module.getLoc(),top.getArguments(),dmaDataWidth,client,kind=="conv");
+        if(schedule=="lcs")generator.build(stage,pixels,lanes,channels,a,weights,bias,result,computeConfig,storeConfig);
+        else if(kind=="conv")generator.convolution(pixels,lanes,channels);
+        else generator.addition(blockElements);
         b.create<dataflow::YieldOp>(module.getLoc());
+      }
+      if(dmaDataWidth) {
+        DMAStreams ports{top.getArgument(0),top.getArgument(1),top.getArgument(2),top.getArgument(3)};
+        packedBroker(b,top,ports,tasks,dmaDataWidth,clients);
+        top->setAttr("sodap.dma_broker",b.getUnitAttr());
+        b.setInsertionPointToEnd(&dispatch.getBody().front());
       }
       b.create<dataflow::YieldOp>(module.getLoc());
       b.setInsertionPointAfter(dispatch);
       b.create<func::ReturnOp>(module.getLoc());
       OpPassManager passes("builtin.module");
-      passes.addNestedPass<func::FuncOp>(dataflow::createPingPong());
+      if(schedule=="lcs")passes.addNestedPass<func::FuncOp>(dataflow::createPingPong());
       passes.addNestedPass<func::FuncOp>(dataflow::createTasksToNodes());
       passes.addPass(dataflow::createNodesToFunc());
       if(failed(runPipeline(passes,module))) return signalPassFailure();
-      module->setAttr("sodap.operator_abi",b.getI32IntegerAttr(CONV_VERSION));
+      if(dmaDataWidth) {
+        module.walk([&](StreamWriteOp op){op->setAttr("sodap.dma_ordered",b.getUnitAttr());});
+        module.walk([&](StreamPeekOp op){op->setAttr("sodap.dma_ordered",b.getUnitAttr());});
+      }
+      module->setAttr("sodap.operator_abi",b.getI32IntegerAttr(dmaDataWidth?OP_PACKED_VERSION:CONV_VERSION));
       module->setAttr("sodap.operator_schedule",b.getStringAttr(schedule));
       return;
     }

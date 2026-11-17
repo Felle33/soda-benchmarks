@@ -1,0 +1,51 @@
+--- a/etc/clang_plugin/PointerResolutionPass.cpp
++++ b/etc/clang_plugin/PointerResolutionPass.cpp
+@@ -386,6 +386,40 @@
+    /// and also the phi on the GEPs, then the bb0 and bb_merge are reassembled
+    /// The pass does not use the Alias Analysis because I suppose that all the GEPs
+    /// are on different memories. To be fair AA should be used
++
++   // InstCombine can merge bank loads into a load through a pointer PHI,
++   // leaving GEPs in the switch cases. Restore the empty-case shape that
++   // the existing resolution expects, without moving any memory access.
++   bool hoistSwitchAddressComputations(SwitchInst* SW)
++   {
++      SmallVector<BasicBlock*, 8> cases;
++      BasicBlock* merge = nullptr;
++      for(auto& item : SW->cases())
++      {
++         BasicBlock* bb = item.getCaseSuccessor();
++         if(bb == SW->getDefaultDest() || bb->getSinglePredecessor() != SW->getParent())
++            return false;
++         auto* br = dyn_cast<BranchInst>(bb->getTerminator());
++         if(!br || !br->isUnconditional()) return false;
++         if(merge && merge != br->getSuccessor(0)) return false;
++         merge = br->getSuccessor(0);
++         for(auto& inst : *bb)
++            if(&inst != br && !isa<GetElementPtrInst>(inst) && !isa<BitCastInst>(inst))
++               return false;
++         if(!llvm::is_contained(cases, bb)) cases.push_back(bb);
++      }
++      bool changed = false;
++      for(BasicBlock* bb : cases)
++         while(bb->size() > 1)
++         {
++            // Single predecessor and only address instructions: operands
++            // dominate the switch or were hoisted earlier in this loop.
++            bb->front().moveBefore(SW);
++            changed = true;
++         }
++      return changed;
++   }
++
+    bool runOnSwitchPointers(Module& M)
+    {
+       LLVM_DEBUG(dbgs() << PASS_PREFIX "Running switch on pointers\n");
+@@ -409,6 +443,7 @@
+                });
+                BasicBlock* MergeBB = nullptr;
+                LLVM_DEBUG(dbgs() << "  Checking if the switch is in a diamond config\n");
++               changed |= hoistSwitchAddressComputations(SW);
+                if(!isSwitchDiamond(SW, MergeBB))
+                   continue;
+ 

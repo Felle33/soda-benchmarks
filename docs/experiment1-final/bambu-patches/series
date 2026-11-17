@@ -1,0 +1,7 @@
+0001-drop-stale-partition-interface.patch
+0002-read-transformed-architecture.patch
+0003-equivalent-index-phi-residues.patch
+0004-resolve-bank-pointers-before-simplifycfg.patch
+0005-hoist-switch-address-calculations.patch
+0006-interface-order.patch
+0007-fifo-empty.patch

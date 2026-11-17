@@ -39,6 +39,8 @@ struct OutstandingLoad
     : public mlir::sodap::dataflow::impl::OutstandingLoadBase<OutstandingLoad> {
   void runOnOperation() override {
     func::FuncOp func = getOperation();
+    // The packed boundary broker already owns/admit-orders all physical DMA.
+    if (func->hasAttr("sodap.dma_broker")) return;
     SmallVector<TaskOp> loads;
     func.walk([&](TaskOp task) {
       if (task->hasAttr("load"))

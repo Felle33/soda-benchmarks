@@ -1,0 +1,41 @@
+--- a/src/HLS/hdl_generators/ReadWriteDPArrayHDLGenerator.cpp
++++ b/src/HLS/hdl_generators/ReadWriteDPArrayHDLGenerator.cpp
+@@ -38,6 +38,7 @@
+ #include "language_writer.hpp"
+ #include "math_function.hpp"
+ #include "structural_objects.hpp"
++#include <algorithm>
+ 
+ enum in_port
+ {
+@@ -119,15 +120,26 @@
+ 
+    if(_ports_out.size() > o_d1)
+    {
+-      out << "assign " << _ports_out[o_we0].name << " = " << _ports_in[i_start].name << "[0] & (|"
++      // A shared array discovered first by a reader gains write ports later.
++      // Those are appended as we0,d0,we1,d1 rather than we0,we1,d0,d1.
++      // Resolve semantic names instead of relying on traversal-dependent order.
++      const auto named_output = [&](const std::string& suffix) -> const std::string& {
++         const auto port = std::find_if(_ports_out.begin(), _ports_out.end(), [&](const auto& p) {
++            return p.name.size() >= suffix.size() &&
++                   p.name.compare(p.name.size() - suffix.size(), suffix.size(), suffix) == 0;
++         });
++         THROW_ASSERT(port != _ports_out.end(), "Missing dual-port array output " + suffix);
++         return port->name;
++      };
++      out << "assign " << named_output("_we0") << " = " << _ports_in[i_start].name << "[0] & (|"
+           << _ports_in[i_in1].name << "[BITSIZE_" << _ports_in[i_in1].name << "*0+:BITSIZE_" << _ports_in[i_in1].name
+           << "]);\n";
+-      out << "assign " << _ports_out[o_d0].name << " = " << _ports_in[i_in3].name << "[BITSIZE_"
++      out << "assign " << named_output("_d0") << " = " << _ports_in[i_in3].name << "[BITSIZE_"
+           << _ports_in[i_in3].name << "*0+:BITSIZE_" << _ports_in[i_in3].name << "];\n";
+-      out << "assign " << _ports_out[o_we1].name << " = " << _ports_in[i_start].name << "[1] & (|"
++      out << "assign " << named_output("_we1") << " = " << _ports_in[i_start].name << "[1] & (|"
+           << _ports_in[i_in1].name << "[BITSIZE_" << _ports_in[i_in1].name << "*1+:BITSIZE_" << _ports_in[i_in1].name
+           << "]);\n";
+-      out << "assign " << _ports_out[o_d1].name << " = " << _ports_in[i_in3].name << "[BITSIZE_"
++      out << "assign " << named_output("_d1") << " = " << _ports_in[i_in3].name << "[BITSIZE_"
+           << _ports_in[i_in3].name << "*1+:BITSIZE_" << _ports_in[i_in3].name << "];\n";
+    }
+ }

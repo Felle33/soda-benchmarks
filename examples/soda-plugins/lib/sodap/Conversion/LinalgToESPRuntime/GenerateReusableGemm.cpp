@@ -6,9 +6,12 @@
 #include "sodap/Dialect/Dataflow/Dataflow.h"
 #include "sodap/Dialect/Dataflow/Transforms/Passes.h"
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
+#include "sodap/ExecutionEngine/DmaTransport.h"
+#include "sodap/Dialect/Dataflow/Transforms/PackedDMA.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -17,12 +20,16 @@ namespace mlir::sodap {
 #include "sodap/SODAPPasses.h.inc"
 namespace {
 using namespace dataflow;
+using namespace dataflow::packed;
 
 class KernelBuilder {
 public:
-  KernelBuilder(OpBuilder &builder, Location location, ValueRange ports)
+  KernelBuilder(OpBuilder &builder, Location location, ValueRange ports,
+                unsigned width=0, PackedClient client={}, bool structured=false)
       : b(builder), loc(location), rc(ports[0]), rd(ports[1]),
-        wc(ports[2]), wd(ports[3]) {}
+        wc(ports[2]), wd(ports[3]), width(width), structured(structured) {
+    if(width) packed.emplace(b,loc,width,client);
+  }
 
   Value idx(int64_t n) { return b.create<arith::ConstantIndexOp>(loc, n); }
   Value add(Value a, Value c) { return b.create<arith::AddIOp>(loc, a, c); }
@@ -38,7 +45,11 @@ public:
     b.setInsertionPointToStart(op.getBody());
     body(op.getInductionVar());
   }
-  void request(Value stream, Value address, Value count) {
+  void request(Value stream, Value address, Value count, bool descriptor=false) {
+    if(width) {
+      packed->request(stream==wc,address,b.create<arith::DivUIOp>(loc,count,idx(2)),descriptor);
+      return;
+    }
     Value len = b.create<arith::IndexCastOp>(loc, b.getI64Type(), count);
     Value addr = b.create<arith::IndexCastOp>(loc, b.getI64Type(), address);
     Value shift = b.create<arith::ConstantIntOp>(loc, 32, 64);
@@ -47,6 +58,7 @@ public:
     b.create<StreamWriteOp>(loc, stream, packet);
   }
   Value readWord() {
+    if(width) return packed->read();
     Value word = b.create<StreamReadOp>(loc, b.getI32Type(), rd).getResult();
     b.create<StreamReadOp>(loc, b.getI32Type(), rd); // DMA64 padding.
     return word;
@@ -63,13 +75,42 @@ public:
   }
   void readTile(Value base, Value stride, Value row, Value col,
                 Value rows, Value cols, Value buffer) {
+    // Public dimensions remain arbitrary. Static local contractions see zeros
+    // outside the active tile; a full tile skips this initialization entirely.
+    if (structured) {
+      auto type=cast<MemRefType>(buffer.getType());
+      Value partial=b.create<arith::OrIOp>(loc,
+          b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ult,rows,idx(type.getDimSize(0))),
+          b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::ult,cols,idx(type.getDimSize(1))));
+      auto pad=b.create<scf::IfOp>(loc,partial,false);
+      OpBuilder::InsertionGuard guard(b); b.setInsertionPointToStart(&pad.getThenRegion().front());
+      Value zero=b.create<arith::ConstantFloatOp>(loc,APFloat(0.0f),b.getF32Type());
+      loop(idx(0),idx(type.getDimSize(0)),idx(1),[&](Value i) {
+        loop(idx(0),idx(type.getDimSize(1)),idx(1),[&](Value j) {store(zero,buffer,i,j);});
+      });
+    }
     loop(idx(0), rows, idx(1), [&](Value i) {
       Value address = add(base, add(mul(add(row, i), stride),
-                                    mul(col, idx(GEMM_WORD_STRIDE))));
+                                    mul(col, idx(width ? 4 : GEMM_WORD_STRIDE))));
       request(rc, address, mul(cols, idx(GEMM_WORD_STRIDE)));
       loop(idx(0), cols, idx(1), [&](Value j) {
         store(b.create<arith::BitcastOp>(loc, b.getF32Type(), readWord()),
               buffer, i, j);
+      });
+    });
+  }
+
+  void contract(Value a, Value rhs, Value accum, Value rows, Value cols, Value depth) {
+    if (structured) {
+      b.create<linalg::MatmulOp>(loc,ValueRange{a,rhs},ValueRange{accum});
+      return;
+    }
+    loop(idx(0),rows,idx(1),[&](Value i) {
+      loop(idx(0),cols,idx(1),[&](Value j) {
+        loop(idx(0),depth,idx(1),[&](Value q) {
+          Value product=b.create<arith::MulFOp>(loc,load(a,i,q),load(rhs,q,j));
+          store(b.create<arith::AddFOp>(loc,load(accum,i,j),product),accum,i,j);
+        });
       });
     });
   }
@@ -79,7 +120,7 @@ public:
     Value accum = allocate(tm, tn), oldC = allocate(tm, tn);
     Value config = b.create<memref::AllocaOp>(loc,
         MemRefType::get({GEMM_FIELD_COUNT}, b.getI32Type()));
-    request(rc, idx(0), idx(GEMM_FIELD_COUNT * GEMM_WORD_STRIDE));
+    request(rc, idx(0), idx(GEMM_FIELD_COUNT * GEMM_WORD_STRIDE),true);
     // A single ordered stream reader latches the complete descriptor before
     // any field is used. Keep this loop independent of the matrix schedule.
     loop(idx(0), idx(GEMM_FIELD_COUNT), idx(1), [&](Value f) {
@@ -102,10 +143,12 @@ public:
     Value zero = b.create<arith::ConstantFloatOp>(loc, APFloat(0.0f), b.getF32Type());
     Value hasC = b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, beta, zero);
     Value magic = b.create<arith::ConstantIntOp>(loc, GEMM_MAGIC, 32);
-    Value version = b.create<arith::ConstantIntOp>(loc, GEMM_VERSION, 32);
+    Value version = b.create<arith::ConstantIntOp>(loc, width ? GEMM_PACKED_VERSION : GEMM_VERSION, 32);
     Value valid = b.create<arith::AndIOp>(loc,
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, fields[GEMM_FIELD_MAGIC], magic),
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, fields[GEMM_FIELD_VERSION], version));
+    if(width) valid=b.create<arith::AndIOp>(loc,valid,b.create<arith::CmpIOp>(loc,
+        arith::CmpIPredicate::eq,fields[GEMM_FIELD_DMA_WIDTH],b.create<arith::ConstantIntOp>(loc,width,32)));
     auto configured = b.create<scf::IfOp>(loc, valid, false);
     {
       OpBuilder::InsertionGuard guard(b);
@@ -114,21 +157,14 @@ public:
         Value rows = bound(m, ii, tm);
         loop(idx(0), n, idx(tn), [&](Value jj) {
           Value cols = bound(n, jj, tn);
-          loop(idx(0), rows, idx(1), [&](Value i) {
-            loop(idx(0), cols, idx(1), [&](Value j) { store(zero, accum, i, j); });
+          loop(idx(0), structured ? idx(tm) : rows, idx(1), [&](Value i) {
+            loop(idx(0), structured ? idx(tn) : cols, idx(1), [&](Value j) { store(zero, accum, i, j); });
           });
           loop(idx(0), k, idx(tk), [&](Value kk) {
             Value depth = bound(k, kk, tk);
             readTile(baseA, lda, ii, kk, rows, depth, a);
             readTile(baseB, ldb, kk, jj, depth, cols, rhs);
-            loop(idx(0), rows, idx(1), [&](Value i) {
-              loop(idx(0), cols, idx(1), [&](Value j) {
-                loop(idx(0), depth, idx(1), [&](Value q) {
-                  Value product = b.create<arith::MulFOp>(loc, load(a, i, q), load(rhs, q, j));
-                  store(b.create<arith::AddFOp>(loc, load(accum, i, j), product), accum, i, j);
-                });
-              });
-            });
+            contract(a,rhs,accum,rows,cols,depth);
           });
           auto readC = b.create<scf::IfOp>(loc, hasC, false);
           {
@@ -138,7 +174,7 @@ public:
           }
           loop(idx(0), rows, idx(1), [&](Value i) {
             Value address = add(baseC, add(mul(add(ii, i), ldc),
-                                          mul(jj, idx(GEMM_WORD_STRIDE))));
+                                          mul(jj, idx(width ? 4 : GEMM_WORD_STRIDE))));
             request(wc, address, mul(cols, idx(GEMM_WORD_STRIDE)));
             loop(idx(0), cols, idx(1), [&](Value j) {
               Value scaled = b.create<arith::MulFOp>(loc, alpha, load(accum, i, j));
@@ -153,18 +189,27 @@ public:
                 b.create<scf::YieldOp>(loc, scaled);
               }
               Value bits = b.create<arith::BitcastOp>(loc, b.getI32Type(), result.getResult(0));
-              b.create<StreamWriteOp>(loc, wd, bits);
-              b.create<StreamWriteOp>(loc, wd, b.create<arith::ConstantIntOp>(loc, 0, 32));
+              writeWord(bits);
             });
           });
         });
       });
     }
   }
+  void writeWord(Value bits) {
+    if(width) packed->write(bits);
+    else {
+      b.create<StreamWriteOp>(loc,wd,bits);
+      b.create<StreamWriteOp>(loc,wd,b.create<arith::ConstantIntOp>(loc,0,32));
+    }
+  }
 protected:
   OpBuilder &b;
   Location loc;
   Value rc, rd, wc, wd;
+  unsigned width;
+  bool structured;
+  std::optional<PackedAccess> packed;
 };
 
 // The three tasks have identical descriptor-controlled tile traversals. Only
@@ -200,7 +245,7 @@ public:
     auto buffer = b.create<memref::AllocaOp>(loc,
         MemRefType::get({GEMM_FIELD_COUNT}, b.getI32Type()));
     if (!input)
-      request(rc, idx(0), idx(GEMM_FIELD_COUNT * GEMM_WORD_STRIDE));
+      request(rc, idx(0), idx(GEMM_FIELD_COUNT * GEMM_WORD_STRIDE),true);
     loop(idx(0), idx(GEMM_FIELD_COUNT), idx(1), [&](Value f) {
       Value value = input ? b.create<StreamReadOp>(loc, b.getI32Type(), input).getResult()
                           : readWord();
@@ -223,11 +268,14 @@ public:
     beta=b.create<arith::BitcastOp>(loc,b.getF32Type(),fields[GEMM_FIELD_BETA]);
     zero=b.create<arith::ConstantFloatOp>(loc,APFloat(0.0f),b.getF32Type());
     hasC=b.create<arith::CmpFOp>(loc,arith::CmpFPredicate::UNE,beta,zero);
-    return b.create<arith::AndIOp>(loc,
+    Value valid=b.create<arith::AndIOp>(loc,
         b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::eq,fields[GEMM_FIELD_MAGIC],
             b.create<arith::ConstantIntOp>(loc,GEMM_MAGIC,32)),
         b.create<arith::CmpIOp>(loc,arith::CmpIPredicate::eq,fields[GEMM_FIELD_VERSION],
-            b.create<arith::ConstantIntOp>(loc,GEMM_VERSION,32)));
+            b.create<arith::ConstantIntOp>(loc,width ? GEMM_PACKED_VERSION : GEMM_VERSION,32)));
+    if(width) valid=b.create<arith::AndIOp>(loc,valid,b.create<arith::CmpIOp>(loc,
+        arith::CmpIPredicate::eq,fields[GEMM_FIELD_DMA_WIDTH],b.create<arith::ConstantIntOp>(loc,width,32)));
+    return valid;
   }
   void outputs(int64_t tm, int64_t tn,
                llvm::function_ref<void(Value,Value,Value,Value)> body) {
@@ -268,18 +316,11 @@ public:
     Value accum=allocate(tm,tn);
     condition(valid,[&] {
       outputs(tm,tn,[&](Value ii,Value jj,Value rows,Value cols) {
-        fill(accum,rows,cols);
+        fill(accum,structured ? idx(tm) : rows,structured ? idx(tn) : cols);
         loop(idx(0),k,idx(tk),[&](Value kk) {
           Value depth=bound(k,kk,tk);
           tile([&] {
-            loop(idx(0),rows,idx(1),[&](Value i) {
-              loop(idx(0),cols,idx(1),[&](Value j) {
-                loop(idx(0),depth,idx(1),[&](Value q) {
-                  Value product=b.create<arith::MulFOp>(loc,load(a,i,q),load(rhs,q,j));
-                  store(b.create<arith::AddFOp>(loc,load(accum,i,j),product),accum,i,j);
-                });
-              });
-            });
+            contract(a,rhs,accum,rows,cols,depth);
           });
         });
         tile([&] {
@@ -302,12 +343,11 @@ public:
       outputs(tm,tn,[&](Value ii,Value jj,Value rows,Value cols) {
         tile([&] {
           loop(idx(0),rows,idx(1),[&](Value i) {
-            Value address=add(baseC,add(mul(add(ii,i),ldc),mul(jj,idx(GEMM_WORD_STRIDE))));
+            Value address=add(baseC,add(mul(add(ii,i),ldc),mul(jj,idx(width ? 4 : GEMM_WORD_STRIDE))));
             request(wc,address,mul(cols,idx(GEMM_WORD_STRIDE)));
             loop(idx(0),cols,idx(1),[&](Value j) {
               Value bits=b.create<arith::BitcastOp>(loc,b.getI32Type(),load(result,i,j));
-              b.create<StreamWriteOp>(loc,wd,bits);
-              b.create<StreamWriteOp>(loc,wd,b.create<arith::ConstantIntOp>(loc,0,32));
+              writeWord(bits);
             });
           });
         });
@@ -321,6 +361,10 @@ public:
   using GenerateReusableGemmBase::GenerateReusableGemmBase;
   void runOnOperation() final {
     auto module = getOperation();
+    if(dmaDataWidth && !::sodap::DmaTransport{dmaDataWidth}.valid()) {
+      module.emitError("dma-data-width must be 64, 128, 256 or 512");
+      return signalPassFailure();
+    }
     if (schedule != "sequential" && schedule != "lcs") {
       module.emitError("GEMM schedule must be sequential or lcs");
       return signalPassFailure();
@@ -337,9 +381,13 @@ public:
     OpBuilder b(module.getContext());
     b.setInsertionPointToEnd(module.getBody());
     auto ctrl = StreamType::get(module.getContext(), b.getI64Type(), 8, StreamInterface::AXIS);
-    auto data = StreamType::get(module.getContext(), b.getI32Type(), 16, StreamInterface::AXIS);
+    auto data = StreamType::get(module.getContext(), b.getIntegerType(dmaDataWidth ? dmaDataWidth : 32), 16, StreamInterface::AXIS);
     auto type = b.getFunctionType({ctrl, data, ctrl, data}, {});
-    if (schedule == "lcs") {
+    if(dmaDataWidth) {
+      module->setAttr("sodap.dma_abi",b.getI32IntegerAttr(2));
+      module->setAttr("sodap.dma_data_width",b.getI32IntegerAttr(dmaDataWidth));
+    }
+    if (schedule == "lcs" || dmaDataWidth) {
       auto top = b.create<func::FuncOp>(module.getLoc(), topName, type);
       b.setInsertionPointToStart(top.addEntryBlock());
       auto dispatch = b.create<DispatchOp>(module.getLoc(), TypeRange{});
@@ -353,43 +401,62 @@ public:
       auto cfgType=StreamType::get(module.getContext(),b.getI32Type(),GEMM_FIELD_COUNT);
       Value computeConfig=b.create<StreamOp>(module.getLoc(),cfgType);
       Value storeConfig=b.create<StreamOp>(module.getLoc(),cfgType);
+      DenseMap<Operation *,PackedClient> clients;
+      SmallVector<TaskOp> tasks;
       auto task = [&](llvm::function_ref<void(PipelineBuilder &)> body) {
+        PackedClient client;
+        if(dmaDataWidth) client=createClient(b,module.getLoc(),dmaDataWidth);
         auto op=b.create<TaskOp>(module.getLoc(),TypeRange{});
         op.getBody().push_back(new Block());
+        tasks.push_back(op);
+        if(dmaDataWidth) {client.task=op;clients[op]=client;}
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToStart(&op.getBody().front());
-        PipelineBuilder builder(b,module.getLoc(),top.getArguments());
+        PipelineBuilder builder(b,module.getLoc(),top.getArguments(),dmaDataWidth,client,structuredCompute);
         body(builder);
         b.create<dataflow::YieldOp>(module.getLoc());
       };
+      if(schedule=="sequential") task([&](PipelineBuilder &p) {p.build(tileM,tileN,tileK);});
+      else {
       task([&](PipelineBuilder &p) { p.loadStage(tileM,tileN,tileK,a,rhs,oldC,computeConfig,storeConfig); });
       task([&](PipelineBuilder &p) { p.computeStage(tileM,tileN,tileK,a,rhs,oldC,result,computeConfig); });
       task([&](PipelineBuilder &p) { p.storeStage(tileM,tileN,result,storeConfig); });
+      }
+      if(dmaDataWidth) {
+        DMAStreams ports{top.getArgument(0),top.getArgument(1),top.getArgument(2),top.getArgument(3)};
+        packedBroker(b,top,ports,tasks,dmaDataWidth,clients);
+        top->setAttr("sodap.dma_broker",b.getUnitAttr());
+        b.setInsertionPointToEnd(&dispatch.getBody().front());
+      }
       b.create<dataflow::YieldOp>(module.getLoc());
       b.setInsertionPointAfter(dispatch);
       b.create<func::ReturnOp>(module.getLoc());
       // Consume the tile scopes before canonicalization can inline them.
       OpPassManager passes("builtin.module");
-      passes.addNestedPass<func::FuncOp>(dataflow::createPingPong());
+      if(schedule=="lcs") passes.addNestedPass<func::FuncOp>(dataflow::createPingPong());
       passes.addNestedPass<func::FuncOp>(dataflow::createTasksToNodes());
       passes.addPass(dataflow::createNodesToFunc());
       if (failed(runPipeline(passes,module)))
         return signalPassFailure();
-      module->setAttr("sodap.gemm_abi",b.getI32IntegerAttr(GEMM_VERSION));
+      if(dmaDataWidth) {
+        module.walk([&](StreamWriteOp op){op->setAttr("sodap.dma_ordered",b.getUnitAttr());});
+        module.walk([&](StreamPeekOp op){op->setAttr("sodap.dma_ordered",b.getUnitAttr());});
+      }
+      module->setAttr("sodap.gemm_abi",b.getI32IntegerAttr(dmaDataWidth ? GEMM_PACKED_VERSION : GEMM_VERSION));
       module->setAttr("sodap.gemm_tiles",b.getDenseI64ArrayAttr({tileM,tileN,tileK}));
       module->setAttr("sodap.gemm_schedule",b.getStringAttr(schedule));
       return;
     }
     auto engine = b.create<func::FuncOp>(module.getLoc(), "gemm_engine", type);
     b.setInsertionPointToStart(engine.addEntryBlock());
-    KernelBuilder(b, module.getLoc(), engine.getArguments()).build(tileM, tileN, tileK);
+    KernelBuilder(b, module.getLoc(), engine.getArguments(),0,{},structuredCompute).build(tileM, tileN, tileK);
     b.create<func::ReturnOp>(module.getLoc());
     b.setInsertionPointToEnd(module.getBody());
     auto top = b.create<func::FuncOp>(module.getLoc(), topName, type);
     b.setInsertionPointToStart(top.addEntryBlock());
     b.create<func::CallOp>(module.getLoc(), engine, top.getArguments());
     b.create<func::ReturnOp>(module.getLoc());
-    module->setAttr("sodap.gemm_abi", b.getI32IntegerAttr(GEMM_VERSION));
+    module->setAttr("sodap.gemm_abi", b.getI32IntegerAttr(dmaDataWidth ? GEMM_PACKED_VERSION : GEMM_VERSION));
     module->setAttr("sodap.gemm_tiles", b.getDenseI64ArrayAttr({tileM, tileN, tileK}));
   }
 };

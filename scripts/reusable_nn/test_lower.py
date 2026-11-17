@@ -4,10 +4,42 @@ import tempfile
 from pathlib import Path
 import unittest
 import numpy as np
-from lower import Node, transpose, reshape, pointwise, unary_activation, leaky_pattern, fuse_relu, plan_memory, invocation
+from lower import Node, transpose, reshape, pointwise, unary_activation, leaky_pattern, fuse_relu, plan_memory, invocation, tensor_bytes
 
 
 class LoweringTests(unittest.TestCase):
+    def test_packed_residual_lifetimes_and_external_constants(self):
+        for width in (64, 128, 256, 512):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as directory:
+                x = Node("input", (1, 2, 3))
+                data = np.arange(6, dtype=np.float32).reshape(x.shape)
+                weights = Node("const", x.shape, data=data)
+                a = Node("add", x.shape, (x, weights))
+                b = Node("add", x.shape, (a, weights))
+                result = Node("add", x.shape, (a, b))
+                nodes, calls, parameters, arena = plan_memory(
+                    x, result, Path(directory), width)
+                self.assertEqual(parameters, 6)
+                self.assertEqual((Path(directory)/"parameters.bin").read_bytes(), data.tobytes())
+                for node in nodes:
+                    self.assertEqual(node.offset % (width//8), 0)
+                    self.assertLessEqual(node.offset + tensor_bytes(node, width), arena)
+                # The residual and both add operands must survive each dispatch.
+                for node in calls:
+                    for parent in node.inputs:
+                        self.assertTrue(
+                            node.offset + tensor_bytes(node, width) <= parent.offset or
+                            parent.offset + tensor_bytes(parent, width) <= node.offset)
+
+    def test_packed_reshape_requires_a_physical_copy(self):
+        for width in (64, 128, 256, 512):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as directory:
+                x = Node("input", (2, 3))
+                result = Node("reshape", (1, 6), (x,))
+                _, calls, _, _ = plan_memory(x, result, Path(directory), width)
+                self.assertEqual([node.kind for node in calls], ["repack"])
+                self.assertNotEqual(result.offset, x.offset)
+
     def test_layout_propagation(self):
         a, b = Node("input", (1, 3, 5, 7)), Node("input", (1, 3, 5, 7))
         p, inverse = (0, 2, 3, 1), (0, 3, 1, 2)

@@ -121,6 +121,7 @@ struct Tile {
 /// every loop of the yielded ops. Loop ids follow the yielded ops' order.
 struct TileModel {
   ::mlir::SmallVector<int64_t> ranges;
+  ::mlir::SmallVector<int64_t> bankFactors, minimums;
   /// The parallel loops of each yielded op.
   ::mlir::SmallVector<::mlir::SmallVector<int>> parallel;
   ::mlir::SmallVector<Tile> tiles;
@@ -233,7 +234,8 @@ static ::mlir::SmallVector<int64_t> loopRanges(::mlir::linalg::LinalgOp op,
 /// ping-pong buffer, stored a tile at a time if read outside the tasks; values
 /// computed in the nest keep a buffer of their own.
 static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
-                                ::llvm::ArrayRef<int64_t> inv = {}) {
+                                ::llvm::ArrayRef<int64_t> inv = {}, int64_t computeLanes = 0,
+                                bool doubleBuffer = true) {
   using namespace ::mlir;
   using sodap::dataflow::TaskOp;
   TileModel m;
@@ -242,12 +244,13 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
   for (Operation *op : lasts) {
     auto last = cast<linalg::LinalgOp>(op);
     auto task = op->getParentOfType<TaskOp>();
+    unsigned firstId = m.ranges.size();
     SmallVector<Extent> leaf, fused;
     SmallVector<int> all, parallel;
     for (auto [iterator, range] : llvm::zip_equal(
              last.getIteratorTypesArray(), loopRanges(last, inv))) {
       int id = m.ranges.size();
-      m.ranges.push_back(range);
+      m.ranges.push_back(range); m.bankFactors.push_back(1); m.minimums.push_back(1);
       m.same.insert(id);
       leaf.push_back({id, 0});
       all.push_back(id);
@@ -258,6 +261,24 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
         parallel.push_back(id);
     }
     m.parallel.push_back(parallel);
+    if (computeLanes && last.getNumReductionLoops() && last.getNumDpsInputs() == 2) {
+      auto maps = last.getIndexingMapsArray();
+      auto uses = [&](unsigned operand,unsigned dim) {
+        return llvm::is_contained(maps[operand].getResults(), getAffineDimExpr(dim,last.getContext()));
+      };
+      int left = -1, right = -1;
+      for (auto [d,kind] : llvm::enumerate(last.getIteratorTypesArray())) if (kind == utils::IteratorType::parallel) {
+        if (uses(0,d) && !uses(1,d) && (left < 0 || m.ranges[firstId+d] > m.ranges[firstId+left])) left = d;
+        if (uses(1,d) && !uses(0,d) && (right < 0 || m.ranges[firstId+d] > m.ranges[firstId+right])) right = d;
+      }
+      int64_t rows = 1, cols = computeLanes;
+      if (right < 0) { rows = computeLanes; cols = 1; }
+      else if (left >= 0) for (int64_t f=1; f*f<=computeLanes; ++f) if (!(computeLanes%f)) { rows=f; cols=computeLanes/f; }
+      for (auto [dim,factor] : {std::pair<int,int64_t>{left,rows}, {right,cols}}) if (dim >= 0) {
+        m.bankFactors[firstId+dim] = factor;
+        if (m.ranges[firstId+dim] >= 2*factor) m.minimums[firstId+dim] = factor;
+      }
+    }
 
     for (OpOperand &yielded : task.getYieldOp()->getOpOperands()) {
       if (yielded.get().getDefiningOp() != op)
@@ -270,7 +291,7 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
       bool stored = llvm::any_of(taskResult.getUsers(), [](Operation *user) {
         return !user->getParentOfType<TaskOp>();
       });
-      m.tiles.push_back({tile, elementBytes(type), 2, stored, parallel});
+      m.tiles.push_back({tile, elementBytes(type), doubleBuffer ? 2 : 1, stored, parallel});
       written[taskResult] = tile;
     }
 
@@ -310,7 +331,7 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
           continue;
         }
         bool everyIteration = isLast && !current.isDpsInit(&operand);
-        m.tiles.push_back({tile, elementBytes(type), 2, true,
+        m.tiles.push_back({tile, elementBytes(type), doubleBuffer ? 2 : 1, true,
                            everyIteration ? all : parallel});
       }
     }
@@ -328,8 +349,12 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
         whole.push_back(std::max(a.id, b.id));
     }
   }
-  for (int id : whole)
-    m.whole.insert(m.same.getLeaderValue(id));
+  for (int id : whole) m.whole.insert(m.same.getLeaderValue(id));
+  for (unsigned i=0;i<m.ranges.size();++i) for (unsigned j=0;j<m.ranges.size();++j)
+    if (m.same.getLeaderValue(i) == m.same.getLeaderValue(j)) {
+      m.bankFactors[i] = std::lcm(m.bankFactors[i],m.bankFactors[j]);
+      m.minimums[i] = std::max(m.minimums[i],m.minimums[j]);
+    }
   return m;
 }
 
@@ -340,14 +365,16 @@ static std::pair<int64_t, int64_t> tileCost(const TileModel &m,
                                             int64_t wordCycles) {
   int64_t cycles = 0, bytes = 0;
   for (const Tile &tile : m.tiles) {
-    int64_t elements = 1, rows = 1;
+    int64_t elements = 1, rows = 1, physicalElements = 1;
     for (auto [d, extent] : llvm::enumerate(tile.extents)) {
       int64_t n = extent.id < 0 ? extent.fixed : size[extent.id];
       elements *= n;
+      int64_t factor = extent.id < 0 ? 1 : m.bankFactors[extent.id];
+      physicalElements *= llvm::divideCeil(n,factor)*factor;
       if (d + 1 < tile.extents.size())
         rows *= n;
     }
-    bytes += tile.copies * elements * tile.elementBytes;
+    bytes += tile.copies * physicalElements * tile.elementBytes;
     if (!tile.moves)
       continue;
     // CopyToDMA: a request per row, then the row's words.
@@ -395,7 +422,7 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     if (inserted) {
       leaders.push_back(leader);
       SmallVector<int64_t> divisors;
-      for (int64_t d = 1; d <= range; ++d)
+      for (int64_t d = m.minimums[id]; d <= range; ++d)
         if (llvm::all_of(models,
                          [&](const TileModel &each) {
                            return each.ranges[id] % d == 0;
@@ -454,6 +481,9 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
   // tile sizes, one per loop: the tile of its function in every loop, or
   // tile_sizes below.
   llvm::MapVector<Operation *, SmallVector<int64_t>> lasts;
+  // With tile_sizes: the sizes of the reduction loops of the producers fused
+  // under a yielded op, in the order the nest has them.
+  DenseMap<Operation *, SmallVector<int64_t>> fusedSizes;
   // A tile from sodap-join-multiple-tiles: its index arguments' values in
   // each invocation. Its ranges are dynamic; the sizes must fit them all.
   SmallVector<SmallVector<int64_t>> invocations;
@@ -463,6 +493,16 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     if (!func)
       return emitSilenceableError()
              << "expected a dataflow.task in a func.func";
+    // A compiler-selected reusable implementation uses one hardware tile
+    // independent of all invocation shapes. Explicit transform sizes win.
+    if (auto module = func->getParentOfType<ModuleOp>())
+      if (auto selected = module->getAttrOfType<ArrayAttr>("sodap.hardware_tile_sizes")) {
+        if (!getTileSizesAttr()) {
+          explicitSizes = selected;
+          plmBytes.reset();
+          maxTileSize.reset();
+        }
+      }
     if (auto module = func->getParentOfType<ModuleOp>())
       if (auto list = module->getAttrOfType<ArrayAttr>("sodap.invocations")) {
         invocations.clear();
@@ -530,28 +570,54 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
         allRanges.push_back(loopRanges(cast<linalg::LinalgOp>(last), inv));
       SmallVector<int64_t> ranges = allRanges.front();
       auto list = dyn_cast<ArrayAttr>(attr);
-      if (!list || list.size() != ranges.size()) {
+      // After the op's own sizes: one per reduction loop of the producers
+      // fused in its nest (gemm's matmul under its epilogue).
+      unsigned fusedReductions = 0;
+      if (auto task = last->getParentOfType<sodap::dataflow::TaskOp>())
+        task->walk([&](linalg::LinalgOp op) {
+          if (op.getOperation() != last)
+            fusedReductions += op.getNumReductionLoops();
+        });
+      if (!list || (list.size() != ranges.size() &&
+                    list.size() != ranges.size() + fusedReductions)) {
         DiagnosedSilenceableFailure diag =
             emitSilenceableError() << "expected a list of " << ranges.size()
                                    << " sizes, one per loop of the op";
+        if (fusedReductions)
+          diag << ", or " << ranges.size() + fusedReductions
+               << " with the reduction loops of its fused producers";
         diag.attachNote(last->getLoc()) << "op";
         return diag;
       }
       for (auto [d, element] : llvm::enumerate(list)) {
         auto value = dyn_cast<IntegerAttr>(element);
         int64_t tile = value ? value.getInt() : -1;
-        bool divides = llvm::all_of(allRanges, [&](ArrayRef<int64_t> r) {
-          return tile && r[d] % tile == 0;
-        });
+        if (d >= ranges.size()) {
+          if (tile <= 0) {
+            DiagnosedSilenceableFailure diag =
+                emitSilenceableError()
+                << "expected a positive size #" << d
+                << " for a fused producer's reduction loop";
+            diag.attachNote(last->getLoc()) << "op";
+            return diag;
+          }
+          fusedSizes[last].push_back(tile);
+          continue;
+        }
+        // With invocations the tiles are cut at run time
+        // (sodap-dataflow-tails): a size need not divide the ranges.
+        bool divides = !invocations.empty() ||
+                       llvm::all_of(allRanges, [&](ArrayRef<int64_t> r) {
+                         return tile && r[d] % tile == 0;
+                       });
         if (tile < 0 || (tile && !divides) ||
             (!tile && !invocations.empty())) {
           DiagnosedSilenceableFailure diag = emitSilenceableError()
                                              << "expected size #" << d
-                                             << " to be 0 or a divisor of "
-                                             << ranges[d]
                                              << (invocations.empty()
-                                                     ? ""
-                                                     : " in every invocation");
+                                                     ? " to be 0 or a divisor of "
+                                                     : " to be positive, range ")
+                                             << ranges[d];
           diag.attachNote(last->getLoc()) << "op";
           return diag;
         }
@@ -564,9 +630,9 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
       llvm::to_vector(llvm::make_first_range(lasts));
   SmallVector<TileModel, 1> models;
   if (invocations.empty())
-    models.push_back(buildTileModel(lastOps));
+    models.push_back(buildTileModel(lastOps, {}, getComputeLanes(), getDoubleBuffer()));
   for (ArrayRef<int64_t> inv : invocations)
-    models.push_back(buildTileModel(lastOps, inv));
+    models.push_back(buildTileModel(lastOps, inv, getComputeLanes(), getDoubleBuffer()));
   const TileModel &model = models.front();
   // Before tiling replaces the ops.
   SetVector<func::FuncOp> funcs;
@@ -604,19 +670,49 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     emitRemark() << "dma_cycles = " << cycles << ", plm_bytes = " << bytes;
   }
 
+  // Selection is compiler metadata, not a diagnostic parsed by a driver.
+  // Opt in only for the bounded whole-kernel search; operator IR is unchanged.
+  if (!lastOps.empty()) {
+    auto module = lastOps.front()->getParentOfType<ModuleOp>();
+    if (module->hasAttr("sodap.capture_tile_selection")) {
+      SmallVector<Attribute> selected;
+      for (auto &[last, sizes] : lasts) {
+        SmallVector<int64_t> all(sizes);
+        llvm::append_range(all, fusedSizes.lookup(last));
+        SmallVector<Attribute> dims;
+        for (int64_t size : all) dims.push_back(rewriter.getI64IntegerAttr(size));
+        selected.push_back(rewriter.getArrayAttr(dims));
+      }
+      module->setAttr("sodap.selected_tile_sizes", rewriter.getArrayAttr(selected));
+    }
+  }
+
   // The sizes used, as tile_sizes would give them.
   {
     InFlightDiagnostic remark = emitRemark() << "tile_sizes = [";
     llvm::interleaveComma(lasts, remark, [&](const auto &entry) {
+      SmallVector<int64_t> all(entry.second);
+      llvm::append_range(all, fusedSizes.lookup(entry.first));
       remark << "[";
-      llvm::interleaveComma(entry.second, remark);
+      llvm::interleaveComma(all, remark);
       remark << "]";
     });
     remark << "]";
   }
 
+  // With invocations, an element-wise yielded op (GEMM's epilogue) runs
+  // only on the part of its tile inside the matrix: its tile sizes, before
+  // they become static below, min(step, ub - iv) per loop.
+  struct ValidPart {
+    linalg::LinalgOp op;
+    SmallVector<OpFoldResult> sizes;
+  };
+  SmallVector<ValidPart> validParts;
+
   for (auto &[last, sizes] : lasts) {
     OperationName lastName = last->getName();
+    auto boundAxes=last->getAttrOfType<DenseI64ArrayAttr>("sodap.bound_axes");
+    auto lastIterators=cast<linalg::LinalgOp>(last).getIteratorTypesArray();
     scf::SCFTilingOptions parallelTiling;
     parallelTiling.setTileSizes(
         tileSizes(rewriter, cast<linalg::LinalgOp>(last), sizes, true));
@@ -644,6 +740,17 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
       return emitSilenceableError()
              << "expected at least one tiled parallel dimension";
 
+    // Preserve semantic axes, not a hand-selected schedule. Later lowering
+    // obtains valid local extents from the actual tiled loop bounds/origins.
+    if(boundAxes) {
+      unsigned loop=0;
+      for(unsigned d=0;d<sizes.size();++d)
+        if(sizes[d] && lastIterators[d]==utils::IteratorType::parallel) {
+          if(boundAxes[d])nest->loops[loop]->setAttr("sodap.bound_axis",rewriter.getI64IntegerAttr(boundAxes[d]));
+          ++loop;
+        }
+    }
+
     SmallVector<Operation *> replaced{last};
     llvm::append_range(replaced, nest->fusedProducers);
     for (Operation *op : replaced) {
@@ -663,17 +770,30 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
       if (op.getNumReductionLoops() > 0)
         reductions.push_back(op);
     });
+    SmallVector<int64_t> fusedOfLast = fusedSizes.lookup(last);
+    ArrayRef<int64_t> fusedLeft = fusedOfLast;
     for (linalg::LinalgOp op : reductions) {
       // A fused producer: the tile of the function in every loop, as `last`
-      // got. tile_sizes has no place for its reductions.
-      // ponytail: fused reductions (e.g. @tasks_trmm) need max_tile_size;
-      // append their reduction sizes to the op's list if a partition needs it.
+      // got; with tile_sizes, its reduction loops take the sizes after the
+      // yielded op's own (its parallel loops are already the tile).
       bool isLast = op.getOperation() == tiledLast;
-      if (!isLast && explicitSizes)
-        return emitDefiniteFailure()
-               << "expected the reductions in the yielded op with tile_sizes";
       SmallVector<int64_t> opSizes =
           isLast ? sizes : SmallVector<int64_t>(op.getNumLoops(), sizes[0]);
+      if (!isLast && explicitSizes) {
+        if (fusedLeft.size() < op.getNumReductionLoops())
+          return emitDefiniteFailure()
+                 << "expected the reductions in the yielded op with "
+                    "tile_sizes, or a size per reduction loop of its fused "
+                    "producers after its own";
+        for (auto [type, size] :
+             llvm::zip_equal(op.getIteratorTypesArray(), opSizes)) {
+          size = 0;
+          if (type == utils::IteratorType::reduction) {
+            size = fusedLeft.front();
+            fusedLeft = fusedLeft.drop_front();
+          }
+        }
+      }
       if (llvm::all_of(llvm::zip_equal(op.getIteratorTypesArray(), opSizes),
                        [](auto pair) {
                          return std::get<0>(pair) ==
@@ -688,18 +808,61 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
           rewriter, cast<TilingInterface>(op.getOperation()), reductionTiling);
       if (failed(tiled))
         return emitDefiniteFailure() << "failed to tile a reduction";
+      if(auto axes=op->getAttrOfType<DenseI64ArrayAttr>("sodap.bound_axes")) {
+        unsigned loop=0;
+        for(auto [d,type]:llvm::enumerate(op.getIteratorTypesArray()))
+          if(type==utils::IteratorType::reduction && opSizes[d]) {
+            if(axes[d])tiled->loops[loop]->setAttr("sodap.bound_axis",rewriter.getI64IntegerAttr(axes[d]));
+            ++loop;
+          }
+      }
       rewriter.replaceOp(op, tiled->replacements);
+    }
+
+    auto elementwise = dyn_cast<linalg::LinalgOp>(tiledLast);
+    if (!invocations.empty() && elementwise &&
+        elementwise.getNumReductionLoops() == 0 &&
+        elementwise.getNumDpsInits() == 1 && elementwise->getNumResults() == 1) {
+      // Every tensor operand a tile of the iteration domain (identity map);
+      // rank-0 operands (scalars) are left as they are.
+      bool identity = llvm::all_of(elementwise->getOpOperands(), [&](OpOperand &o) {
+        auto type = dyn_cast<RankedTensorType>(o.get().getType());
+        return !type || type.getRank() == 0 ||
+               elementwise.getMatchingIndexingMap(&o).isIdentity();
+      });
+      auto init = elementwise.getDpsInits()[0].getDefiningOp<tensor::ExtractSliceOp>();
+      if (identity && init &&
+          init.getType().getRank() == int64_t(elementwise.getNumLoops())) {
+        ValidPart part{elementwise, {}};
+        for (OpFoldResult size : init.getMixedSizes()) {
+          auto min = dyn_cast_if_present<Value>(size)
+                         ? cast<Value>(size).getDefiningOp<affine::AffineMinOp>()
+                         : affine::AffineMinOp();
+          if (!min) {
+            part.sizes.push_back(size);
+            continue;
+          }
+          // A copy that stays dynamic: the original becomes the step below.
+          rewriter.setInsertionPointAfter(min);
+          Operation *copy = rewriter.clone(*min);
+          copy->setAttr("sodap.valid_size", rewriter.getUnitAttr());
+          part.sizes.push_back(copy->getResult(0));
+        }
+        validParts.push_back(std::move(part));
+      }
     }
   }
 
-  // With invocations every size divides every range, so no tile is partial:
-  // min(step, ub - iv) on a tiled loop is the step, and the tiles keep a
-  // static shape.
-  // ponytail: tails (sizes that don't divide) keep the min and need dynamic
-  // tiles downstream.
+  // With invocations the tiles keep a static shape: min(step, ub - iv) on a
+  // tiled loop becomes the step. The last tile of a range the step doesn't
+  // divide then reaches past the range; sodap-dataflow-tails cuts every
+  // transfer of a tile of an argument to min(step, range - offset) and pads
+  // the local tile with zeros, so the tasks compute on whole tiles.
   if (!invocations.empty()) {
     for (func::FuncOp func : funcs)
       func.walk([&](affine::AffineMinOp min) {
+        if (min->hasAttr("sodap.valid_size"))
+          return;
         for (Value operand : min.getOperands()) {
           auto loop = scf::getForInductionVarOwner(operand);
           std::optional<int64_t> step =
@@ -716,6 +879,33 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
         }
       });
   }
+  // The element-wise yielded ops on [0, 0][valid sizes] of their static
+  // tiles, inserted back: the rest of the tile is never stored
+  // (sodap-dataflow-tails cuts the store to the same part).
+  for (ValidPart &part : validParts) {
+    linalg::LinalgOp op = part.op;
+    Location loc = op.getLoc();
+    rewriter.setInsertionPoint(op);
+    int64_t rank = op.getNumLoops();
+    SmallVector<OpFoldResult> zeros(rank, rewriter.getIndexAttr(0)),
+        ones(rank, rewriter.getIndexAttr(1));
+    IRMapping mapping;
+    for (OpOperand &o : op->getOpOperands()) {
+      auto type = dyn_cast<RankedTensorType>(o.get().getType());
+      if (!type || type.getRank() != rank)
+        continue;
+      mapping.map(o.get(), rewriter.create<tensor::ExtractSliceOp>(
+                               loc, o.get(), zeros, part.sizes, ones));
+    }
+    Value init = op.getDpsInits()[0];
+    Operation *cut = rewriter.clone(*op.getOperation(), mapping);
+    cut->getResult(0).setType(mapping.lookup(init).getType());
+    Value whole = rewriter.create<tensor::InsertSliceOp>(
+        loc, cut->getResult(0), init, zeros, part.sizes, ones);
+    rewriter.replaceOp(op, whole);
+  }
+  for (func::FuncOp func : funcs)
+    func.walk([](affine::AffineMinOp min) { min->removeAttr("sodap.valid_size"); });
   return DiagnosedSilenceableFailure::success();
 }
 

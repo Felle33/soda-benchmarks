@@ -24,13 +24,16 @@ LCS_TILE_SIZES ?=
 LCS_PLM_BYTES ?= 327680
 LCS_DMA_REQUEST_CYCLES ?=
 LCS_DMA_WORD_CYCLES ?=
+# Options read by tosa_to_lcs.sh from the environment (Make exports command-line
+# and environment variables to the recipe); in the stamp only when set.
+LCS_ENV_OPTIONS = LCS_DMA_ABI LCS_DMA_DATA_WIDTH LCS_COMPUTE_LANES LCS_REGISTER_BLOCK LCS_BANK_LOCAL LCS_FP_UNITS
 .PHONY: lcs-options cpu-baseline-object
 lcs-options:
 
 # Stable timestamps unless common layout/profiling options change.
 $(ODIR)/esp/lcs-options: lcs-options
 	mkdir -p $(dir $@)
-	@printf '%s\n' 'profile=$(LCS_PROFILE)' 'word_stride=$(LCS_DMA_WORD_STRIDE)' 'outstanding_loads=$(LCS_OUTSTANDING_LOADS)' 'sequential=$(LCS_SEQUENTIAL)' 'overlap=$(LCS_OVERLAP)' 'reuse_budget=$(LCS_REUSE_BUFFER_BUDGET)' 'transform=$(LCS_TRANSFORM)' 'tile_sizes=$(LCS_TILE_SIZES)' 'plm_bytes=$(LCS_PLM_BYTES)' 'dma_request_cycles=$(LCS_DMA_REQUEST_CYCLES)' 'dma_word_cycles=$(LCS_DMA_WORD_CYCLES)' 'reusable=$(LCS_REUSABLE_GEMM)' 'gemm_schedule=$(LCS_GEMM_SCHEDULE)' 'gemm_tiles=$(LCS_GEMM_TILE_M),$(LCS_GEMM_TILE_N),$(LCS_GEMM_TILE_K)' $(if $(filter-out kernel,$(LCS_TILES)),'tiles=$(LCS_TILES)') > $@.tmp
+	@printf '%s\n' 'profile=$(LCS_PROFILE)' 'word_stride=$(LCS_DMA_WORD_STRIDE)' 'outstanding_loads=$(LCS_OUTSTANDING_LOADS)' 'sequential=$(LCS_SEQUENTIAL)' 'overlap=$(LCS_OVERLAP)' 'reuse_budget=$(LCS_REUSE_BUFFER_BUDGET)' 'transform=$(LCS_TRANSFORM)' 'tile_sizes=$(LCS_TILE_SIZES)' 'plm_bytes=$(LCS_PLM_BYTES)' 'dma_request_cycles=$(LCS_DMA_REQUEST_CYCLES)' 'dma_word_cycles=$(LCS_DMA_WORD_CYCLES)' 'reusable=$(LCS_REUSABLE_GEMM)' 'gemm_schedule=$(LCS_GEMM_SCHEDULE)' 'gemm_tiles=$(LCS_GEMM_TILE_M),$(LCS_GEMM_TILE_N),$(LCS_GEMM_TILE_K)' $(if $(filter-out kernel,$(LCS_TILES)),'tiles=$(LCS_TILES)') $(foreach v,$(LCS_ENV_OPTIONS),$(if $($(v)),'$(v)=$($(v))')) > $@.tmp
 	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
 LCS_OUTPUTS = $(addprefix $(ODIR)/esp/%/,05_hw_acc.ll 05_kernel_riscv.ll 05_cpu_baseline.ll architecture.xml argument_order.txt host.mlir outlined.mlir layout.txt)

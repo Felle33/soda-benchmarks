@@ -1,0 +1,54 @@
+--- a/src/frontend_analysis/IR_analysis/InterfaceInfer.cpp
++++ b/src/frontend_analysis/IR_analysis/InterfaceInfer.cpp
+@@ -347,6 +347,42 @@
+       if(stmt_node->AddVover(vssa))
+       {
+          GetPointerS<ssa_node>(vssa)->AddUseStmt(stmt);
++      }
++   }
++
++
++   // SSA use-list traversal is not program order. Interface accesses create
++   // FIFO ordering dependencies, so retain basic-block instruction order.
++   // Preserve the positions of accesses from other blocks/functions: this
++   // correction introduces no new ordering between distinct control paths.
++   void orderInterfaceAccessesWithinBlocks(std::list<ir_nodeRef>& statements)
++   {
++      using BlockKey = std::pair<unsigned int, unsigned int>;
++      const auto key = [](const ir_nodeRef& stmt) -> BlockKey {
++         const auto sn = GetPointerS<const node_stmt>(stmt);
++         return {sn->parent->index, sn->bb_index};
++      };
++      std::map<BlockKey, std::vector<ir_nodeRef>> groups;
++      for(const auto& stmt : statements) groups[key(stmt)].push_back(stmt);
++      for(auto& entry : groups)
++      {
++         auto& group = entry.second;
++         if(group.size() < 2) continue;
++         const auto sn = GetPointerS<const node_stmt>(group.front());
++         const auto fd = GetPointerS<const function_val_node>(sn->parent);
++         const auto sl = GetPointerS<const statement_list_node>(fd->body);
++         const auto bb = sl->list_of_bloc.at(sn->bb_index);
++         std::map<unsigned int, size_t> order;
++         for(const auto& stmt : bb->CGetStmtList()) order.emplace(stmt->index, order.size());
++         std::sort(group.begin(), group.end(), [&](const ir_nodeRef& a, const ir_nodeRef& b) {
++            return order.at(a->index) < order.at(b->index);
++         });
++      }
++      std::map<BlockKey, size_t> next;
++      for(auto& stmt : statements)
++      {
++         const auto block = key(stmt);
++         stmt = groups.at(block).at(next[block]++);
+       }
+    }
+ 
+@@ -1691,6 +1727,8 @@
+    CustomOrderedSet<unsigned> Visited;
+    INDENT_DBG_MEX(DEBUG_LEVEL_PEDANTIC, debug_level, "-->Parameter uses:");
+    ChasePointerInterfaceRecurse(Visited, ssa_node, writeStmt, readStmt, info);
++   orderInterfaceAccessesWithinBlocks(readStmt);
++   orderInterfaceAccessesWithinBlocks(writeStmt);
+    INDENT_DBG_MEX(DEBUG_LEVEL_PEDANTIC, debug_level, "<--");
+ }
+ 

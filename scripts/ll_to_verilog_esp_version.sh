@@ -10,6 +10,7 @@ fi
 INPUT=$(realpath "$1")
 DIRNAME_INPUT="$(dirname "${INPUT}")"
 TOP_FNAME="$2"
+BAMBU=${BAMBU_BIN:-bambu}
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 source "$SCRIPT_DIR/check_docker.sh"
 
@@ -23,11 +24,20 @@ args=(accelerator.ll --architecture-xml=architecture.xml
   --generate-interface=INFER --generate-components=separate
   --clock-period="${BAMBU_CLOCK_PERIOD:-10}" --no-clean -v3)
 if [[ -n ${BAMBU_DEVICE:-} ]]; then args+=(--device="$BAMBU_DEVICE"); fi
-printf '%q ' bambu "${args[@]}" > command.txt
+# The compiler emits complete Bambu constraint arguments, one per line.
+# Do not recompute a hardware budget in shell or Python.
+[[ -s "$DIRNAME_INPUT/bambu_fp_constraints.txt" ]] || {
+  echo 'Missing compiler-emitted bambu_fp_constraints.txt; use the registered backend (or the archived HLS script for historical artifacts)' >&2; exit 1;
+}
+mapfile -t fp_constraints < "$DIRNAME_INPUT/bambu_fp_constraints.txt"
+args+=("${fp_constraints[@]}")
+cp "$DIRNAME_INPUT/bambu_fp_constraints.txt" .
+[[ ! -f "$DIRNAME_INPUT/compute_config.json" ]] || cp "$DIRNAME_INPUT/compute_config.json" .
+printf '%q ' "$BAMBU" "${args[@]}" > command.txt
 printf '\n' >> command.txt
-$DOCKER_RUN bambu --version > bambu-version.txt 2>&1
+$DOCKER_RUN "$BAMBU" --version > bambu-version.txt 2>&1
 sha256sum accelerator.ll architecture.xml > inputs.sha256
-$DOCKER_RUN bambu "${args[@]}" > bambu.log 2>&1 || {
+$DOCKER_RUN "$BAMBU" "${args[@]}" > bambu.log 2>&1 || {
   tail -40 bambu.log >&2
   exit 1
 }

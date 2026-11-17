@@ -76,14 +76,15 @@ FailureOr<Side> sideOf(TaskOp task, ArrayRef<Access> accesses) {
     while (!side.level->findAncestorOpInBlock(*access.op))
       side.level = side.level->getParentOp()->getBlock();
     side.writes |= access.writes;
-    side.reads |= hasEffect<MemoryEffects::Read>(access.op, access.view);
+    side.reads |= access.reads;
   }
   for (const Access &access : accesses) {
     Operation *op = side.level->findAncestorOpInBlock(*access.op);
+    Operation *end = side.level->findAncestorOpInBlock(*access.last());
     if (!side.first || op->isBeforeInBlock(side.first))
       side.first = op;
-    if (!side.last || side.last->isBeforeInBlock(op))
-      side.last = op;
+    if (!side.last || side.last->isBeforeInBlock(end))
+      side.last = end;
   }
   return side;
 }
@@ -139,10 +140,11 @@ LogicalResult reuseScope(Side &side, Value buffer, DenseI64ArrayAttr dims) {
   side.first = side.last = nullptr;
   for (const Access &access : side.accesses) {
     Operation *op = side.level->findAncestorOpInBlock(*access.op);
+    Operation *end = side.level->findAncestorOpInBlock(*access.last());
     if (!side.first || op->isBeforeInBlock(side.first))
       side.first = op;
-    if (!side.last || side.last->isBeforeInBlock(op))
-      side.last = op;
+    if (!side.last || side.last->isBeforeInBlock(end))
+      side.last = end;
   }
   return success();
 }
@@ -150,7 +152,7 @@ LogicalResult reuseScope(Side &side, Value buffer, DenseI64ArrayAttr dims) {
 LogicalResult replaceAccess(OpBuilder &builder, const Access &access,
                             Value target, DenseI64ArrayAttr reuseDims) {
   if (!reuseDims) {
-    access.op->replaceUsesOfWith(access.view, target);
+    replaceAccessedView(access.op, access.view, target);
     return success();
   }
   OpBuilder::InsertionGuard guard(builder);
@@ -167,11 +169,56 @@ LogicalResult replaceAccess(OpBuilder &builder, const Access &access,
     sizes.push_back(builder.getIndexAttr(size));
   Value view = builder.create<memref::SubViewOp>(access.op->getLoc(), target,
                                                  tile->offsets, sizes, strides);
-  access.op->replaceUsesOfWith(access.view, view);
+  replaceAccessedView(access.op, access.view, view);
   return success();
 }
 
-LogicalResult pingPong(DispatchOp dispatch) {
+/// fold-memref-alias-ops merges a part of a tile (partOfTile) into its
+/// tile: subview(buffer, [o][min(s, ...)]). Split it back into the static
+/// tile, subview(buffer, [o][s]), and the part of it, so the tasks still
+/// exchange tiles of one shape.
+void splitParts(DispatchOp dispatch) {
+  OpBuilder builder(dispatch.getContext());
+  for (auto alloc : dispatch.getBody().front().getOps<memref::AllocOp>())
+    for (Operation *user : llvm::to_vector(alloc->getUsers())) {
+      auto subview = dyn_cast<memref::SubViewOp>(user);
+      if (!subview || subview.getSource() != alloc.getResult() ||
+          subview.getType().getRank() != alloc.getType().getRank() ||
+          !llvm::all_of(subview.getStaticStrides(),
+                        [](int64_t s) { return s == 1; }) ||
+          llvm::all_of(subview.getMixedSizes(), [](OpFoldResult size) {
+            return getConstantIntValue(size).has_value();
+          }))
+        continue;
+      SmallVector<OpFoldResult> tileSizes;
+      for (OpFoldResult size : subview.getMixedSizes()) {
+        std::optional<int64_t> bound = boundOf(size);
+        if (!bound)
+          break;
+        tileSizes.push_back(builder.getIndexAttr(*bound));
+      }
+      if (tileSizes.size() != subview.getMixedSizes().size())
+        continue;
+      builder.setInsertionPoint(subview);
+      Location loc = subview.getLoc();
+      int64_t rank = tileSizes.size();
+      SmallVector<OpFoldResult> ones(rank, builder.getIndexAttr(1)),
+          zeros(rank, builder.getIndexAttr(0));
+      Value tile = builder.create<memref::SubViewOp>(
+          loc, alloc, subview.getMixedOffsets(), tileSizes, ones);
+      Value part = builder.create<memref::SubViewOp>(
+          loc, tile, zeros, subview.getMixedSizes(), ones);
+      if (part.getType() != subview.getType())
+        part = builder.create<memref::CastOp>(loc, subview.getType(), part);
+      subview.replaceAllUsesWith(part);
+      subview.erase();
+    }
+}
+
+LogicalResult pingPong(DispatchOp dispatch, bool singleSlot) {
+  if (singleSlot != dispatch->hasAttr("sodap.serial_tasks"))
+    return dispatch.emitOpError("single-slot storage requires the serial-tasks handoff");
+  splitParts(dispatch);
   Block &body = dispatch.getBody().front();
   OpBuilder builder(dispatch.getContext());
   Type i8 = builder.getI8Type();
@@ -237,9 +284,9 @@ LogicalResult pingPong(DispatchOp dispatch) {
                << *read << " and " << *written << " (sodap-dataflow-schedule)";
     }
 
-    // The two slots, and a token stream per reader.
+    // Allocate the tile slots and a publication stream per reader.
     Location loc = alloc.getLoc();
-    SmallVector<int64_t> shape{2};
+    SmallVector<int64_t> shape{singleSlot ? 1 : 2};
     llvm::append_range(shape, tile.getShape());
     builder.setInsertionPoint(alloc);
     Value slots = builder.create<memref::AllocOp>(
@@ -256,9 +303,12 @@ LogicalResult pingPong(DispatchOp dispatch) {
     // the slot at the end: Bambu wants each task on a ping-pong buffer to be
     // a writer or a reader, not both.
     builder.setInsertionPointToStart(&writer->task.getBody().front());
-    Value var = builder.create<memref::AllocaOp>(loc, MemRefType::get({}, i8));
-    builder.create<memref::StoreOp>(
-        loc, builder.create<arith::ConstantIntOp>(loc, 0, 8), var);
+    Value var;
+    if (!singleSlot)
+      var = builder.create<memref::AllocaOp>(loc, MemRefType::get({}, i8));
+    Value zero = builder.create<arith::ConstantIntOp>(loc, 0, 8);
+    if (var)
+      builder.create<memref::StoreOp>(loc, zero, var);
     Value target;
     if (writer->reads)
       target = builder.create<memref::AllocOp>(
@@ -267,7 +317,7 @@ LogicalResult pingPong(DispatchOp dispatch) {
       builder.setInsertionPointAfter(writer->last);
     else
       builder.setInsertionPoint(writer->first);
-    Value slot = builder.create<memref::LoadOp>(loc, var);
+    Value slot = singleSlot ? zero : builder.create<memref::LoadOp>(loc, var).getResult();
     Value view = slotView(builder, loc, slots, slot);
     if (writer->reads)
       builder.create<linalg::CopyOp>(loc, target, view);
@@ -280,15 +330,21 @@ LogicalResult pingPong(DispatchOp dispatch) {
       builder.setInsertionPointAfter(writer->last);
     for (Value stream : streams)
       builder.create<StreamWriteOp>(loc, stream, slot);
-    Value next = builder.create<arith::XOrIOp>(
-        loc, slot, builder.create<arith::ConstantIntOp>(loc, 1, 8));
-    builder.create<memref::StoreOp>(loc, next, var);
+    if (!singleSlot) {
+      Value next = builder.create<arith::XOrIOp>(
+          loc, slot, builder.create<arith::ConstantIntOp>(loc, 1, 8));
+      builder.create<memref::StoreOp>(loc, next, var);
+    }
 
     // A reader peeks the slot at the start of its tile and frees it at the
     // end.
     for (auto [reader, stream] : llvm::zip(readers, streams)) {
       builder.setInsertionPoint(reader.first);
-      Value peek = builder.create<StreamPeekOp>(loc, i8, stream);
+      Value peek;
+      if (singleSlot)
+        peek = builder.create<arith::ConstantIntOp>(loc, 0, 8);
+      else
+        peek = builder.create<StreamPeekOp>(loc, i8, stream);
       Value view = slotView(builder, loc, slots, peek);
       for (const Access &access : reader.accesses)
         if (failed(replaceAccess(builder, access, view, reuseDims)))
@@ -309,10 +365,11 @@ LogicalResult pingPong(DispatchOp dispatch) {
 }
 
 struct PingPong : public mlir::sodap::dataflow::impl::PingPongBase<PingPong> {
+  using PingPongBase::PingPongBase;
   void runOnOperation() override {
     for (DispatchOp dispatch :
          llvm::to_vector(getOperation().front().getOps<DispatchOp>()))
-      if (failed(pingPong(dispatch)))
+      if (failed(pingPong(dispatch, singleSlot)))
         return signalPassFailure();
   }
 };

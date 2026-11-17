@@ -27,19 +27,29 @@ module reusable_gemm_tb #(parameter TIMEOUT_CYCLES=2000000, parameter real TOL=0
     .dma_write_ctrl_data_size(),.dma_write_ctrl_data_user(),
     .dma_write_chnl_valid(wdvalid),.dma_write_chnl_ready(wdready),.dma_write_chnl_data(wd));
   function real fp32(input [31:0] value);
+    reg [10:0] exponent;
+    reg [63:0] as_double;
+    begin
     if (value[30:23]==0)
-      fp32=(value[31] ? -1.0 : 1.0)*value[22:0]*(2.0**(-149));
-    else
-      fp32=(value[31] ? -1.0 : 1.0)*(1.0+value[22:0]/8388608.0)*
-           (2.0**(integer'(value[30:23])-127));
+      fp32=(value[31] ? -1.0 : 1.0)*value[22:0]*1.401298464324817e-45;
+    else begin
+      // Exact FP32-to-double widening; avoids simulator-specific real power
+      // evaluation (a Verilator internal error with an integer cast exponent).
+      exponent=value[30:23]==255 ? 11'd2047 : {3'b0,value[30:23]}+11'd896;
+      as_double={value[31],exponent,value[22:0],29'b0};
+      fp32=$bitstoreal(as_double);
+    end
+    end
   endfunction
   always @(posedge clk) if(rst) begin
     cycles<=cycles+1;
     if(cycles>INVOCATIONS*TIMEOUT_CYCLES+1000) $fatal(1,"adapter timeout");
     hold_read<=rdvalid&&!rdready;
+`ifndef SODAP_PACKED_DMA
     if($test$plusargs("trace_config") && cycles<120 && dut.read_full && dut.core_read_ready)
       $display("CONFIG_READ cycle=%0d half=%0d data=%h",cycles,dut.read_half,
                dut.read_half ? dut.read_buffer[63:32] : dut.read_buffer[31:0]);
+`endif
     if(rv&&rr) begin
       if(rl==0 || 2*(ri+rl)>WORDS) $fatal(1,"read bounds");
       raddr<=ri;rleft<=rl;
@@ -72,7 +82,14 @@ module reusable_gemm_tb #(parameter TIMEOUT_CYCLES=2000000, parameter real TOL=0
         if(mask[i]==2) begin
           difference=fp32(mem[i])-fp32(gold[i]);
           if(difference<0) difference=-difference;
-          if($isunknown(mem[i]) || mem[i][30:23]==255 || difference>TOL) begin
+          // Source-expression mode preserves explicit 0*NaN. Accept a NaN
+          // only when the independent reference also expects one; infinities
+          // must match sign. Finite references still reject all nonfinite data.
+          if($isunknown(mem[i]) ||
+             ((gold[i][30:23]==255 && gold[i][22:0]!=0) ?
+                !(mem[i][30:23]==255 && mem[i][22:0]!=0) :
+              (gold[i][30:23]==255 ? mem[i]!=gold[i] :
+                (mem[i][30:23]==255 || difference>TOL)))) begin
             if(errors<8) $display("mismatch word=%0d got=%h expected=%h",i,mem[i],gold[i]);
             errors++;
           end

@@ -156,6 +156,8 @@ LogicalResult ConvertDataflowToLLVM::collectSpecializations(
       streamType = readOp.getChannel().getType();
     else if (auto writeOp = dyn_cast<StreamWriteOp>(op))
       streamType = writeOp.getChannel().getType();
+    else if (auto available = dyn_cast<StreamAvailableOp>(op))
+      streamType = available.getChannel().getType();
     else if (auto peekOp = dyn_cast<StreamPeekOp>(op))
       streamType = peekOp.getChannel().getType();
     else
@@ -167,8 +169,14 @@ LogicalResult ConvertDataflowToLLVM::collectSpecializations(
       return WalkResult::interrupt();
     }
     seen.insert(elementType);
-    if (isa<StreamPeekOp>(op) && op->hasAttr("sodap.dma_ordered"))
+    if (isa<StreamAvailableOp>(op) ||
+        (isa<StreamPeekOp>(op) && op->hasAttr("sodap.dma_ordered"))) {
+      if (elementType.isInteger(64) || elementType.isF64()) {
+        op->emitError("Bambu Clang19 readiness probing requires at most 32-bit channel elements; use a separate admission token for 64-bit payloads");
+        return WalkResult::interrupt();
+      }
       readyTypes.insert(elementType);
+    }
     return WalkResult::advance();
   });
   if (result.wasInterrupted())
@@ -345,6 +353,11 @@ ConvertDataflowToLLVM::getOrInsertFunc(StringRef name,
 
 void ConvertDataflowToLLVM::runOnOperation() {
   module = getOperation();
+  if (auto width = module->getAttrOfType<IntegerAttr>("sodap.dma_data_width"))
+    if (width.getInt() != 64) {
+      module.emitError("Bambu packed DMA backend supports dma-data-width=64 only; wider widths are compiler-level layouts");
+      return signalPassFailure();
+    }
   tuPath = dataflow::getTileFilePath(module, tuFileName);
   irPath = dataflow::getTileFilePath(module, irFileName);
   auto *context = &getContext();
@@ -382,6 +395,15 @@ void ConvertDataflowToLLVM::runOnOperation() {
     OpBuilder builder(op);
     auto loc = op->getLoc();
 
+    if (auto available = dyn_cast<StreamAvailableOp>(op)) {
+      auto element = cast<StreamType>(available.getChannel().getType()).getElementType();
+      auto &info = channels[element];
+      Value ready = builder.create<LLVM::CallOp>(loc,
+          getOrInsertFunc(info.readySymbol, info.readyType), ValueRange{available.getChannel()}).getResult();
+      available.getResult().replaceAllUsesWith(ready);
+      toErase.push_back(op);
+      return;
+    }
     if (auto readOp = dyn_cast<StreamReadOp>(op)) {
       auto elementType =
           cast<StreamType>(readOp.getChannel().getType()).getElementType();

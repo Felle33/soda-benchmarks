@@ -25,7 +25,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "sodap/Dialect/Dataflow/Transforms/Passes.h"
-#include "sodap/ExecutionEngine/ReusableGemmABI.h"
+#include "sodap/ExecutionEngine/ReusableOperatorABI.h"
+#include "sodap/ExecutionEngine/DmaTransport.h"
+#include "sodap/Dialect/Dataflow/Transforms/PackedDMA.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -57,13 +59,7 @@ using namespace mlir::sodap::dataflow;
 
 namespace {
 
-/// The four streams of the DMA engine.
-struct DMAStreams {
-  Value readCtrl;
-  Value readData;
-  Value writeCtrl;
-  Value writeData;
-};
+using namespace mlir::sodap::dataflow::packed;
 
 /// One copy of a tile of a top argument, and where that argument starts.
 struct Transfer {
@@ -73,6 +69,11 @@ struct Transfer {
   bool read;
   /// With a descriptor: the fields of the argument's address and row stride.
   int64_t baseField = -1, ldField = -1;
+  /// Packed DMA: whether a write needs its neighbours (packedNeedsBoundary),
+  /// decided before the descriptor's fields replace the index arguments.
+  std::optional<bool> boundary;
+  StringRef view;
+  SmallVector<int64_t> shapeFields;
 };
 
 } // namespace
@@ -88,7 +89,25 @@ static LogicalResult collectTransfers(BlockArgument arg, int64_t base,
                                                   "sodap.descriptor_field");
   auto ld = func.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),
                                                "sodap.descriptor_ld");
-  if (field && (!ld || type.getRank() != 2))
+  auto view=func.getArgAttrOfType<StringAttr>(arg.getArgNumber(),"sodap.dma_view");
+  SmallVector<int64_t> shapeFields;
+  if(view) {
+    auto name=view.getValue();
+    if(!field || (name!="packed" && name!="conv_window_nhwc" && name!="conv_weights_ohwi" && name!="conv_window_flat") ||
+       (name=="conv_window_nhwc" && type.getRank()!=6) ||
+       (name=="conv_window_flat" && type.getRank()!=3) ||
+       (name=="conv_weights_ohwi" && type.getRank()!=4))
+      return emitError(loc,"invalid descriptor DMA view");
+    auto dims=func.getArgAttrOfType<DenseI64ArrayAttr>(arg.getArgNumber(),"sodap.dims");
+    if(!dims || int64_t(dims.size())!=type.getRank())return emitError(loc,"DMA view requires bound dimensions");
+    for(auto index:dims.asArrayRef()) {
+      if(index<0 || index>=func.getNumArguments())return emitError(loc,"invalid DMA view dimension binding");
+      auto f=func.getArgAttrOfType<IntegerAttr>(index,"sodap.descriptor_field");
+      if(!f)return emitError(loc,"DMA view dimensions must be descriptor fields");
+      shapeFields.push_back(f.getInt());
+    }
+  }
+  if (field && !view && (!ld || type.getRank() != 2))
     return emitError(loc) << "argument #" << arg.getArgNumber()
                           << ": a descriptor field needs a matrix with "
                              "sodap.descriptor_ld";
@@ -104,7 +123,9 @@ static LogicalResult collectTransfers(BlockArgument arg, int64_t base,
     if (field)
       for (Transfer &t : llvm::drop_begin(transfers, first)) {
         t.baseField = field.getInt();
-        t.ldField = ld.getInt();
+        t.ldField = ld ? ld.getInt() : -1;
+        if(view)t.view=view.getValue();
+        t.shapeFields=shapeFields;
       }
   });
   for (Operation *user : arg.getUsers()) {
@@ -115,9 +136,12 @@ static LogicalResult collectTransfers(BlockArgument arg, int64_t base,
       transfers.push_back({copy, {}, base, copy.getSource() == arg});
       continue;
     }
+    // A tile of a matrix with a descriptor field may be cut at run time
+    // (sodap-dataflow-tails): its sizes are then values.
     auto tile = dyn_cast<memref::SubViewOp>(user);
     if (!tile || !tile.hasUnitStride() ||
-        ShapedType::isDynamicShape(tile.getStaticSizes()))
+        tile.getType().getRank() != type.getRank() ||
+        (!field && ShapedType::isDynamicShape(tile.getStaticSizes())))
       return user->emitError()
              << "argument #" << arg.getArgNumber()
              << " is used other than by a copy or a static tile with unit "
@@ -146,8 +170,11 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   // A whole argument: a tile the shape of the buffer, at 0.
   auto argType = tile ? tile.getSourceType()
                       : cast<MemRefType>(buffer.getType());
-  SmallVector<int64_t> sizes = llvm::to_vector(
-      tile ? tile.getStaticSizes() : argType.getShape());
+  // A size is a value in a tile cut at run time (sodap-dataflow-tails).
+  SmallVector<OpFoldResult> sizes =
+      getAsIndexOpFoldResult(b.getContext(), argType.getShape());
+  if (tile)
+    sizes = tile.getMixedSizes();
   SmallVector<OpFoldResult> offsets(argType.getRank(), b.getIndexAttr(0));
   if (tile)
     offsets = tile.getMixedOffsets();
@@ -164,7 +191,7 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
   SmallVector<Value> ivs;
   for (unsigned d = 0; d + 1 < rank; ++d) {
-    Value size = b.create<arith::ConstantIndexOp>(loc, sizes[d]);
+    Value size = getValueOrCreateConstantIndexOp(b, loc, sizes[d]);
     auto loop = b.create<scf::ForOp>(loc, c0, size, c1);
     b.setInsertionPointToStart(loop.getBody());
     ivs.push_back(loop.getInductionVar());
@@ -198,13 +225,25 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   }
 
   // A scalar is a row of one element, with no index.
-  int64_t length = rank ? sizes.back() : 1;
+  OpFoldResult length = rank ? sizes.back() : OpFoldResult(b.getIndexAttr(1));
+  Value rowLength = getValueOrCreateConstantIndexOp(b, loc, length);
+  Value words;
+  if (std::optional<int64_t> constant = getConstantIntValue(length))
+    words = b.create<arith::ConstantIntOp>(loc, (*constant * wordStride) << 32,
+                                           64);
+  else
+    words = b.create<arith::ShLIOp>(
+        loc,
+        b.create<arith::IndexCastOp>(
+            loc, b.getI64Type(),
+            b.create<arith::MulIOp>(
+                loc, rowLength,
+                b.create<arith::ConstantIndexOp>(loc, wordStride))),
+        b.create<arith::ConstantIntOp>(loc, 32, 64));
   Value request = b.create<arith::OrIOp>(
-      loc, b.create<arith::ConstantIntOp>(loc, (length * wordStride) << 32, 64),
-      b.create<arith::IndexCastOp>(loc, b.getI64Type(), addr));
+      loc, words, b.create<arith::IndexCastOp>(loc, b.getI64Type(), addr));
   b.create<StreamWriteOp>(loc, ctrl, request);
 
-  Value rowLength = b.create<arith::ConstantIndexOp>(loc, length);
   auto row = b.create<scf::ForOp>(loc, c0, rowLength, c1);
   b.setInsertionPointToStart(row.getBody());
   SmallVector<Value> indices(ivs);
@@ -230,16 +269,51 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
   }
 }
 
+#include "PackedDMA.inc"
+#include "PackedViews.inc"
+
+// The producer of an operator contract owns the schema; DMA transport only
+// interprets it. Defaults preserve the existing GEMM ABI byte for byte.
+struct DescriptorSchema {
+  int64_t fields=GEMM_FIELD_COUNT, magic=GEMM_MAGIC;
+  int64_t version=GEMM_PACKED_VERSION, widthField=GEMM_FIELD_DMA_WIDTH;
+  int64_t bytes() const {return fields*8;}
+};
+static FailureOr<DescriptorSchema> descriptorSchema(func::FuncOp top, unsigned width) {
+  DescriptorSchema s;
+  auto read=[&](StringRef name,int64_t &v) {
+    if(auto a=top->getAttrOfType<IntegerAttr>(name))v=a.getInt();
+  };
+  read("sodap.descriptor_fields",s.fields);
+  read("sodap.descriptor_magic",s.magic);
+  read("sodap.descriptor_version",s.version);
+  read("sodap.descriptor_width_field",s.widthField);
+  if(s.fields<3 || s.fields>256 || s.widthField<2 || s.widthField>=s.fields ||
+      s.magic<=0 || uint64_t(s.magic)>UINT32_MAX || s.version<=0 || uint64_t(s.version)>UINT32_MAX ||
+      (width && s.bytes()%(width/8)))
+    return top.emitError("invalid descriptor schema or header alignment");
+  for(unsigned i=0;i<top.getNumArguments();++i)
+    for(auto name:{"sodap.descriptor_field","sodap.descriptor_ld"})
+      if(auto a=top.getArgAttrOfType<IntegerAttr>(i,name))
+        if(a.getInt()<0 || a.getInt()>=s.fields)
+          return top.emitError("descriptor argument field outside schema");
+  return s;
+}
+
 /// Each task of `dispatch` gets the descriptor at its start: the load task
 /// reads it from the DMA at address 0 (one 64-bit slot per field) and writes
 /// it to a stream per other task, which read it from there. Returns each
 /// task's fields, as index values.
 static FailureOr<DenseMap<Operation *, SmallVector<Value>>>
-readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma) {
+readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma,
+               unsigned width, const DenseMap<Operation *, PackedClient> &clients,
+               const DescriptorSchema &schema) {
   MLIRContext *ctx = b.getContext();
   Location loc = dispatch.getLoc();
   Block &body = dispatch.getBody().front();
-  SmallVector<TaskOp> tasks = llvm::to_vector(body.getOps<TaskOp>());
+  SmallVector<TaskOp> tasks;
+  for (TaskOp task : body.getOps<TaskOp>())
+    if (!task->hasAttr("sodap.dma_broker")) tasks.push_back(task);
   auto load = llvm::find_if(tasks, [](TaskOp t) { return t->hasAttr("load"); });
   if (load == tasks.end())
     return dispatch.emitOpError("expected a load task to read the descriptor");
@@ -249,48 +323,82 @@ readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma) {
   for (TaskOp task : tasks)
     if (task != *load)
       streams[task] = b.create<StreamOp>(
-          loc, StreamType::get(ctx, i32, GEMM_FIELD_COUNT));
+          loc, StreamType::get(ctx, i32, schema.fields));
 
   DenseMap<Operation *, SmallVector<Value>> fields;
   for (TaskOp task : tasks) {
     b.setInsertionPointToStart(&task.getBody().front());
     Value local = b.create<memref::AllocaOp>(
-        loc, MemRefType::get({GEMM_FIELD_COUNT}, i32));
+        loc, MemRefType::get({schema.fields}, i32));
     Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
     Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-    Value count = b.create<arith::ConstantIndexOp>(loc, GEMM_FIELD_COUNT);
-    if (task == *load)
-      b.create<StreamWriteOp>(
-          loc, dma.readCtrl,
-          b.create<arith::ConstantIntOp>(
-              loc, int64_t(GEMM_FIELD_COUNT * GEMM_WORD_STRIDE) << 32, 64));
+    Value count = b.create<arith::ConstantIndexOp>(loc, schema.fields);
+    DMAStreams ports = dma;
+    Value meta, notice;
+    if (auto it = clients.find(task); it != clients.end()) {
+      ports = it->second.dma; meta = it->second.meta; notice = it->second.notice;
+    }
+    PackedEmitter e{b, loc, width ? width : 64};
+    if (task == *load) {
+      if (meta) e.write(meta, e.integer(0));
+      e.write(ports.readCtrl, e.request(e.idx(0), e.idx(width
+          ? schema.bytes() / (width / 8) : schema.fields * GEMM_WORD_STRIDE)));
+      if (notice) e.write(notice, e.integer(1, 8));
+    }
+    if (width && task == *load) {
+      // Descriptor fields retain 64-bit slots independently of payload width.
+      // Buffer the entire header before publishing it to any consumer.
+      e.loop(e.idx(schema.bytes() / (width / 8)), [&](Value beat) {
+        Value data = e.read(ports.readData);
+        for (unsigned lane = 0; lane < width / 64; ++lane) {
+          Value value = b.create<arith::TruncIOp>(loc, i32,
+              b.create<arith::ShRUIOp>(loc, data, e.integer(lane * 64, width)));
+          Value field = e.add(e.mul(beat, e.idx(width / 64)), e.idx(lane));
+          b.create<memref::StoreOp>(loc, value, local, field);
+        }
+      });
+    }
     auto loop = b.create<scf::ForOp>(loc, c0, count, c1);
     {
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(loop.getBody());
       Value value;
       if (task == *load) {
-        value = b.create<StreamReadOp>(loc, i32, dma.readData).getResult();
-        b.create<StreamReadOp>(loc, i32, dma.readData); // The padding lane.
+        if (width)
+          value = b.create<memref::LoadOp>(loc, local, loop.getInductionVar());
+        else {
+          value = b.create<StreamReadOp>(loc, i32, ports.readData).getResult();
+          b.create<StreamReadOp>(loc, i32, ports.readData);
+        }
         for (TaskOp other : tasks)
-          if (other != *load)
-            b.create<StreamWriteOp>(loc, streams[other], value);
-      } else {
-        value = b.create<StreamReadOp>(loc, i32, streams[task]).getResult();
-      }
+          if (other != *load) e.write(streams[other], value);
+      } else value = e.read(streams[task]);
       b.create<memref::StoreOp>(loc, value, local, loop.getInductionVar());
     }
-    // ponytail: no magic/version check; add William's guard (no work on an
-    // invalid descriptor) once the runtime can send one.
-    for (int64_t f = 0; f < GEMM_FIELD_COUNT; ++f) {
+    for (int64_t f = 0; f < schema.fields; ++f) {
       Value word = b.create<memref::LoadOp>(
           loc, local, ValueRange{b.create<arith::ConstantIndexOp>(loc, f)});
       fields[task].push_back(
           b.create<arith::IndexCastUIOp>(loc, b.getIndexType(), word));
     }
+    // Invalid ABI headers do no matrix work. Keep broker EOF outside this
+    // guard so all participants still terminate on an invalid invocation.
+    if (width) {
+      Value valid = e.band(e.eq(fields[task][GEMM_FIELD_MAGIC], e.idx(schema.magic)),
+          e.band(e.eq(fields[task][GEMM_FIELD_VERSION], e.idx(schema.version)),
+                 e.eq(fields[task][schema.widthField], e.idx(width))));
+      auto guarded = b.create<scf::IfOp>(loc, valid, false);
+      for (Operation *op = guarded->getNextNode(); op && !op->hasTrait<OpTrait::IsTerminator>() &&
+           !op->hasAttr("sodap.dma_eof");) {
+        Operation *next = op->getNextNode();
+        op->moveBefore(guarded.thenBlock()->getTerminator());
+        op = next;
+      }
+    }
   }
   return fields;
 }
+
 
 namespace {
 
@@ -299,6 +407,10 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    if (dmaDataWidth && !::sodap::DmaTransport{dmaDataWidth}.valid()) {
+      module.emitError("dma-data-width must be 64, 128, 256 or 512 (0 selects legacy)");
+      return signalPassFailure();
+    }
     if (wordStride != 1 && wordStride != 2) {
       module.emitError("dma-word-stride must be 1 or 2");
       return signalPassFailure();
@@ -321,25 +433,48 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
       if (failed(collectTransfers(arg, base, transfers)))
         return signalPassFailure();
       regions.set(arg.getArgNumber());
-      if (type.hasStaticShape())
-        base += type.getNumElements() * wordStride;
+      if (type.hasStaticShape()) {
+        uint64_t words=type.getNumElements()*wordStride;
+        if (dmaDataWidth && (!::sodap::DmaTransport{dmaDataWidth}.tensorWords(
+            type.getShape().data(),type.getRank(),words) ||
+            uint64_t(base)+words > uint64_t(UINT32_MAX)*(dmaDataWidth/32))) {
+          module.emitError("packed DMA arena exceeds request address range");
+          return signalPassFailure();
+        }
+        base += words;
+      }
     }
-    // The index arguments read from the descriptor.
+    // The index and f32 arguments read from the descriptor (an f32 is the
+    // bits of its field's low 32 bits, as esp_gemm_invoke writes alpha).
     SmallVector<std::pair<BlockArgument, int64_t>> scalars;
     for (BlockArgument arg : top.getArguments())
       if (auto field = top.getArgAttrOfType<IntegerAttr>(
               arg.getArgNumber(), "sodap.descriptor_field")) {
-        if (isa<IndexType>(arg.getType())) {
+        if (isa<IndexType>(arg.getType()) || arg.getType().isF32()) {
           scalars.push_back({arg, field.getInt()});
           regions.set(arg.getArgNumber());
         }
       }
     bool descriptor = llvm::any_of(
         transfers, [](const Transfer &t) { return t.baseField >= 0; });
-    if (descriptor && wordStride != GEMM_WORD_STRIDE) {
+    if (descriptor && !dmaDataWidth && wordStride != GEMM_WORD_STRIDE) {
       module.emitError("a descriptor needs dma-word-stride=2");
       return signalPassFailure();
     }
+
+    if(!dmaDataWidth && llvm::any_of(transfers,[](const Transfer &t){return !t.view.empty();})) {
+      top.emitError("descriptor DMA views require packed transport");return signalPassFailure();
+    }
+    auto schema=descriptorSchema(top,dmaDataWidth);
+    if(descriptor && failed(schema)) return signalPassFailure();
+    for(const auto &t:transfers)
+      if(t.view=="conv_window_nhwc" || t.view=="conv_weights_ohwi" || t.view=="conv_window_flat") {
+        if(!t.read || failed(schema) || schema->magic!=OP_CONV_MAGIC ||
+            schema->fields!=OP_HEADER_FIELDS || schema->version!=(t.view=="conv_window_flat"?CONV_MATRIX_VERSION:OP_PACKED_VERSION)) {
+          top.emitError("convolution DMA views require read-only transfers and the convolution descriptor schema");
+          return signalPassFailure();
+        }
+      }
 
     // A copy between two DMA regions needs local staging. Reject it before
     // mutating anything, rather than lowering/erasing the same copy twice.
@@ -359,7 +494,7 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
     MLIRContext *ctx = &getContext();
     Location loc = top.getLoc();
     auto ctrlType = StreamType::get(ctx, IntegerType::get(ctx, 64), 4);
-    auto dataType = StreamType::get(ctx, IntegerType::get(ctx, 32), 1);
+    auto dataType = StreamType::get(ctx, IntegerType::get(ctx, dmaDataWidth ? dmaDataWidth : 32), 1);
     unsigned next = top.getNumArguments();
     for (Type type : {ctrlType, dataType, ctrlType, dataType})
       top.insertArgument(next++, type, DictionaryAttr::get(ctx), loc);
@@ -368,6 +503,31 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
                    top.getArgument(first + 2), top.getArgument(first + 3)};
 
     OpBuilder b(ctx);
+    DenseMap<Operation*,PackedClient> clients;
+    if (dmaDataWidth) {
+      module->setAttr("sodap.dma_abi", b.getI32IntegerAttr(2));
+      module->setAttr("sodap.dma_data_width", b.getI32IntegerAttr(dmaDataWidth));
+      llvm::SmallPtrSet<Operation*,4> tasks;
+      bool boundary=false;
+      for (auto &t:transfers) {
+        if(auto task=t.copy->getParentOfType<TaskOp>())tasks.insert(task);
+        t.boundary = t.view.empty() ? packedNeedsBoundary(t,dmaDataWidth) : !t.read;
+        boundary |= *t.boundary;
+      }
+      if (boundary && tasks.size()>1) {
+        SmallVector<TaskOp> owners;
+        for (auto &transfer : transfers) {
+          auto task=transfer.copy->getParentOfType<TaskOp>();
+          if (!task) {
+            transfer.copy.emitError("mixed scoped/unscoped DMA owners are unsupported");
+            return signalPassFailure();
+          }
+          if (!llvm::is_contained(owners,task)) owners.push_back(task);
+        }
+        clients=packedBroker(b,top,dma,owners,dmaDataWidth);
+        top->setAttr("sodap.dma_broker",b.getUnitAttr());
+      }
+    }
     DenseMap<Operation *, SmallVector<Value>> fields;
     if (descriptor) {
       auto dispatches = llvm::to_vector(top.front().getOps<DispatchOp>());
@@ -375,7 +535,7 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
         top.emitError("a descriptor needs one dataflow.dispatch");
         return signalPassFailure();
       }
-      auto read = readDescriptor(b, dispatches.front(), dma);
+      auto read = readDescriptor(b, dispatches.front(), dma, dmaDataWidth, clients, *schema);
       if (failed(read))
         return signalPassFailure();
       fields = std::move(*read);
@@ -388,7 +548,15 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
                                       "the tasks");
             return signalPassFailure();
           }
-          use.set(fields[task][field]);
+          Value value = fields[task][field];
+          if (arg.getType().isF32()) {
+            auto cast = value.getDefiningOp<arith::IndexCastUIOp>();
+            OpBuilder::InsertionGuard guard(b);
+            b.setInsertionPointAfter(cast);
+            value = b.create<arith::BitcastOp>(cast.getLoc(), arg.getType(),
+                                               cast.getIn());
+          }
+          use.set(value);
         }
     }
     llvm::SmallPtrSet<Operation *, 4> receivers;
@@ -403,7 +571,17 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
       ArrayRef<Value> taskFields;
       if (transfer.baseField >= 0)
         taskFields = fields[transfer.copy->getParentOfType<TaskOp>()];
-      lowerTransfer(b, transfer, dma, wordStride, taskFields);
+      if (dmaDataWidth) {
+        auto task=transfer.copy->getParentOfType<TaskOp>();
+        auto it=clients.find(task);
+        DMAStreams ports=it!=clients.end()?it->second.dma:dma;
+        Value meta=it!=clients.end()?it->second.meta:Value();
+        Value notice=it!=clients.end()?it->second.notice:Value();
+        if(transfer.view.empty())
+          lowerPackedTransfer(b, transfer, ports, dmaDataWidth, meta, notice,
+                              taskFields, it == clients.end() ? Value() : it->second.storeCompleted);
+        else lowerPackedViewTransfer(b,transfer,ports,dmaDataWidth,meta,notice,taskFields,mergeWindowRuns);
+      } else lowerTransfer(b, transfer, dma, wordStride, taskFields);
       transfer.copy.erase();
     }
     // A stalled tile publication must complete before the receiver admits

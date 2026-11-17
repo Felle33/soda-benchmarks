@@ -67,4 +67,111 @@ def EmitBambuArchitecture :
   let dependentDialects = ["::mlir::sodap::dataflow::DataflowDialect"];
 }
 
+def ApplyLCSTransform : Pass<"sodap-apply-lcs-transform", "::mlir::ModuleOp"> {
+  let summary = "Configure and apply operator transform library inside the compiler";
+  let options = [
+    Option<"family", "family", "std::string", "\"gemm\"", "Operator family">,
+    Option<"lanes", "lanes", "unsigned", "64", "Core lanes">,
+    Option<"transformFile", "transform-file", "std::string", "\"\"", "Transform library">,
+    Option<"reportDir", "report-dir", "std::string", "\".\"", "Reports directory">
+  ];
+}
+
+def EmitHLSConfiguration : Pass<"sodap-emit-hls-configuration", "::mlir::ModuleOp"> {
+  let summary = "Write fixed-format HLS constraints and compute provenance";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "FP32 unit constraint per task">,
+    Option<"directory", "directory", "std::string", "\".\"", "Output directory">
+  ];
+}
+
+def SelectKernelTiles : Pass<"sodap-select-kernel-tiles", "::mlir::ModuleOp"> {
+  let summary = "Select whole-kernel tiles using the requested scheduled IR";
+  let options = [
+    Option<"schedule", "schedule", "std::string", "\"overlap\"", "overlap or nonoverlap">,
+    Option<"singleCopyProposals", "single-copy-proposals", "bool", "false",
+           "Also consider single-copy proposals for the fused schedule">,
+    Option<"lanes", "lanes", "unsigned", "64", "Core FP32 lane budget">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Final local storage budget">,
+    Option<"reuseBytes", "reuse-bytes", "uint64_t", "262144", "Reuse admission budget">,
+    Option<"dmaWidth", "dma-width", "unsigned", "64", "Packed transport width">,
+    Option<"wordStride", "word-stride", "unsigned", "2", "Legacy DMA word stride">,
+    Option<"requestCycles", "request-cycles", "unsigned", "64", "DMA request cost">,
+    Option<"wordCycles", "word-cycles", "unsigned", "1", "DMA word cost">,
+    Option<"transformFile", "transform-file", "std::string", "\"\"", "Transform library">,
+    Option<"reportDir", "report-dir", "std::string", "\".\"", "Search reports directory">
+  ];
+}
+
+def SnapshotKernelIR : Pass<"sodap-snapshot-kernel-ir", "::mlir::ModuleOp"> {
+  let summary = "Write an intermediate whole-kernel module without changing it";
+  let options = [Option<"file", "file", "std::string", "\"\"", "Output filename">];
+}
+
+def SelectReusableHardware : Pass<"sodap-select-reusable-hardware", "::mlir::ModuleOp"> {
+  let summary = "Select shape-independent GEMM tiles from compute and storage budgets";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "FP32 contraction lane budget">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Total local storage budget">,
+    Option<"report", "report", "std::string", "\"\"", "Optional hardware selection JSON">
+  ];
+}
+
+def PrepareComputeBudget : Pass<"sodap-prepare-compute-budget", "::mlir::ModuleOp"> {
+  let summary = "Normalize FP32 contractions and allocate one shared compute budget";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "Whole-accelerator contraction lane budget">,
+    Option<"report", "report", "std::string", "\"\"", "Optional allocation report JSON">
+  ];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect", "::mlir::linalg::LinalgDialect"];
+}
+
+def BankMatmulBuffers : Pass<"sodap-bank-matmul-buffers", "::mlir::ModuleOp"> {
+  let summary = "Mark matmul local memories for cyclic banking before register blocking";
+  let options = [
+    Option<"rows", "rows", "unsigned", "8", "A row banks">,
+    Option<"cols", "cols", "unsigned", "8", "B and C column banks">,
+    Option<"pointwise", "pointwise", "bool", "false", "Also bank independent pointwise lanes along the last loop axis">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "0", "Physical local array bytes after padding, zero disables check">,
+    Option<"report", "report", "std::string", "\"\"", "Optional physical storage report JSON">
+  ];
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect",
+    "::mlir::arith::ArithDialect", "::mlir::memref::MemRefDialect"];
+}
+
+def LegalizeFPMinMax : Pass<"sodap-legalize-fp-minmax", "::mlir::ModuleOp"> {
+  let summary = "Lower FP32 IEEE minimum/maximum to bit comparisons supported by Bambu";
+  let dependentDialects = ["::mlir::arith::ArithDialect"];
+}
+
+def RegisterBlockPointwise : Pass<"sodap-register-block-pointwise", "::mlir::ModuleOp"> {
+  let summary = "Unroll independent pointwise lanes by cloning the source scalar region";
+  let options = [Option<"lanes", "lanes", "unsigned", "4", "Independent pointwise lanes">];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::affine::AffineDialect",
+    "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect", "::mlir::linalg::LinalgDialect"];
+}
+
+def FinalizeBankedMemRefsToLLVM :
+    Pass<"sodap-finalize-banked-memrefs-to-llvm", "::mlir::ModuleOp"> {
+  let summary = "Lower static identity memrefs with array-shaped allocas and full GEPs";
+  let description = [{
+    Opt-in backend for banked memories. Run fold-memref-alias-ops first so
+    subview accesses address the original array with all dimensions. This
+    preserves the shape required by Bambu CSROA. Other memrefs use the standard
+    MLIR conversion. Does not change the bare-pointer function ABI or DMA layout.
+  }];
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
+}
+
+def RegisterBlockMatmul : Pass<"sodap-register-block-matmul", "::mlir::ModuleOp"> {
+  let summary = "Lower matmul to a fully exposed register block with guarded tails";
+  let options = [
+    Option<"rows", "rows", "unsigned", "8", "Register block rows">,
+    Option<"cols", "cols", "unsigned", "8", "Register block columns">
+  ];
+  let dependentDialects = ["::mlir::arith::ArithDialect",
+    "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect"];
+}
+
 #endif // SODAP_CONVERSION_DATAFLOWTOLLVM_PASSES_TD

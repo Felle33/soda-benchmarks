@@ -4,6 +4,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef SODAP_GEMM_PROFILE
+#include "sodap/ExecutionEngine/esp_prof.h"
+#include "sodap/ExecutionEngine/ReusableGemmProfile.h"
+extern "C" __attribute__((weak)) void esp_gemm_profile_event(uint32_t, uint32_t) {}
+struct ProfileRegion {
+  uint32_t id;
+  explicit ProfileRegion(uint32_t value) : id(value) { esp_prof_begin(id); }
+  ~ProfileRegion() { esp_prof_end(id); }
+};
+#define GEMM_PROFILE(id) ProfileRegion profileRegion(id)
+#define GEMM_EVENT(begin, invocation) esp_gemm_profile_event(begin, invocation)
+#else
+#define GEMM_PROFILE(id) ((void)0)
+#define GEMM_EVENT(begin, invocation) ((void)0)
+#endif
+#ifdef SODAP_GEMM_QUIET
+#define GEMM_LOG(...) ((void)0)
+#else
+#define GEMM_LOG(...) std::printf(__VA_ARGS__)
+#endif
 
 #ifdef __riscv
 extern "C" {
@@ -21,7 +41,7 @@ extern "C" {
 namespace {
 struct Context {
   uint32_t *arena;
-  uint32_t bytes, instance, invocations;
+  uint32_t bytes, instance, invocations, dmaWidth;
   bool running;
   Context *next;
 #ifdef __riscv
@@ -50,9 +70,11 @@ void trace(const Context &ctx, const char *kind) {
   if (!file) std::abort();
   uint32_t base = ctx.arena[2 * GEMM_FIELD_C];
   uint32_t stride = ctx.arena[2 * GEMM_FIELD_LDC];
+  if (ctx.dmaWidth) { base /= 4; stride /= 4; }
+  unsigned elementWords = ctx.dmaWidth ? 1 : GEMM_WORD_STRIDE;
   for (unsigned i = 0; i < ctx.bytes / 4; ++i) {
     bool output = i >= base && (i - base) / stride < ctx.arena[2 * GEMM_FIELD_M] &&
-        (i - base) % stride < 2 * ctx.arena[2 * GEMM_FIELD_N] && (i - base) % 2 == 0;
+        (i - base) % stride < elementWords * ctx.arena[2 * GEMM_FIELD_N] && (i - base) % elementWords == 0;
     std::fprintf(file, "%x\n", output ? 2 : 0);
   }
   std::fclose(file);
@@ -99,29 +121,39 @@ void fence() {
 }
 uint64_t endOf(Context &ctx, int64_t offset, int64_t rows,
                int64_t cols, int64_t stride) {
-  if (offset < GEMM_HEADER_BYTES || offset % GEMM_SLOT_BYTES ||
+  const unsigned alignment = ctx.dmaWidth ? ctx.dmaWidth / 8 : GEMM_SLOT_BYTES;
+  const unsigned elementBytes = ctx.dmaWidth ? 4 : GEMM_SLOT_BYTES;
+  if (offset < GEMM_HEADER_BYTES || offset % alignment ||
       rows <= 0 || cols <= 0 || rows > UINT32_MAX || cols > UINT32_MAX ||
-      stride <= 0 || stride % GEMM_SLOT_BYTES || stride > ctx.bytes ||
-      uint64_t(stride) < uint64_t(cols) * GEMM_SLOT_BYTES)
+      stride <= 0 || stride % alignment || stride > ctx.bytes ||
+      uint64_t(stride) < uint64_t(cols) * elementBytes)
     fail("invalid matrix descriptor");
   // Factors are bounded above before multiplication, so this fits uint64_t.
   uint64_t end = uint64_t(offset) + uint64_t(rows - 1) * stride +
-                 uint64_t(cols) * GEMM_SLOT_BYTES;
+                 uint64_t(cols) * elementBytes;
   if (offset > ctx.bytes || end > ctx.bytes) fail("matrix exceeds arena");
   return end;
 }
 void copy(int64_t handle, int64_t offset, int64_t rank, void *descriptor, bool in) {
   Context &ctx = lookup(handle);
-  if (ctx.running || offset < GEMM_HEADER_BYTES || offset % GEMM_SLOT_BYTES ||
-      !sodap::copyMemRefF32(rank, descriptor, ctx.arena, ctx.bytes / 4,
-                            offset / 4, in, GEMM_WORD_STRIDE))
+  if (ctx.running || offset < GEMM_HEADER_BYTES ||
+      (ctx.dmaWidth ? !sodap::copyMemRefF32Packed(rank, descriptor, ctx.arena,
+                           ctx.bytes, offset, in, ctx.dmaWidth)
+                    : offset % GEMM_SLOT_BYTES ||
+                      !sodap::copyMemRefF32(rank, descriptor, ctx.arena, ctx.bytes / 4,
+                                           offset / 4, in, GEMM_WORD_STRIDE)))
     fail("invalid shared-memory copy");
 }
 } // namespace
 
-extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
+static int64_t openContext(int64_t bytes, int64_t instance, unsigned width) {
+  GEMM_PROFILE(ESP_PROF_ALLOC);
+  if (width && !sodap::DmaTransport{width}.valid()) fail("invalid DMA width");
+#ifdef __riscv
+  if (width && width != 64) fail("ESP backend supports packed DMA64 only");
+#endif
   if (bytes < GEMM_HEADER_BYTES || bytes > (1 << 30) ||
-      bytes % GEMM_SLOT_BYTES || instance < 0 || instance > UINT32_MAX)
+      bytes % (width ? width / 8 : GEMM_SLOT_BYTES) || instance < 0 || instance > UINT32_MAX)
     fail("invalid arena size or instance");
   for (Context *p = live; p; p = p->next)
     if (p->instance == instance) fail("device instance already owned");
@@ -129,6 +161,7 @@ extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
   *ctx = {};
   ctx->bytes = bytes;
   ctx->instance = instance;
+  ctx->dmaWidth = width;
 #ifdef __riscv
   esp_device *devices = nullptr;
   int count = probe(&devices, VENDOR_SLD, SODAP_ESP_DEVICE_ID, SODAP_ESP_DEVICE_NAME);
@@ -158,24 +191,39 @@ extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
   std::memset(ctx->arena, 0, bytes);
   ctx->next = live;
   live = ctx;
-  std::printf("REUSABLE_GEMM open instance=%u arena_bytes=%u abi=%u\n",
-              ctx->instance, ctx->bytes, GEMM_VERSION);
+  GEMM_LOG("REUSABLE_GEMM open instance=%u arena_bytes=%u abi=%u\n",
+              ctx->instance, ctx->bytes, width ? GEMM_PACKED_VERSION : GEMM_VERSION);
   return reinterpret_cast<intptr_t>(ctx);
+}
+
+extern "C" int64_t esp_gemm_open(int64_t bytes, int64_t instance) {
+  return openContext(bytes, instance, 0);
+}
+extern "C" int64_t esp_gemm_open_packed(int64_t bytes, int64_t instance, int64_t width) {
+  if (width <= 0 || width > UINT32_MAX || !sodap::DmaTransport{unsigned(width)}.valid())
+    fail("invalid DMA width");
+  return openContext(bytes, instance, unsigned(width));
 }
 
 extern "C" void esp_gemm_copy_in(int64_t ctx, int64_t offset,
                                  int64_t rank, void *descriptor) {
+  GEMM_PROFILE(ESP_PROF_PACK);
   copy(ctx, offset, rank, descriptor, true);
 }
 extern "C" void esp_gemm_copy_out(int64_t ctx, int64_t offset,
                                   int64_t rank, void *descriptor) {
+  GEMM_PROFILE(ESP_PROF_UNPACK);
   copy(ctx, offset, rank, descriptor, false);
 }
 
-extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
+static void invoke(int64_t handle, int64_t a, int64_t b,
     int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
-    int64_t ldc, float alpha, float beta) {
+    int64_t ldc, float alpha, float beta, float hasC, bool sourceSemantics) {
   Context &ctx = lookup(handle);
+  if (sourceSemantics && (!ctx.dmaWidth || (hasC != 0.0f && hasC != 1.0f)))
+    fail("source GEMM requires packed DMA and an explicit C-presence flag");
+  GEMM_PROFILE(ESP_PROF_ACCEL);
+  GEMM_EVENT(1, ctx.invocations);
   if (ctx.running) fail("instance is already running");
   uint64_t ae = endOf(ctx, a, m, k, lda), be = endOf(ctx, b, k, n, ldb);
   uint64_t ce = endOf(ctx, c, m, n, ldc);
@@ -184,25 +232,29 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
     fail("output overlaps an input");
   uint32_t descriptor[GEMM_FIELD_COUNT] = {};
   descriptor[GEMM_FIELD_MAGIC] = GEMM_MAGIC;
-  descriptor[GEMM_FIELD_VERSION] = GEMM_VERSION;
+  descriptor[GEMM_FIELD_VERSION] = sourceSemantics ? GEMM_SOURCE_VERSION :
+      (ctx.dmaWidth ? GEMM_PACKED_VERSION : GEMM_VERSION);
+  descriptor[GEMM_FIELD_DMA_WIDTH] = ctx.dmaWidth;
+  const unsigned addressUnit = ctx.dmaWidth ? 1 : 4;
   descriptor[GEMM_FIELD_M] = m;
   descriptor[GEMM_FIELD_N] = n;
   descriptor[GEMM_FIELD_K] = k;
-  descriptor[GEMM_FIELD_A] = a / 4;
-  descriptor[GEMM_FIELD_B] = b / 4;
-  descriptor[GEMM_FIELD_C] = c / 4;
-  descriptor[GEMM_FIELD_LDA] = lda / 4;
-  descriptor[GEMM_FIELD_LDB] = ldb / 4;
-  descriptor[GEMM_FIELD_LDC] = ldc / 4;
+  descriptor[GEMM_FIELD_A] = a / addressUnit;
+  descriptor[GEMM_FIELD_B] = b / addressUnit;
+  descriptor[GEMM_FIELD_C] = c / addressUnit;
+  descriptor[GEMM_FIELD_LDA] = lda / addressUnit;
+  descriptor[GEMM_FIELD_LDB] = ldb / addressUnit;
+  descriptor[GEMM_FIELD_LDC] = ldc / addressUnit;
   std::memcpy(&descriptor[GEMM_FIELD_ALPHA], &alpha, sizeof(float));
   std::memcpy(&descriptor[GEMM_FIELD_BETA], &beta, sizeof(float));
+  if (sourceSemantics) std::memcpy(&descriptor[GEMM_FIELD_HAS_C], &hasC, sizeof(float));
   for (unsigned i = 0; i < GEMM_FIELD_COUNT; ++i) {
     ctx.arena[2 * i] = descriptor[i];
     ctx.arena[2 * i + 1] = 0;
   }
   ctx.running = true;
   trace(ctx, "initial");
-  std::printf("REUSABLE_GEMM launch=%u instance=%u M=%u N=%u K=%u A=%u B=%u C=%u\n",
+  GEMM_LOG("REUSABLE_GEMM launch=%u instance=%u M=%u N=%u K=%u A=%u B=%u C=%u\n",
       ctx.invocations, ctx.instance, unsigned(m), unsigned(n), unsigned(k),
       unsigned(a), unsigned(b), unsigned(c));
 #ifdef __riscv
@@ -217,7 +269,7 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
   // compiler isolation and arena lifetimes independently of HLS/simulation.
   auto read = [&](int64_t base, int64_t row, int64_t col, int64_t ld) {
     float value;
-    std::memcpy(&value, reinterpret_cast<char *>(ctx.arena) + base + row * ld + col * 8, 4);
+    std::memcpy(&value, reinterpret_cast<char *>(ctx.arena) + base + row * ld + col * (ctx.dmaWidth ? 4 : 8), 4);
     return value;
   };
   for (int64_t i = 0; i < m; ++i)
@@ -226,22 +278,35 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
       for (int64_t q = 0; q < k; ++q)
         sum = sum + read(a, i, q, lda) * read(b, q, j, ldb);
       float value = alpha * sum;
-      if (beta != 0) value = value + beta * read(c, i, j, ldc);
-      char *slot = reinterpret_cast<char *>(ctx.arena) + c + i * ldc + j * 8;
+      if (sourceSemantics ? hasC != 0 : beta != 0)
+        value = beta * read(c, i, j, ldc) + value;
+      char *slot = reinterpret_cast<char *>(ctx.arena) + c + i * ldc + j * (ctx.dmaWidth ? 4 : 8);
       std::memcpy(slot, &value, 4);
-      std::memset(slot + 4, 0, 4);
+      if (!ctx.dmaWidth) std::memset(slot + 4, 0, 4);
     }
 #endif
   trace(ctx, "expected");
   ctx.running = false;
+  GEMM_EVENT(0, ctx.invocations);
   ++ctx.invocations;
-  std::printf("REUSABLE_GEMM complete=%u instance=%u\n", ctx.invocations, ctx.instance);
+  GEMM_LOG("REUSABLE_GEMM complete=%u instance=%u\n", ctx.invocations, ctx.instance);
+}
+
+extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
+    int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
+    int64_t ldc, float alpha, float beta) {
+  invoke(handle,a,b,c,m,n,k,lda,ldb,ldc,alpha,beta,0,false);
+}
+extern "C" void esp_gemm_invoke_source(int64_t handle, int64_t a, int64_t b,
+    int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
+    int64_t ldc, float alpha, float beta, float hasC) {
+  invoke(handle,a,b,c,m,n,k,lda,ldb,ldc,alpha,beta,hasC,true);
 }
 
 extern "C" void esp_gemm_close(int64_t handle) {
   Context &ctx = lookup(handle);
   if (ctx.running) fail("cannot close a running instance");
-  std::printf("REUSABLE_GEMM close instance=%u invocations=%u\n", ctx.instance, ctx.invocations);
+  GEMM_LOG("REUSABLE_GEMM close instance=%u invocations=%u\n", ctx.instance, ctx.invocations);
   Context **link = &live;
   while (*link != &ctx) link = &(*link)->next;
   *link = ctx.next;

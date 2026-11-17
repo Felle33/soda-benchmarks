@@ -33,6 +33,7 @@
 #endif
 
 #include <cstdint>
+#include "sodap/ExecutionEngine/DmaTransport.h"
 #include <cstring>
 
 namespace sodap {
@@ -90,7 +91,7 @@ inline MemRefViewF32 decodeMemRefF32(int64_t rank, void *descriptor) {
 /// Unlike float/fixed conversion, this preserves NaNs, infinities and -0 bits.
 inline bool copyMemRefF32(int64_t rank, void *descriptor, void *shared,
                           int64_t capacity, int64_t offset, bool toShared,
-                          int64_t sharedStride = 1) {
+                          int64_t sharedStride = 1, int64_t rowWords = 0, int64_t sharedColumns = 0) {
   if (rank < 0 || !descriptor || !shared || offset < 0 || offset > capacity ||
       sharedStride < 1)
     return false;
@@ -116,6 +117,11 @@ inline bool copyMemRefF32(int64_t rank, void *descriptor, void *shared,
   }
   if (count > available || !head->aligned)
     return false;
+
+  int64_t cols = sharedColumns ? sharedColumns : (rank ? sizes[rank-1] : 1);
+  if (cols <= 0 || count % cols) return false;
+  if (rowWords && (rowWords < cols || sharedStride != 1 ||
+      count / cols > (capacity-offset)/rowWords)) return false;
 
   // Check the descriptor's full index range before modifying either buffer.
   int64_t low = head->offset, high = head->offset;
@@ -143,7 +149,7 @@ inline bool copyMemRefF32(int64_t rank, void *descriptor, void *shared,
   }
   auto *host = head->aligned + head->offset;
   auto *slots = bytes + offset * sizeof(float);
-  if (contiguous &&
+  if (contiguous && (!rowWords || rowWords == cols) &&
       ((reinterpret_cast<uintptr_t>(host) |
         reinterpret_cast<uintptr_t>(slots)) % alignof(float)) == 0) {
     // memcpy preserves object representations without aliasing float storage
@@ -169,7 +175,8 @@ inline bool copyMemRefF32(int64_t rank, void *descriptor, void *shared,
       index += (remainder % sizes[d]) * strides[d];
       remainder /= sizes[d];
     }
-    void *slot = bytes + (offset + linear * sharedStride) * sizeof(float);
+    int64_t physical = rowWords ? (linear/cols)*rowWords + linear%cols : linear*sharedStride;
+    void *slot = bytes + (offset + physical) * sizeof(float);
     if (toShared)
       std::memcpy(slot, head->aligned + index, sizeof(float));
     else
@@ -178,6 +185,34 @@ inline bool copyMemRefF32(int64_t rank, void *descriptor, void *shared,
   return true;
 }
 
+// Byte-addressed packed ABI; supports wide beats without wide CPU integers.
+inline bool copyMemRefF32Packed(int64_t rank,void *descriptor,void *shared,
+    int64_t capacityBytes,int64_t offsetBytes,bool toShared,unsigned width,
+    int64_t sharedColumns = 0) {
+  DmaTransport transport{width};
+  if(!transport.valid() || rank<0 || !descriptor || !shared || capacityBytes<0 ||
+      offsetBytes<0 || offsetBytes%transport.beatBytes() || offsetBytes>capacityBytes) return false;
+  auto *sizes=reinterpret_cast<int64_t*>(static_cast<char*>(descriptor)+sizeof(MemRefDescriptorHeadF32));
+  uint64_t words,row;
+  if(!transport.tensorWords(sizes,rank,words) ||
+      !transport.rowWords(rank?sizes[rank-1]:1,row)) return false;
+  uint64_t cols=rank?sizes[rank-1]:1;
+  if(sharedColumns) {
+    if(sharedColumns<0)return false;
+    uint64_t count=1;
+    for(int64_t d=0;d<rank;++d)
+      if(sizes[d]<0 || __builtin_mul_overflow(count,uint64_t(sizes[d]),&count))return false;
+    cols=sharedColumns;
+    if(count%cols || !transport.rowWords(cols,row) ||
+        __builtin_mul_overflow(count/cols,row,&words))return false;
+  }
+  if(words>uint64_t(capacityBytes-offsetBytes)/4 ||
+      !copyMemRefF32(rank,descriptor,shared,capacityBytes/4,offsetBytes/4,toShared,1,row,sharedColumns))return false;
+  if(toShared && row && row>cols)
+    for(uint64_t r=0;r<words/row;++r)
+      std::memset(static_cast<unsigned char*>(shared)+offsetBytes+(r*row+cols)*4,0,(row-cols)*4);
+  return true;
+}
 } // namespace sodap
 
 /// Allocate a contiguous shared memory buffer accessible by both the
@@ -205,6 +240,13 @@ esp_copy_from_shared_f32(int64_t mem_handle, int64_t offset, int64_t rank,
 /// The same bit-preserving copies with a positive shared-memory element stride.
 /// Stride 2 puts each f32 in the low word of a 64-bit slot. Padding is
 /// untouched.
+extern "C" MLIR_ESPRUNNERUTILS_EXPORT void
+esp_copy_to_shared_f32_packed(int64_t rank, void *ptr, int64_t mem_handle,
+                              int64_t offset_bytes, int64_t dma_width);
+extern "C" MLIR_ESPRUNNERUTILS_EXPORT void
+esp_copy_from_shared_f32_packed(int64_t mem_handle, int64_t offset_bytes,
+                                int64_t rank, void *ptr, int64_t dma_width);
+
 extern "C" MLIR_ESPRUNNERUTILS_EXPORT void
 esp_copy_to_shared_f32_strided(int64_t rank, void *ptr, int64_t mem_handle,
                                int64_t offset, int64_t shared_stride);

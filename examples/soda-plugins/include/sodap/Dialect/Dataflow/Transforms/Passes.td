@@ -137,6 +137,8 @@ def Schedule :
   }];
   let options = [Option<"reuseBufferBudget", "reuse-buffer-budget", "uint64_t",
       "0", "Byte budget for inferred intermediate reuse buffers (two slots plus accumulator); zero preserves the always-load schedule">,
+      Option<"serialTasks", "serial-tasks", "bool", "false",
+      "Serialize distinct LCS tasks with explicit stage handoffs">,
       Option<"serial", "serial", "bool", "false",
       "Emit the same demand-driven schedule as one sequential LCS task with single-copy tiles/slabs; preserve reuse selection">];
   let dependentDialects = [
@@ -147,9 +149,62 @@ def Schedule :
   ];
 }
 
+def GuardReads :
+    Pass<"sodap-dataflow-guard-reads", "::mlir::func::FuncOp"> {
+  let summary = "Read an argument only when a scalar argument isn't 0";
+  let description = [{
+    An argument with `sodap.read_unless_zero = i` is read only when the f32
+    argument `i` isn't 0: GEMM's C, read only when beta isn't 0
+    (`sodap-join-multiple-tiles`), as the measured engine's
+    `hasC = beta UNE 0`. Each `memref.copy` out of the argument, or out of a
+    subview of it, runs under `scf.if (arith.cmpf une, %i, 0.0)`; a NaN
+    reads. The compute must not need what it doesn't read: GEMM's body
+    selects `alpha * A.B` when beta is 0. Run before `sodap-dataflow-tails`,
+    which cuts the guarded copies, and their padding, inside the `scf.if`.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
+def Tails :
+    Pass<"sodap-dataflow-tails", "::mlir::func::FuncOp"> {
+  let summary = "Cut the tiles of run-time shapes to the part inside them";
+  let description = [{
+    A tile from `sodap-join-multiple-tiles` has its shapes as arguments
+    (`sodap.dims`), and `transform.sodap.tile_and_fuse` gives it tile sizes
+    that need not divide them: the tasks walk static tiles, and the last tile
+    of a range reaches past it. Run after `sodap-dataflow-ping-pong` (or the
+    serial schedule), on each `memref.copy` between a static, unit-stride
+    tile of an argument with a dynamic shape and a local buffer:
+
+    - the copy moves the part of the tile inside the argument:
+      `min(size, dim - offset)` along each dynamic dim, to or from the start
+      of the local tile. `sodap-dataflow-copy-to-dma` then requests rows of
+      that length;
+    - before a copy in (a load), the local tile is filled with zeros when
+      some part is smaller than its size, and only then: a whole tile pays
+      nothing. The compute tasks stay on whole static tiles; the zeros add
+      nothing to a contraction, and the rows and columns past the argument
+      are never stored.
+
+    A store copies its part out without padding. Arguments with a static
+    shape (`LCS_TILES=kernel`) are left alone.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
 def PingPong :
     Pass<"sodap-dataflow-ping-pong", "::mlir::func::FuncOp"> {
   let summary = "Synchronise the tasks of a dispatch with ping-pong buffers";
+  let options = [Option<"singleSlot", "single-slot", "bool", "false",
+                        "Use slot zero under the serial task handoff">];
   let description = [{
     Works on the dispatches `sodap-dataflow-schedule` leaves: tasks sharing
     buffers a tile at a time, the writer and the readers of each walking the
@@ -394,8 +449,12 @@ def CopyToDMA :
   let options = [
     Option<"topFunc", "top-func", "std::string", /*default=*/"",
            "Top function of the design (default: the module's name)">,
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0",
+           "Packed transport width: 64/128/256/512; 0 selects the legacy ABI">,
     Option<"wordStride", "dma-word-stride", "unsigned", /*default=*/"1",
-           "32-bit words per shared-memory element; must match host lowering">
+           "32-bit words per shared-memory element; must match host lowering">,
+    Option<"mergeWindowRuns", "merge-window-runs", "bool", "true",
+           "Merge physically contiguous runs within a logical convolution window tile">
   ];
   let dependentDialects = [
     "::mlir::sodap::dataflow::DataflowDialect",
@@ -434,6 +493,7 @@ def BindDims : Pass<"sodap-dataflow-bind-dims", "::mlir::func::FuncOp"> {
 def ReportLCSCost : Pass<"sodap-dataflow-report-cost", "::mlir::ModuleOp"> {
   let summary = "Report static DMA work and allocated storage after LCS scheduling";
   let options = [
+    Option<"dmaDataWidth", "dma-data-width", "unsigned", "0", "Packed transport accounting; 0 retains legacy only">,
     Option<"file", "file", "std::string", "\"schedule_cost.json\"", "JSON output" >,
     Option<"requestCycles", "request-cycles", "int64_t", "64", "Cost per row request">,
     Option<"wordCycles", "word-cycles", "int64_t", "1", "Cost per transferred 32-bit word">,

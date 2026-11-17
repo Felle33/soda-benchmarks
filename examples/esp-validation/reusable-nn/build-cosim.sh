@@ -10,17 +10,24 @@ out=$(realpath "$out")
 shopt -s nullglob
 memories=("$hardware/combined/"*.mem)
 if ((${#memories[@]})); then cp "${memories[@]}" "$out/"; fi
+width=0
+if [[ -f "$hardware/combined/transport.json" ]]; then
+  width=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["dma_data_width"])' "$hardware/combined/transport.json")
+fi
+adapter="$here/../generated-gemm/sqr_bambu_basic_dma64.sv"
+if [[ $width == 64 ]]; then adapter="$here/../native-dma/packed_dma64.sv";
+elif [[ $width != 0 ]]; then echo 'Unsupported Bambu DMA width' >&2; exit 1; fi
 cd "$hardware/combined"
 verilator --cc --top-module sqr_bambu_basic_dma64 --prefix Voperator \
   --Mdir "$out" -Wno-fatal -DSODAP_LCS_GENERIC -GTIMEOUT_CYCLES=2000000000 \
   -CFLAGS '-O3 -fPIC' --output-split 20000 --output-split-cfuncs 5000 \
   +incdir+"$hardware/combined" operator_engines.v forward_kernel.sv \
-  "$here/../generated-gemm/sqr_bambu_basic_dma64.sv" > "$out/verilator.log" 2>&1
+  "$adapter" > "$out/verilator.log" 2>&1
 make -C "$out" -f Voperator.mk -j"${NN_BUILD_JOBS:-8}" > "$out/build.log" 2>&1
 # Keep the simulator independent of a particular compiled host/model.
 verilator_include=${VERILATOR_INCLUDE:-/usr/share/verilator/include}
 verilator_support=("$verilator_include/verilated.cpp")
-if [[ -f "$verilator_include/verilated_threads.cpp" ]]; then
+if grep -q "^[[:space:]]*verilated_threads" "$out/Voperator_classes.mk"; then
   verilator_support+=("$verilator_include/verilated_threads.cpp")
 fi
 c++ -std=c++17 -O3 -fPIC -shared -pthread \

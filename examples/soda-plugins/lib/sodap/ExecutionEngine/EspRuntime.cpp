@@ -262,6 +262,21 @@ void copySharedF32(int64_t rank, void *ptr, int64_t handle, int64_t offset,
 }
 } // namespace
 
+extern "C" void esp_copy_to_shared_f32_packed(int64_t rank,void *ptr,
+    int64_t handle,int64_t offsetBytes,int64_t width) {
+  if (width < 0 || width > UINT32_MAX || !g_state.buf ||
+      handle!=reinterpret_cast<intptr_t>(g_state.buf) ||
+      !sodap::copyMemRefF32Packed(rank,ptr,g_state.buf,g_state.memSize,offsetBytes,true,width))
+    std::printf("esp: invalid packed f32 copy-in\n");
+}
+extern "C" void esp_copy_from_shared_f32_packed(int64_t handle,int64_t offsetBytes,
+    int64_t rank,void *ptr,int64_t width) {
+  if (width < 0 || width > UINT32_MAX || !g_state.buf ||
+      handle!=reinterpret_cast<intptr_t>(g_state.buf) ||
+      !sodap::copyMemRefF32Packed(rank,ptr,g_state.buf,g_state.memSize,offsetBytes,false,width))
+    std::printf("esp: invalid packed f32 copy-out\n");
+}
+
 extern "C" void esp_copy_to_shared_f32(int64_t rank, void *ptr,
                                        int64_t handle, int64_t offset) {
   copySharedF32(rank, ptr, handle, offset, true);

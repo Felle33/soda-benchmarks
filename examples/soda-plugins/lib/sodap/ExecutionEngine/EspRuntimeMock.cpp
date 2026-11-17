@@ -118,3 +118,22 @@ extern "C" void esp_accel_start() {
 extern "C" void esp_accel_wait() {
   std::cout << "Called: " << __func__ << std::endl;
 }
+
+namespace {
+void copyPacked(int64_t rank, void *ptr, int64_t handle, int64_t offset,
+                int64_t width, bool toShared) {
+  auto found = allocations.find(handle);
+  if (found == allocations.end() || width < 0 || width > UINT32_MAX ||
+      !sodap::copyMemRefF32Packed(rank, ptr, reinterpret_cast<void *>(handle),
+                                 found->second, offset, toShared, unsigned(width)))
+    std::cout << "esp: invalid packed f32 shared-memory copy" << std::endl;
+}
+}
+extern "C" void esp_copy_to_shared_f32_packed(int64_t rank, void *ptr,
+    int64_t handle, int64_t offset, int64_t width) {
+  copyPacked(rank, ptr, handle, offset, width, true);
+}
+extern "C" void esp_copy_from_shared_f32_packed(int64_t handle, int64_t offset,
+    int64_t rank, void *ptr, int64_t width) {
+  copyPacked(rank, ptr, handle, offset, width, false);
+}

@@ -1,3 +1,4 @@
+#include "sodap/ExecutionEngine/DmaTransport.h"
 //===- ESPPasses.cpp - Replace linalg.batch_matmul with ESP calls -*- C++-*-==//
 //
 // This file is licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -12,6 +13,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 
 #include "sodap/Dialect/Dataflow/Dataflow.h"
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
@@ -504,6 +507,7 @@ struct EspCalls {
   Location loc;
   unsigned dmaWordStride;
   bool profile;
+  unsigned dmaDataWidth = 0;
 
   /// Declares what the calls below use.
   void declare(ModuleOp module) {
@@ -515,7 +519,7 @@ struct EspCalls {
     getOrInsertFunc(module, builder, kEspFreeShared, {}, {i64Ty});
     SmallVector<Type> inTypes{urMemRefF32, i64Ty, i64Ty};
     SmallVector<Type> outTypes{i64Ty, i64Ty, urMemRefF32};
-    if (dmaWordStride != 1) {
+    if (dmaWordStride != 1 || dmaDataWidth) {
       inTypes.push_back(i64Ty);
       outTypes.push_back(i64Ty);
     }
@@ -530,10 +534,12 @@ struct EspCalls {
   }
 
   StringRef copyInName() const {
+    if (dmaDataWidth) return "esp_copy_to_shared_f32_packed";
     return dmaWordStride == 1 ? kEspCopyToSharedF32
                               : "esp_copy_to_shared_f32_strided";
   }
   StringRef copyOutName() const {
+    if (dmaDataWidth) return "esp_copy_from_shared_f32_packed";
     return dmaWordStride == 1 ? kEspCopyFromSharedF32
                               : "esp_copy_from_shared_f32_strided";
   }
@@ -565,17 +571,17 @@ struct EspCalls {
   void copyIn(Value value, Value handle, int64_t offset) {
     Value cast = builder.create<memref::CastOp>(
         loc, UnrankedMemRefType::get(builder.getF32Type(), 0), value);
-    SmallVector<Value> args{cast, handle, constant(offset)};
-    if (dmaWordStride != 1)
-      args.push_back(constant(dmaWordStride));
+    SmallVector<Value> args{cast, handle, constant(dmaDataWidth ? offset * 4 : offset)};
+    if (dmaWordStride != 1 || dmaDataWidth)
+      args.push_back(constant(dmaDataWidth ? dmaDataWidth : dmaWordStride));
     builder.create<func::CallOp>(loc, copyInName(), TypeRange{}, args);
   }
   void copyOut(Value handle, int64_t offset, Value value) {
     Value cast = builder.create<memref::CastOp>(
         loc, UnrankedMemRefType::get(builder.getF32Type(), 0), value);
-    SmallVector<Value> args{handle, constant(offset), cast};
-    if (dmaWordStride != 1)
-      args.push_back(constant(dmaWordStride));
+    SmallVector<Value> args{handle, constant(dmaDataWidth ? offset * 4 : offset), cast};
+    if (dmaWordStride != 1 || dmaDataWidth)
+      args.push_back(constant(dmaDataWidth ? dmaDataWidth : dmaWordStride));
     builder.create<func::CallOp>(loc, copyOutName(), TypeRange{}, args);
   }
   void run() {
@@ -589,13 +595,19 @@ struct EspCalls {
 /// The words of an f32 memref with a static shape and the identity layout in
 /// shared memory, or failure.
 static FailureOr<int64_t> sharedWords(Value value, Location loc,
-                                      unsigned dmaWordStride) {
+                                      unsigned dmaWordStride, unsigned dmaDataWidth = 0) {
   auto type = dyn_cast<MemRefType>(value.getType());
   if (!type || !type.getElementType().isF32() || !type.hasStaticShape() ||
       !type.getLayout().isIdentity())
     return emitError(loc, "expected f32 memrefs with static shapes and the "
                           "identity layout, got ")
            << value.getType();
+  if (dmaDataWidth) {
+    uint64_t words;
+    if (!::sodap::DmaTransport{dmaDataWidth}.tensorWords(type.getShape().data(),type.getRank(),words))
+      return emitError(loc,"invalid packed DMA layout/width or address range");
+    return int64_t(words);
+  }
   return type.getNumElements() * dmaWordStride;
 }
 
@@ -625,7 +637,7 @@ public:
     int64_t words = 0;
     for (BlockArgument arg : function.getArguments()) {
       FailureOr<int64_t> size =
-          sharedWords(arg, function.getLoc(), dmaWordStride);
+          sharedWords(arg, function.getLoc(), dmaWordStride, dmaDataWidth);
       if (failed(size))
         return signalPassFailure();
       offsets.push_back(words);
@@ -645,7 +657,7 @@ public:
     while (!entry.empty())
       entry.back().erase();
     OpBuilder builder = OpBuilder::atBlockEnd(&entry);
-    EspCalls esp{builder, function.getLoc(), dmaWordStride, profile};
+    EspCalls esp{builder, function.getLoc(), dmaWordStride, profile, dmaDataWidth};
     esp.declare(module);
     Value handle = esp.alloc(words);
     esp.mark(kEspProfBegin, kProfPack);
@@ -688,22 +700,49 @@ static void forwardOutParams(dataflow::LaunchOp launch) {
   }
 }
 
-/// The launches of a tile from sodap-join-multiple-tiles, matmul's for now:
+/// C of a GEMM launch when it holds nothing: the allocation of a
+/// tensor.empty (no C, beta = 0), which only the launch touches.
+static bool isEmptyC(Value c, dataflow::LaunchOp launch) {
+  auto alloc = c.getDefiningOp<memref::AllocOp>();
+  return alloc && llvm::all_of(alloc->getUsers(), [&](Operation *user) {
+           return user == launch.getOperation() || isa<memref::DeallocOp>(user);
+         });
+}
+
+/// The launches of a tile from sodap-join-multiple-tiles, GEMM's for now:
 /// William's reusable-GEMM calls (ReusableGemmABI.h). One arena for the
 /// whole host, its header then each buffer a launch uses; the host's
 /// arguments a launch reads are copied in before the first launch, those it
 /// writes copied out after the last; a buffer between two launches stays in
-/// the arena. Each launch passes its shapes, addresses and row strides.
+/// the arena. Each launch passes its shapes, addresses, row strides, alpha
+/// and beta. The accelerator writes D over C: C, unless empty, is copied
+/// into D's place, with the other copies in when it is a host argument (no
+/// launch but its own writes D), else just before its launch.
 static LogicalResult lowerInvocations(ModuleOp module,
-                                      MutableArrayRef<dataflow::LaunchOp> launches) {
+                                      MutableArrayRef<dataflow::LaunchOp> launches, unsigned width,
+                                      StringRef report) {
+  bool sourceSemantics = launches.front().getInputs().size() == 9;
+  if (sourceSemantics && !width)
+    return module.emitError("source GEMM semantics require packed DMA (descriptor v3)");
   SetVector<Value> buffers, read, written;
   for (dataflow::LaunchOp launch : launches) {
-    // A matmul: (A, B, M, K, N) outs(C).
-    if (launch.getInputs().size() != 5 || launch.getOuts().size() != 1)
-      return launch.emitOpError("expected a matmul launch: (A, B, M, K, N) "
-                                "outs(C)");
+    // A GEMM: (A, B, C, M, K, N, alpha, beta) outs(D).
+    if (launch.getInputs().size() != (sourceSemantics ? 9 : 8) || launch.getOuts().size() != 1 ||
+        !launch.getInputs()[6].getType().isF32() ||
+        !launch.getInputs()[7].getType().isF32() ||
+        (sourceSemantics && !launch.getInputs()[8].getType().isF32()))
+      return launch.emitOpError("expected a gemm launch: (A, B, C, M, K, N, "
+                                "alpha, beta) outs(D)");
+    Value c = launch.getInputs()[2], d = launch.getOuts()[0];
+    if (c.getType() != d.getType())
+      return launch.emitOpError("expected C of D's type");
+    // ponytail: C from another launch would need a copy inside the arena.
+    if (llvm::any_of(launches, [&](dataflow::LaunchOp other) {
+          return llvm::is_contained(other.getOuts(), c);
+        }))
+      return launch.emitOpError("expected C from the host, not from a launch");
     SmallVector<Value> matrices{launch.getInputs()[0], launch.getInputs()[1],
-                                launch.getOuts()[0]};
+                                d};
     for (auto [i, m] : llvm::enumerate(matrices)) {
       auto type = dyn_cast<MemRefType>(m.getType());
       if (!type || type.getRank() != 2 || !type.hasStaticShape() ||
@@ -728,11 +767,77 @@ static LogicalResult lowerInvocations(ModuleOp module,
   int64_t bytes = GEMM_HEADER_BYTES;
   for (Value buffer : buffers) {
     offset[buffer] = bytes;
-    bytes += cast<MemRefType>(buffer.getType()).getNumElements() *
-             GEMM_SLOT_BYTES;
+    auto type = cast<MemRefType>(buffer.getType());
+    uint64_t words = 0;
+    if (width) {
+      if (!::sodap::DmaTransport{width}.tensorWords(type.getShape().data(), type.getRank(), words) ||
+          words > (uint64_t(1) << 28))
+        return module.emitError("invalid packed GEMM layout or address overflow");
+      bytes += words * 4;
+    } else bytes += type.getNumElements() * GEMM_SLOT_BYTES;
   }
   if (bytes > (int64_t(1) << 30))
     return module.emitError("GEMM arena exceeds the one-GiB interface limit");
+
+  if (!report.empty()) {
+    DenseMap<Value, int64_t> ids;
+    llvm::json::Array tensors, calls, initializations, outputs;
+    for (auto [id, buffer] : llvm::enumerate(buffers)) {
+      ids[buffer] = id;
+      llvm::json::Array shape;
+      for (int64_t d : cast<MemRefType>(buffer.getType()).getShape()) shape.push_back(d);
+      tensors.push_back(llvm::json::Object{{"id",int64_t(id)},
+          {"shape",std::move(shape)}, {"offset_bytes",offset[buffer]}});
+    }
+    auto binding = [&](Value value, int64_t id, llvm::json::Array &into) -> LogicalResult {
+      auto arg = dyn_cast<BlockArgument>(value);
+      if (!arg) return module.emitError("invocation manifest needs host-argument bindings");
+      into.push_back(llvm::json::Object{{"buffer",id}, {"argument",int64_t(arg.getArgNumber())}});
+      return success();
+    };
+    auto scalar = [&](Value value, StringRef name, llvm::json::Object &call) -> LogicalResult {
+      if (auto c = value.getDefiningOp<arith::ConstantOp>()) {
+        if (auto f = dyn_cast<FloatAttr>(c.getValue())) {
+          call[(name + "_constant").str()] = f.getValueAsDouble();
+          return success();
+        }
+      }
+      if (auto load = value.getDefiningOp<memref::LoadOp>()) {
+        Value source = load.getMemRef();
+        while (auto cast = source.getDefiningOp<memref::CastOp>()) source = cast.getSource();
+        if (auto arg = dyn_cast<BlockArgument>(source)) {
+          call[(name + "_argument").str()] = int64_t(arg.getArgNumber());
+          return success();
+        }
+      }
+      return module.emitError("invocation manifest requires scalar constants or host scalar inputs: ") << name;
+    };
+    for (Value arg : read)
+      if (failed(binding(arg,ids[arg],initializations))) return failure();
+    for (dataflow::LaunchOp launch : launches) {
+      auto in = launch.getInputs();
+      Value d = launch.getOuts()[0];
+      auto a = cast<MemRefType>(in[0].getType()), b = cast<MemRefType>(in[1].getType());
+      llvm::json::Object call{{"a",ids[in[0]]}, {"b",ids[in[1]]}, {"c",ids[d]},
+          {"m",a.getDimSize(0)}, {"n",b.getDimSize(1)}, {"k",a.getDimSize(1)},
+          {"alpha_constant",1.0}, {"beta_constant",0.0}};
+      if (failed(scalar(in[6],"alpha",call)) || failed(scalar(in[7],"beta",call))) return failure();
+      if (sourceSemantics && failed(scalar(in[8],"has_c",call))) return failure();
+      if (!isEmptyC(in[2],launch) && failed(binding(in[2],ids[d],initializations))) return failure();
+      calls.push_back(std::move(call));
+    }
+    for (Value arg : written)
+      if (failed(binding(arg,ids[arg],outputs))) return failure();
+    std::error_code error;
+    llvm::raw_fd_ostream out(report,error,llvm::sys::fs::OF_Text);
+    if (error) return module.emitError("cannot write invocation manifest: ") << error.message();
+    out << llvm::json::Value(llvm::json::Object{{"schema_version",1},
+        {"kernel","forward_kernel"}, {"instance",0}, {"dma_data_width",width},
+        {"descriptor_version",int64_t(sourceSemantics ? GEMM_SOURCE_VERSION : (width ? GEMM_PACKED_VERSION : GEMM_VERSION))},
+        {"fp_semantics",sourceSemantics ? "source_expression" : "blas_beta_zero"},
+        {"arena_bytes",bytes}, {"buffers",std::move(tensors)}, {"invocations",std::move(calls)},
+        {"initializations",std::move(initializations)}, {"outputs",std::move(outputs)}}) << '\n';
+  }
 
   OpBuilder b(module.getContext());
   Location loc = launches.front()->getLoc();
@@ -746,57 +851,75 @@ static LogicalResult lowerInvocations(ModuleOp module,
     b.create<func::FuncOp>(loc, name, b.getFunctionType(inputs, results))
         .setPrivate();
   };
-  declare("esp_gemm_open", {i64, i64}, {i64});
+  StringRef openName = width ? "esp_gemm_open_packed" : "esp_gemm_open";
+  declare(openName, SmallVector<Type>(width ? 3 : 2, i64), {i64});
   declare("esp_gemm_close", {i64}, {});
   declare("esp_gemm_copy_in", {i64, i64, unranked}, {});
   declare("esp_gemm_copy_out", {i64, i64, unranked}, {});
   SmallVector<Type> invokeTypes(10, i64);
   invokeTypes.append({f32, f32});
-  declare("esp_gemm_invoke", invokeTypes, {});
+  if (sourceSemantics) invokeTypes.push_back(f32);
+  StringRef invokeName = sourceSemantics ? "esp_gemm_invoke_source" : "esp_gemm_invoke";
+  declare(invokeName, invokeTypes, {});
   auto constant = [&](int64_t n) -> Value {
     return b.create<arith::ConstantIntOp>(loc, n, 64);
   };
   auto i64Of = [&](Value index) -> Value {
     return b.create<arith::IndexCastOp>(loc, i64, index);
   };
-  auto copy = [&](StringRef name, Value context, Value buffer) {
+  auto copy = [&](StringRef name, Value context, Value buffer,
+                  std::optional<int64_t> at = std::nullopt) {
     b.create<func::CallOp>(
         loc, name, TypeRange{},
-        ValueRange{context, constant(offset[buffer]),
+        ValueRange{context, constant(at ? *at : offset[buffer]),
                    b.create<memref::CastOp>(loc, unranked, buffer)});
   };
 
   b.setInsertionPoint(launches.front().getOperation());
-  Value context = b.create<func::CallOp>(
-                       loc, "esp_gemm_open", TypeRange{i64},
-                       ValueRange{constant(bytes), constant(0)})
-                      .getResult(0);
+  SmallVector<Value> openArgs{constant(bytes), constant(0)};
+  if (width) openArgs.push_back(constant(width));
+  Value context = b.create<func::CallOp>(loc, openName, TypeRange{i64}, openArgs).getResult(0);
   for (Value arg : read)
     copy("esp_gemm_copy_in", context, arg);
-  Value one = b.create<arith::ConstantFloatOp>(loc, APFloat(1.0f),
-                                               cast<FloatType>(f32));
-  Value zero = b.create<arith::ConstantFloatOp>(loc, APFloat(0.0f),
-                                                cast<FloatType>(f32));
+  for (dataflow::LaunchOp launch : launches)
+    if (Value c = launch.getInputs()[2]; isa<BlockArgument>(c))
+      copy("esp_gemm_copy_in", context, c, offset[launch.getOuts()[0]]);
   for (dataflow::LaunchOp launch : launches) {
     b.setInsertionPoint(launch);
     ValueRange in = launch.getInputs();
     Value a = in[0], rhs = in[1], c = launch.getOuts()[0];
+    if (!isa<BlockArgument>(in[2]) && !isEmptyC(in[2], launch))
+      copy("esp_gemm_copy_in", context, in[2], offset[c]);
     auto ld = [&](Value m) {
-      return constant(cast<MemRefType>(m.getType()).getDimSize(1) *
-                      GEMM_SLOT_BYTES);
+      int64_t cols = cast<MemRefType>(m.getType()).getDimSize(1);
+      uint64_t words = 0;
+      if (width) {
+        (void)::sodap::DmaTransport{width}.rowWords(cols, words);
+        return constant(words * 4);
+      }
+      return constant(cols * GEMM_SLOT_BYTES);
     };
-    b.create<func::CallOp>(
-        launch.getLoc(), "esp_gemm_invoke", TypeRange{},
-        ValueRange{context, constant(offset[a]), constant(offset[rhs]),
-                   constant(offset[c]), i64Of(in[2]), i64Of(in[4]),
-                   i64Of(in[3]), ld(a), ld(rhs), ld(c), one, zero});
+    SmallVector<Value> invokeArgs{context, constant(offset[a]), constant(offset[rhs]),
+                   constant(offset[c]), i64Of(in[3]), i64Of(in[5]),
+                   i64Of(in[4]), ld(a), ld(rhs), ld(c), in[6], in[7]};
+    if (sourceSemantics) invokeArgs.push_back(in[8]);
+    b.create<func::CallOp>(launch.getLoc(), invokeName, TypeRange{}, invokeArgs);
   }
   b.setInsertionPointAfter(launches.back().getOperation());
   for (Value arg : written)
     copy("esp_gemm_copy_out", context, arg);
   b.create<func::CallOp>(loc, "esp_gemm_close", TypeRange{}, context);
+  SmallVector<Value> emptyCs;
+  for (dataflow::LaunchOp launch : launches)
+    if (isEmptyC(launch.getInputs()[2], launch))
+      emptyCs.push_back(launch.getInputs()[2]);
   for (dataflow::LaunchOp launch : launches)
     launch.erase();
+  for (Value buffer : emptyCs) {
+    for (Operation *user : llvm::make_early_inc_range(buffer.getUsers()))
+      user->erase();
+    buffer.getDefiningOp()->erase();
+  }
   for (Value buffer : buffers)
     if (auto alloc = buffer.getDefiningOp<memref::AllocOp>()) {
       for (Operation *user : llvm::make_early_inc_range(alloc->getUsers()))
@@ -838,12 +961,24 @@ public:
         }
         forwardOutParams(launch);
       }
-      if (failed(lowerInvocations(module, launches)))
+      if (failed(lowerInvocations(module, launches, dmaDataWidth, invocationsFile)))
         return signalPassFailure();
       tiles.front().erase();
       host.setSymName(this->host);
       return;
     }
+    auto argumentOrder=host->getAttrOfType<DenseI64ArrayAttr>("sodap.kernel_argument_order");
+    if (!argumentOrderFile.empty()) {
+      if (!argumentOrder || argumentOrder.size()!=host.getNumArguments()) {
+        host.emitError("missing or inconsistent whole-kernel argument order from outline pass");
+        return signalPassFailure();
+      }
+      std::error_code ec;
+      llvm::raw_fd_ostream out(argumentOrderFile,ec);
+      if (ec) { host.emitError(ec.message()); return signalPassFailure(); }
+      llvm::interleave(argumentOrder.asArrayRef(),out," "); out << "\n";
+    }
+    host->removeAttr("sodap.kernel_argument_order");
     for (dataflow::LaunchOp launch : launches) {
       if (launch->getParentOfType<func::FuncOp>() != host ||
           launch->getBlock() != launches.front()->getBlock()) {
@@ -868,7 +1003,7 @@ public:
         return signalPassFailure();
       }
       for (Value operand : launch->getOperands())
-        if (failed(sharedWords(operand, launch.getLoc(), dmaWordStride)))
+        if (failed(sharedWords(operand, launch.getLoc(), dmaWordStride, dmaDataWidth)))
           return signalPassFailure();
       forwardOutParams(launch);
     }
@@ -879,7 +1014,7 @@ public:
     int64_t words = 0;
     for (Value operand : launches.front()->getOperands()) {
       FailureOr<int64_t> size =
-          sharedWords(operand, launches.front().getLoc(), dmaWordStride);
+          sharedWords(operand, launches.front().getLoc(), dmaWordStride, dmaDataWidth);
       if (failed(size))
         return signalPassFailure();
       offsets.push_back(words);
@@ -888,7 +1023,7 @@ public:
 
     OpBuilder builder(module.getContext());
     builder.setInsertionPoint(launches.front());
-    EspCalls esp{builder, launches.front().getLoc(), dmaWordStride, profile};
+    EspCalls esp{builder, launches.front().getLoc(), dmaWordStride, profile, dmaDataWidth};
     esp.declare(module);
     Value handle = esp.alloc(words);
     for (dataflow::LaunchOp launch : launches) {
@@ -1003,6 +1138,7 @@ public:
 class OrderKernelArguments
     : public impl::OrderKernelArgumentsBase<OrderKernelArguments> {
 public:
+  using Base::Base;
   void runOnOperation() override {
     ModuleOp module = getOperation();
     WalkResult result = module.walk([&](Operation *launch) {
@@ -1088,6 +1224,13 @@ private:
       for (unsigned i : order)
         permuted.push_back(attrs[i]);
       kernel->setAttr("arg_attrs", ArrayAttr::get(&getContext(), permuted));
+    }
+    if (!argumentOrderFile.empty()) {
+      std::error_code ec;
+      llvm::raw_fd_ostream out(argumentOrderFile,ec);
+      if (ec) return launch->emitError(ec.message());
+      llvm::interleave(order,out,[&](unsigned i) { out << numbers[i]; }," ");
+      out << "\n";
     }
     return success();
   }
