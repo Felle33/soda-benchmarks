@@ -40,10 +40,20 @@ GEMM launches, respectively, on the same engine.
 
 `esp_op_gemm_full_source` accepts coefficients and explicit C presence. Scalar
 model inputs are read on each run; constants remain compiler-extracted data.
-The GEMM engine writes its result in place into its C buffer. The host therefore
-copies source C into a distinct writable result buffer before the launch; it
-never overwrites a persistent parameter, model input or live SSA value.
+The GEMM engine writes its result in place into its C buffer. The host consumes
+C's arena buffer when its last read is this invocation and its packed row layout
+matches the result. Model inputs are copied into the arena on every run, so their
+private copies can be consumed while the caller's inputs remain unchanged.
+Persistent parameters, later readers and C that aliases another GEMM operand
+require a distinct writable result. Alias chains extend the storage lifetime.
 `esp_op_gemm_source` remains the pure-product entry point.
+
+Reshapes preserving element count and last dimension are storage aliases;
+reshapes changing the packed row layout retain a repack. A stable topological
+partition moves CPU operations depending only on inputs/parameters before the
+first accelerator launch, including protected C preparation when independent of
+accelerator results. Allocation and lifetime analysis use this execution order.
+These are host transformations; they do not change operator hardware or fusion.
 
 Both entry points use the existing packed source-semantics GEMM descriptor v3.
 Field 14 contains the FP32 C-presence flag, independent of beta. Explicit `0*C`
@@ -84,6 +94,12 @@ Input packing, C copies before the first invocation, final unpacking, setup,
 UART and numerical validation are outside this interval and must be reported
 separately. Copies between launches are inside it. The whole `forward_run`
 function is therefore not the Experiment 2 timing boundary.
+
+`SODAP_OP_PROFILE` enables separate allocation, packing and unpacking counters.
+Allocation covers context/page-table setup, tensor-layout metadata and teardown;
+packing covers parameter/input copies and required repacks; unpacking covers
+the final output copy. These accumulated categories can overlap the primary
+interval if a required repack occurs between launches. They do not redefine it.
 
 Qualification requires original and added compiler tests; MINI/LARGE native
 GEMM/2MM/3MM; odd dimensions; explicit NaN-C; descriptor byte comparisons;

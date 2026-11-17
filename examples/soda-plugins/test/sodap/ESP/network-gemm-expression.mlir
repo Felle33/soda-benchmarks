@@ -4,7 +4,7 @@
 // RUN: soda-opt %t.dir/host.mlir --lower-all-to-llvm=use-bare-ptr-memref-call-conv --convert-func-to-llvm --reconcile-unrealized-casts | mlir-translate --mlir-to-llvmir -o %t.dir/host.ll
 // RUN: /usr/bin/clang-19 -shared -fPIC -O2 -ffp-contract=off %t.dir/host.ll %S/../../../lib/sodap/ExecutionEngine/ReusableOperatorRuntime.cpp -I %S/../../../include -o %t.dir/native.so
 // RUN: python3 %S/Inputs/check_unified_host.py %t.dir expression
-// CHECK: call @esp_op_repack
+// CHECK-NOT: call @esp_op_repack
 // CHECK: call @esp_op_scalar
 // CHECK: call @esp_op_scalar
 // CHECK: call @esp_op_gemm_full_source

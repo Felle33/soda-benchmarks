@@ -60,7 +60,10 @@ launches and system-level policy optimization are outside this change.
 types/geometry, fuses single-consumer conv/add ReLU, externalizes FP32 constants
 to `parameters.bin`, and allocates packed DRAM buffers using last uses and a
 best-fit free list. Residual values survive their final consumer. Parameters
-and inputs remain persistent; reshapes repack when padding changes layout.
+remain immutable; model inputs are refreshed in private arena storage each run.
+Reshapes preserving element count and last dimension alias storage; row-layout
+changes repack. Alias-aware last uses protect live values. Input-only CPU work
+is hoisted before accelerator calls without changing the network timing region.
 It emits `forward_init`, `forward_run`, `forward_close` and `network.json`.
 The manifest also identifies model input buffers, parameter bindings, explicit
 copies and GEMM coefficient sources, so external baseline hosts can consume
@@ -75,7 +78,8 @@ consumers are overwritten. Unsupported broadcasting/batches are not newly
 advertised; supported non-fused cases retain separate launches.
 
 ResNet18/34 consequently have 29/53 accelerator calls instead of 30/54.
-SqueezeNet1.1 retains 26 calls and byte-identical host LLVM. Device manifests
+SqueezeNet1.1 retains 26 calls; the host copy optimization changes its host LLVM
+while retaining byte-identical accelerator LLVM. Device manifests
 contain only families actually used; GEMM-only apps support a single-device
 runtime build without unused convolution/addition devices.
 

@@ -71,6 +71,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   DenseSet<Operation *> fused;
   DenseMap<Operation *, bool> activations;
   DenseMap<Operation *, Gemm> gemms;
+  DenseSet<Operation *> consumeC, prepareC;
   DenseMap<Value, unsigned> lastUse;
   SmallVector<std::pair<int64_t, int64_t>> free;
   int64_t cursor = 0, parameters = 0;
@@ -103,7 +104,11 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
 
   Value storageValue(Value v) {
     auto it = aliases.find(v);
-    return it == aliases.end() ? v : it->second;
+    return it == aliases.end() ? v : storageValue(it->second);
+  }
+  bool sameLayout(Value a, Value b) {
+    auto x=shape(a),y=shape(b);
+    return product(x)==product(y) && (x.empty()?1:x.back())==(y.empty()?1:y.back());
   }
   Buffer &buffer(Value v) { return buffers.find(storageValue(v))->second; }
   LogicalResult type(Value v) {
@@ -324,17 +329,62 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
         aliases[op->getResult(0)]=x; fused.insert(op); activations[producer]=true;
       }
     }
+    // A view of the same packed rows owns no storage. Resolve transitively so
+    // every consumer (including return) extends the underlying allocation.
+    for(auto *op:operations)
+      if(!fused.contains(op) && !gemms.count(op) && isa<tosa::ReshapeOp>(op) &&
+          sameLayout(op->getOperand(0),op->getResult(0))) {
+        aliases[op->getResult(0)]=op->getOperand(0);fused.insert(op);
+      }
+    // Stable topological partition: CPU work with no accelerator dependency
+    // runs after input packing and before the first launch. Compute lifetimes
+    // on this schedule, not on the original textual order.
+    DenseSet<Value> inputOnly,immutable;
+    for(auto arg:source.getArguments())inputOnly.insert(arg);
+    for(auto c:weights) {inputOnly.insert(c.getResult());immutable.insert(c.getResult());}
+    SmallVector<Operation *> early,dependent;
+    for(auto *op:operations) {
+      if(fused.contains(op))continue;
+      bool ready=operatorFamily(op).empty() && llvm::all_of(operands(op),
+          [&](Value v){return inputOnly.contains(storageValue(v));});
+      if(ready) {early.push_back(op);inputOnly.insert(storageValue(op->getResult(0)));}
+      else dependent.push_back(op);
+    }
+    operations=early;operations.append(dependent);
     // Last uses come from the MLIR graph, including return and residual branches.
     for(auto [i,op]:llvm::enumerate(operations))
       if(!fused.contains(op))
         for(Value v:operands(op)) lastUse[storageValue(v)]=i;
     lastUse[storageValue(ret.getOperand(0))]=operations.size();
+    DenseSet<Operation *> inputOnlyC;
+    for(auto *op:operations) {
+      auto it=gemms.find(op);
+      if(it!=gemms.end() && it->second.c && inputOnly.contains(storageValue(it->second.c)))inputOnlyC.insert(op);
+    }
+    // Transfer ownership only after C's last read. Model-input arena copies are
+    // refreshed on every forward_run; parameter storage is never consumed.
+    // A/B (or a scalar) sharing C is still read during the launch and cannot be
+    // overwritten safely. Layout-changing C also needs its own packed result.
+    for(auto [i,op]:llvm::enumerate(operations)) {
+      auto it=gemms.find(op);if(it==gemms.end() || !it->second.c)continue;
+      auto &g=it->second;Value c=storageValue(g.c),out=op->getResult(0);
+      bool otherRead=false;
+      for(Value v:SmallVector<Value>{g.matmul.getA(),g.matmul.getB(),g.alpha,g.beta})
+        if(v && storageValue(v)==c)otherRead=true;
+      if(!immutable.contains(c) && lastUse.lookup(c)==i && !otherRead && sameLayout(c,out)) {
+        consumeC.insert(op);aliases[out]=c;
+        lastUse[c]=std::max(lastUse.lookup(c),lastUse.lookup(out));
+      } else if(inputOnlyC.contains(op))prepareC.insert(op);
+    }
     DenseSet<Value> persistent;
     for(auto c:weights) {
       allocate(c.getResult(),true); auto &b=buffer(c.getResult());
       b.parameter=parameters; parameters+=b.elements; persistent.insert(c.getResult());
     }
     for(auto arg:source.getArguments()) {allocate(arg,true);persistent.insert(arg);}
+    // Input-only C preparation can be hoisted too. Reserve its destination
+    // before the schedule, so no intervening operation can reuse that storage.
+    for(auto *op:operations)if(prepareC.contains(op))allocate(op->getResult(0),false);
     SmallVector<std::pair<std::string,SmallVector<int64_t>>> calls;
     SmallVector<Operation *> scheduled;
     for(auto [i,op]:llvm::enumerate(operations)) {
@@ -343,7 +393,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       // constants are allowed only as transpose permutations).
       for(Value v:operands(op))
         if(!buffers.count(storageValue(v))) {op->emitError("unsupported data operand");return signalPassFailure();}
-      allocate(op->getResult(0),false);
+      if(!consumeC.contains(op) && !prepareC.contains(op))allocate(op->getResult(0),false);
       auto a=arguments(op); if(failed(a)) return signalPassFailure();
       auto kind=operatorFamily(op);
       auto *bound=binding(op);
@@ -375,7 +425,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       calls.push_back(std::move(*a)); scheduled.push_back(op);
       SmallVector<Value> dead;
       for(auto &[v,b]:buffers)
-        if(!persistent.contains(v) && lastUse.lookup(v)==i && v!=op->getResult(0)) dead.push_back(v);
+        if(!persistent.contains(v) && lastUse.lookup(v)==i && v!=storageValue(op->getResult(0))) dead.push_back(v);
       for(Value v:dead) release(buffers[v]);
       // Entries remain for manifest provenance; prevent a second release.
       for(Value v:dead) lastUse[v]=UINT_MAX;
@@ -421,7 +471,22 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
     inputs.push_back(mem(buffer(ret.getOperand(0)).elements));
     auto run=make("forward_run",inputs,{}); ctx=run.getArgument(0);
     for(auto [i,arg]:llvm::enumerate(source.getArguments())) {reg(ctx,buffer(arg));copy(ctx,buffer(arg),run.getArgument(i+1),true);}
+    auto copyC=[&](Operation *op) {
+      auto input=buffer(gemms.find(op)->second.c),out=buffer(op->getResult(0));
+      reg(ctx,out);
+      invoke("esp_op_repack",ctx,{input.offset,out.offset,out.elements});
+      records.push_back(llvm::json::Object{{"index",int64_t(records.size())},
+        {"operator","repack"},{"execution","cpu"},{"runtime","repack"},
+        {"arguments",jsonInts({input.offset,out.offset,out.elements})},
+        {"inputs",llvm::json::Array{input.id}},{"output",out.id},
+        {"reason","preserve GEMM C before in-place execution"}});
+    };
+    bool prepared=false;
     for(auto [i,op]:llvm::enumerate(scheduled)) {
+      if(!prepared && !operatorFamily(op).empty()) {
+        for(auto *candidate:scheduled)if(prepareC.contains(candidate))copyC(candidate);
+        prepared=true;
+      }
       auto &entry=calls[i]; Buffer out=buffer(op->getResult(0)); reg(ctx,out);
       auto f=operatorFamily(op); bool hw=!f.empty();
       auto *bound=binding(op);
@@ -431,17 +496,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       if(auto attr=bound->getAttrOfType<StringAttr>("sodap.implementation"))implementation=attr.getValue().str();
       if(hw)invoke("esp_op_select_device",ctx,{f=="conv"?0:f=="add"?1:2,instance});
       auto g=gemms.find(op);
-      if(g!=gemms.end() && g->second.c) {
-        auto input=buffer(g->second.c);
-        // The engine overwrites C. Never overwrite parameters, model inputs,
-        // or SSA values retained by another consumer. Refresh on every run.
-        invoke("esp_op_repack",ctx,{input.offset,out.offset,out.elements});
-        records.push_back(llvm::json::Object{{"index",int64_t(records.size())},
-          {"operator","repack"},{"execution","cpu"},{"runtime","repack"},
-          {"arguments",jsonInts({input.offset,out.offset,out.elements})},
-          {"inputs",llvm::json::Array{input.id}},{"output",out.id},
-          {"reason","preserve GEMM C before in-place execution"}});
-      }
+      if(g!=gemms.end() && g->second.c && !consumeC.contains(op) && !prepareC.contains(op))copyC(op);
       func::CallOp callOp;
       if(entry.first=="gemm_full_source") {
         SmallVector<Value> values{ctx};

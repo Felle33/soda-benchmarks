@@ -8,6 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#ifdef SODAP_OP_PROFILE
+#include "sodap/ExecutionEngine/esp_prof.h"
+#endif
 
 #if defined(SODAP_OP_CPU_ONLY) && (defined(SODAP_OP_EXTERNAL_EXECUTOR) || defined(SODAP_OP_VERIFY_RTL))
 #error CPU-only execution cannot be combined with an RTL executor
@@ -25,6 +28,15 @@ extern "C" {
 #endif
 
 namespace {
+struct ProfileRegion {
+#ifdef SODAP_OP_PROFILE
+  unsigned id;
+  explicit ProfileRegion(unsigned id):id(id) {esp_prof_begin(id);}
+  ~ProfileRegion() {esp_prof_end(id);}
+#else
+  explicit ProfileRegion(unsigned) {}
+#endif
+};
 #ifdef SODAP_OP_QUIET
 #define OP_LOG(...) ((void)0)
 #else
@@ -320,6 +332,7 @@ void copy(int64_t handle, int64_t offset, int64_t rank, void *desc, bool in) {
 
 static int64_t openContext(int64_t bytes,int64_t instance,unsigned width,
     bool separate=false,int64_t conv=0,int64_t add=0,int64_t gemm=0) {
+  ProfileRegion allocation(5); // ESP_PROF_ALLOC: context, arena and page table.
   if(width && !sodap::DmaTransport{width}.valid())fail("invalid DMA width");
 #ifdef SODAP_OP_ESP_HW
   if(width && width!=64)fail("ESP backend supports packed DMA64 only");
@@ -453,6 +466,7 @@ extern "C" void esp_op_tensor(int64_t handle,int64_t offset,int64_t elements,int
   TensorLayout *entry=ctx.layouts;
   while(entry && entry->offset!=offset)entry=entry->next;
   if(!entry) {
+    ProfileRegion allocation(5);
     entry=static_cast<TensorLayout *>(allocate(sizeof(TensorLayout)));
     entry->next=ctx.layouts;ctx.layouts=entry;
   }
@@ -460,6 +474,7 @@ extern "C" void esp_op_tensor(int64_t handle,int64_t offset,int64_t elements,int
   entry->rowWords=rowWords;entry->bytes=bytes;
 }
 extern "C" void esp_op_repack(int64_t handle,int64_t a,int64_t c,int64_t elements) {
+  ProfileRegion packing(1); // ESP_PROF_PACK: required packed-layout preparation.
   Context &ctx=lookup(handle);
   auto ae=check(ctx,a,product({elements})),ce=check(ctx,c,product({elements}));
   disjoint(a,ae,c,ce);
@@ -483,6 +498,7 @@ extern "C" void esp_op_concat(int64_t handle,int64_t a,int64_t b,int64_t c,
 }
 
 extern "C" void esp_op_close(int64_t handle) {
+  ProfileRegion allocation(5);
   Context &ctx = lookup(handle);
   if (ctx.running) fail("cannot close a running socket");
   OP_LOG("%s close socket=%u invocations=%u\n", executionPrefix, ctx.instance, ctx.invocations);
@@ -503,8 +519,8 @@ extern "C" void esp_op_close(int64_t handle) {
   if (!live) cpuArenaUsed = 0;
 #endif
 }
-extern "C" void esp_op_copy_in(int64_t h, int64_t o, int64_t r, void *d) { copy(h,o,r,d,true); }
-extern "C" void esp_op_copy_out(int64_t h, int64_t o, int64_t r, void *d) { copy(h,o,r,d,false); }
+extern "C" void esp_op_copy_in(int64_t h, int64_t o, int64_t r, void *d) { ProfileRegion packing(1);copy(h,o,r,d,true); }
+extern "C" void esp_op_copy_out(int64_t h, int64_t o, int64_t r, void *d) { ProfileRegion unpacking(3);copy(h,o,r,d,false); }
 
 extern "C" void esp_op_conv(int64_t handle, int64_t a, int64_t w, int64_t bias, int64_t c,
     int64_t n, int64_t ih, int64_t iw, int64_t ic, int64_t oc, int64_t kh, int64_t kw,
