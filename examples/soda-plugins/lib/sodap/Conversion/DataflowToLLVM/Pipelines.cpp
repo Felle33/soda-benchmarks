@@ -46,6 +46,7 @@ struct DataflowToLLVMPipelineOptions
 };
 struct ReusableOperatorBackendOptions
     : public PassPipelineOptions<ReusableOperatorBackendOptions> {
+  Option<std::string> family{*this,"family",llvm::cl::init("gemm"),llvm::cl::desc("Operator compute family: gemm, conv or add")};
   Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64),llvm::cl::desc("FP32 core lane budget")};
   Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64),llvm::cl::desc("Packed DMA width")};
   Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680),llvm::cl::desc("Local array storage budget")};
@@ -109,14 +110,22 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
       [](OpPassManager &pm, const ReusableOperatorBackendOptions &o) {
         // Keep the registered sequence in the compiler. The shell driver only
         // passes target budgets and orchestrates frontends/tool invocations.
+        std::string compute;
+        if(o.family=="gemm" || o.family=="conv") compute=
+          "sodap-prepare-compute-budget{lanes=" + std::to_string(o.lanes) + " report=" + o.computeReport.getValue() + "},"
+          "sodap-bank-matmul-buffers{rows=1 cols=1 plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
+          "sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,";
+        else if(o.family=="add") compute=
+          "sodap-bank-matmul-buffers{pointwise=true rows=1 cols=" + std::to_string(o.lanes) +
+          " plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
+          "sodap-register-block-pointwise{lanes=" + std::to_string(o.lanes) + "},canonicalize,cse,";
+        else llvm::report_fatal_error("unsupported reusable operator compute family");
         std::string pipeline =
           "func.func(sodap-dataflow-guard-reads,sodap-dataflow-tails),"
           "sodap-dataflow-copy-to-dma{dma-word-stride=2 dma-data-width=" + std::to_string(o.dmaWidth) + "},"
           "func.func(sodap-dataflow-tasks-to-nodes),sodap-dataflow-nodes-to-func,"
-          "sodap-prepare-compute-budget{lanes=" + std::to_string(o.lanes) + " report=" + o.computeReport.getValue() + "},"
-          "sodap-bank-matmul-buffers{rows=1 cols=1 plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
-          "sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,"
-          "func.func(convert-linalg-to-loops),sodap-dataflow-infer-top-interface,"
+          + compute +
+          "func.func(convert-linalg-to-loops),sodap-legalize-fp-minmax,sodap-dataflow-infer-top-interface,"
           "sodap-emit-bambu-architecture{file=architecture.xml},sodap-convert-dataflow-to-llvm,"
           "func.func(promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}),"
           "func.func(fold-memref-alias-ops),lower-affine,convert-scf-to-cf,convert-math-to-llvm,"

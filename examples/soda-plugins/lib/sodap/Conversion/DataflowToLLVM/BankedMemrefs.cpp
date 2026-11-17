@@ -8,6 +8,8 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -21,11 +23,106 @@ namespace mlir::sodap {
 #define GEN_PASS_DEF_BANKMATMULBUFFERS
 #define GEN_PASS_DEF_FINALIZEBANKEDMEMREFSTOLLVM
 #define GEN_PASS_DEF_REGISTERBLOCKMATMUL
+#define GEN_PASS_DEF_REGISTERBLOCKPOINTWISE
+#define GEN_PASS_DEF_LEGALIZEFPMINMAX
 #include "sodap/Conversion/DataflowToLLVM/Passes.h.inc"
 }
 using namespace mlir;
 
 namespace {
+// IEEE ordered-bit keys preserve signed zero. Explicit NaN selection keeps
+// minimum/maximum semantics without llvm.minimum/maximum, which this Bambu
+// frontend cannot lower. No fast-math assumptions or extra floating units.
+struct LegalizeFPMinMax : sodap::impl::LegalizeFPMinMaxBase<LegalizeFPMinMax> {
+  void runOnOperation() override {
+    SmallVector<Operation *> ops;
+    getOperation().walk([&](Operation *op) {
+      if(isa<arith::MinimumFOp,arith::MaximumFOp>(op))ops.push_back(op);
+    });
+    for(Operation *op:ops) {
+      if(!op->getResult(0).getType().isF32()) {
+        op->emitError("Bambu min/max legalization currently supports FP32");return signalPassFailure();
+      }
+      OpBuilder b(op);Location l=op->getLoc();
+      auto integer=[&](uint32_t n)->Value{return b.create<arith::ConstantIntOp>(l,n,32);};
+      Value sign=integer(0x80000000u),mask=integer(0x7fffffffu),inf=integer(0x7f800000u),zero=integer(0),ones=integer(UINT32_MAX);
+      SmallVector<Value> bits,keys,nans;
+      for(Value v:op->getOperands()) {
+        Value word=b.create<arith::BitcastOp>(l,b.getI32Type(),v);bits.push_back(word);
+        Value negative=b.create<arith::CmpIOp>(l,arith::CmpIPredicate::slt,word,zero);
+        Value flip=b.create<arith::SelectOp>(l,negative,ones,sign);
+        keys.push_back(b.create<arith::XOrIOp>(l,word,flip));
+        Value magnitude=b.create<arith::AndIOp>(l,word,mask);
+        nans.push_back(b.create<arith::CmpIOp>(l,arith::CmpIPredicate::ugt,magnitude,inf));
+      }
+      auto pred=isa<arith::MinimumFOp>(op)?arith::CmpIPredicate::ult:arith::CmpIPredicate::ugt;
+      Value cmp=b.create<arith::CmpIOp>(l,pred,keys[0],keys[1]);
+      Value selected=b.create<arith::SelectOp>(l,cmp,bits[0],bits[1]);
+      selected=b.create<arith::SelectOp>(l,nans[1],bits[1],selected);
+      selected=b.create<arith::SelectOp>(l,nans[0],bits[0],selected);
+      Value result=b.create<arith::BitcastOp>(l,b.getF32Type(),selected);
+      op->getResult(0).replaceAllUsesWith(result);op->erase();
+    }
+  }
+};
+bool pointwise2D(linalg::GenericOp op) {
+  return op.hasPureBufferSemantics() && op.getNumLoops()==2 &&
+      op.getNumParallelLoops()==2 && op.getNumDpsInits()==1 &&
+      op.getMatchingIndexingMap(op.getDpsInitOperand(0)).isIdentity();
+}
+
+struct RegisterBlockPointwise : sodap::impl::RegisterBlockPointwiseBase<RegisterBlockPointwise> {
+  using Base::Base;
+  void runOnOperation() override {
+    if(!lanes || lanes>256) {getOperation().emitError("pointwise lanes must be 1..256");return signalPassFailure();}
+    SmallVector<linalg::GenericOp> ops;
+    getOperation().walk([&](linalg::GenericOp op){ops.push_back(op);});
+    if(ops.size()!=1 || !pointwise2D(ops.front())) {
+      getOperation().emitError("pointwise backend requires one fused two-dimensional parallel scalar region");
+      return signalPassFailure();
+    }
+    auto op=ops.front();auto type=cast<MemRefType>(op.getOutputs()[0].getType());
+    if(!type.getElementType().isF32()) {
+      op.emitError("pointwise register blocking requires local FP32 buffers");return signalPassFailure();
+    }
+    OpBuilder b(op);Location loc=op.getLoc();
+    auto idx=[&](int64_t n){return b.create<arith::ConstantIndexOp>(loc,n).getResult();};
+    auto extent=[&](unsigned dim)->Value {
+      if(type.isDynamicDim(dim))return b.create<memref::DimOp>(loc,op.getOutputs()[0],dim);
+      return idx(type.getDimSize(dim));
+    };
+    auto zero=idx(0),one=idx(1),step=idx(lanes),m=extent(0),n=extent(1);
+    b.create<scf::ForOp>(loc,zero,m,one,ValueRange{},[&](OpBuilder &ib,Location l,Value i,ValueRange){
+      ib.create<scf::ForOp>(l,zero,n,step,ValueRange{},[&](OpBuilder &jb,Location l,Value j,ValueRange){
+        for(unsigned lane=0;lane<lanes;++lane) {
+          Value offset=jb.create<arith::ConstantIndexOp>(l,lane);
+          Value col=jb.create<arith::AddIOp>(l,j,offset);
+          auto emit=[&](OpBuilder &sb,Location l) {
+            SmallVector<Value> indices{i,col}; IRMapping mapping;
+            for(auto [number,operand]:llvm::enumerate(op->getOpOperands())) {
+              auto map=op.getMatchingIndexingMap(&operand);SmallVector<Value> at;
+              for(auto expr:map.getResults()) at.push_back(sb.create<affine::AffineApplyOp>(l,
+                  AffineMap::get(2,0,expr),indices));
+              Value v=sb.create<memref::LoadOp>(l,operand.get(),at);
+              mapping.map(op.getBody()->getArgument(number),v);
+            }
+            for(auto &inner:op.getBody()->without_terminator()) {
+              if(auto index=dyn_cast<linalg::IndexOp>(inner)) mapping.map(index.getResult(),indices[index.getDim()]);
+              else sb.clone(inner,mapping);
+            }
+            Value value=mapping.lookupOrDefault(op.getBody()->getTerminator()->getOperand(0));
+            sb.create<memref::StoreOp>(l,value,op.getOutputs()[0],indices);
+          };
+          if(type.isDynamicDim(1) || type.getDimSize(1)%lanes) {
+            Value valid=jb.create<arith::CmpIOp>(l,arith::CmpIPredicate::ult,col,n);
+            jb.create<scf::IfOp>(l,valid,[&](OpBuilder &sb,Location l){emit(sb,l);sb.create<scf::YieldOp>(l);});
+          } else emit(jb,l);
+        }
+        jb.create<scf::YieldOp>(l);
+      });ib.create<scf::YieldOp>(l);
+    });op.erase();
+  }
+};
 // Same register-blocked i/j/k interchange as the compute-tiling study, but
 // expose every lane explicitly. Cleanup loops with dynamic lane indices would
 // multiplex bank pointers and hide parallelism from the HLS interface analysis.
@@ -177,6 +274,15 @@ struct BankMatmulBuffers : sodap::impl::BankMatmulBuffersBase<BankMatmulBuffers>
       mark(op.getInputs()[0], 0, r);
       mark(op.getInputs()[1], 1, c);
       mark(op.getOutputs()[0], 1, c);
+    });
+    if(pointwise) getOperation().walk([&](linalg::GenericOp op) {
+      if(!pointwise2D(op)) {op.emitError("unsupported pointwise banking maps");invalid=true;return;}
+      for(OpOperand &operand:op->getOpOperands()) {
+        auto map=op.getMatchingIndexingMap(&operand);
+        for(auto [dim,expr]:llvm::enumerate(map.getResults()))
+          if(auto axis=dyn_cast<AffineDimExpr>(expr))
+            if(axis.getPosition()==1) mark(operand.get(),dim,cols);
+      }
     });
     if (invalid) return signalPassFailure();
     if (banks.empty()) return;

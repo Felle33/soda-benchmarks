@@ -25,6 +25,11 @@ def main():
     p.add_argument('--compute-lanes', type=int, default=64)
     p.add_argument('--plm-bytes', type=int, default=327680)
     p.add_argument('--dma-width', type=int, choices=[64], default=64)
+    p.add_argument('--network-host-only', action='store_true',
+                   help='Validate compiler-owned CNN host lowering; no hardware qualification')
+    p.add_argument('--network', action='store_true', help='Compile a network host and its reusable operator engines')
+    p.add_argument('--conv-lanes', type=int, default=32)
+    p.add_argument('--add-lanes', type=int, default=4)
     p.add_argument('--atol', type=float, default=0.001)
     p.add_argument('--rtol', type=float, default=0.0001)
     a = p.parse_args()
@@ -77,15 +82,30 @@ def main():
            'LCS_DMA_ABI':'packed', 'LCS_DMA_DATA_WIDTH':str(a.dma_width),
            'LCS_COMPUTE_LANES':str(a.compute_lanes), 'LCS_PLM_BYTES':str(a.plm_bytes),
            'LCS_GEMM_FP_SEMANTICS':'source', 'LCS_PROFILE':'true'}
+    if a.network or a.network_host_only:
+        env.update(LCS_TILES='network',LCS_CONV_LANES=str(a.conv_lanes),
+                   LCS_ADD_LANES=str(a.add_lanes),LCS_GEMM_LANES=str(a.compute_lanes))
     # Reproducible defaults: unrelated experiments must not inject schedules.
     for key in ('LCS_TILE_SIZES','LCS_REGISTER_BLOCK','LCS_TRANSFORM','LCS_ENTRY',
                 'LCS_SEQUENTIAL','LCS_OVERLAP','LCS_FP_UNITS','LCS_BANK_LOCAL'):
         env.pop(key, None)
     (out/'lowering-env.json').write_text(json.dumps({k:v for k,v in env.items() if k.startswith('LCS_')},indent=2)+'\n')
+    driver = 'scripts/lcs/network_host.sh' if a.network_host_only else 'scripts/tosa_to_lcs.sh'
     with (out/'compile.log').open('w') as log:
-        subprocess.run(['bash',str(repo/'scripts/tosa_to_lcs.sh'),str(out/'01_tosa.mlir'),str(out/'generated')],
+        subprocess.run(['bash',str(repo/driver),str(out/'01_tosa.mlir'),str(out/'generated')],
                        env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-    result = dict(status='LOWERED_NOT_HARDWARE_VALIDATED',
+    if a.network_host_only:
+        result = dict(status='NETWORK_HOST_LOWERED_NOT_HARDWARE_VALIDATED',
+                      host_sha256=sha(out/'generated/host.ll'),
+                      parameter_sha256=sha(out/'generated/parameters.bin'),
+                      fixture_sha256=sha(out/'fixture.json'),
+                      invocation_manifest_sha256=sha(out/'generated/network.json'))
+    elif a.network:
+        result = dict(status='NETWORK_LOWERED_NOT_HARDWARE_VALIDATED',
+                      compilation_sha256=sha(out/'generated/compilation.json'),
+                      fixture_sha256=sha(out/'fixture.json'))
+    else:
+        result = dict(status='LOWERED_NOT_HARDWARE_VALIDATED',
                   hardware_sha256=sha(out/'generated/05_hw_acc.ll'),
                   host_sha256=sha(out/'generated/05_kernel_riscv.ll'),
                   fixture_sha256=sha(out/'fixture.json'),

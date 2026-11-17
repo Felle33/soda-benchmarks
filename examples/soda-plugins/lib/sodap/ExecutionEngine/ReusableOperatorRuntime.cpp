@@ -19,12 +19,17 @@ extern "C" {
 #include <esp_accelerator.h>
 #include <esp_probe.h>
 }
-#ifndef SODAP_ESP_DEVICE_ID
+#if !defined(SODAP_ESP_DEVICE_ID) && !defined(SODAP_OP_SEPARATE_DEVICES)
 #error Define SODAP_ESP_DEVICE_ID and SODAP_ESP_DEVICE_NAME for the operator socket
 #endif
 #endif
 
 namespace {
+#ifdef SODAP_OP_QUIET
+#define OP_LOG(...) ((void)0)
+#else
+#define OP_LOG(...) std::printf(__VA_ARGS__)
+#endif
 #ifdef SODAP_OP_CPU_ONLY
 constexpr const char *executionPrefix = "CPU_OP";
 #else
@@ -53,11 +58,15 @@ struct Context {
   TensorLayout *layouts, *recent[4];
   unsigned recentIndex;
   bool running;
+  bool separateDevices;
+  uint32_t operatorInstances[3]; // conv, add, gemm
   int64_t outputOffset;
   uint64_t outputElements;
   Context *next;
 #ifdef SODAP_OP_ESP_HW
   esp_device *devices, *device;
+  esp_device *bindings[3], *enumerations[3];
+  unsigned enumerationCounts[3], pageChunks, pageShift;
   unsigned **pages;
   bool flush;
 #endif
@@ -150,26 +159,56 @@ uint64_t elementAddress(Context &ctx,int64_t offset,uint64_t index) {
 }
 float read(Context &ctx, int64_t offset, uint64_t index) {
   float value;
-#ifdef SODAP_OP_CPU_ONLY
-  // GCC 8 otherwise expands memcpy from the arena into byte loads and stack
-  // stores. An explicit aligned word access preserves ordinary float loads.
+  // Explicit aligned words also matter for CPU fallback on an FPGA: byte
+  // accesses to the uncached DMA arena each incur a separate transaction.
   uint32_t bits = ctx.arena[elementAddress(ctx,offset,index)];
   std::memcpy(&value, &bits, 4);
-#else
-  std::memcpy(&value, ctx.arena + elementAddress(ctx,offset,index), 4);
-#endif
   return value;
 }
 void write(Context &ctx, int64_t offset, uint64_t index, float value) {
   auto *p = ctx.arena + elementAddress(ctx,offset,index);
-#ifdef SODAP_OP_CPU_ONLY
   uint32_t bits;
   std::memcpy(&bits, &value, 4);
   p[0] = bits;
-#else
-  std::memcpy(p, &value, 4);
-#endif
   if(!ctx.dmaWidth)p[1] = 0;
+}
+// Construct only after check()/disjoint(): metadata and bounds are validated
+// once per CPU operation, rather than rediscovered for every scalar access.
+struct TensorView {
+  uint32_t *base;
+  uint64_t columns,rowWords,step;
+  TensorView(Context &ctx,int64_t offset,uint64_t elements)
+      : base(ctx.arena+wordAddress(offset)),columns(elements),
+        rowWords(elements*2),step(ctx.dmaWidth?1:2) {
+    if(ctx.dmaWidth) {
+      auto &t=layout(ctx,offset);columns=t.columns;rowWords=t.rowWords;
+    }
+  }
+  bool dense() const { return rowWords==columns*step; }
+  uint64_t address(uint64_t index) const {
+    return dense()?index*step:(index/columns)*rowWords+(index%columns)*step;
+  }
+  bool rowCompatible(uint64_t cols) const {return dense() || columns==cols;}
+  uint64_t stride(uint64_t cols) const {return dense()?cols*step:rowWords;}
+  float get(uint64_t at) const {
+    uint32_t bits=base[at];float value;std::memcpy(&value,&bits,4);return value;
+  }
+  void put(uint64_t at,float value) const {
+    uint32_t bits;std::memcpy(&bits,&value,4);base[at]=bits;
+    if(step==2)base[at+1]=0;
+  }
+};
+void copyRange(const TensorView &src,uint64_t si,const TensorView &dst,uint64_t di,uint64_t count) {
+  while(count) {
+    uint64_t chunk=count;
+    if(!src.dense())chunk=std::min(chunk,src.columns-si%src.columns);
+    if(!dst.dense())chunk=std::min(chunk,dst.columns-di%dst.columns);
+    auto *s=src.base+src.address(si),*d=dst.base+dst.address(di);
+    for(uint64_t i=0;i<chunk;++i,s+=src.step,d+=dst.step) {
+      *d=*s;if(dst.step==2)d[1]=0;
+    }
+    si+=chunk;di+=chunk;count-=chunk;
+  }
 }
 float activation(float value, int64_t relu) {
   if (!relu) return value;
@@ -191,12 +230,17 @@ bool launch(Context &ctx, const char *kind, int64_t outputOffset, uint64_t outpu
   for(unsigned i=0;i<24;++i) std::printf(" %x",ctx.arena[2*i]);
   std::printf("\n");
 #endif
-  std::printf("%s launch=%u kind=%s instance=0 socket=%u\n",
-              executionPrefix, ctx.invocations, kind, ctx.instance);
+  unsigned family=ctx.arena[0]==OP_CONV_MAGIC?0:ctx.arena[0]==OP_ADD_MAGIC?1:2;
+  OP_LOG("%s launch=%u kind=%s instance=%u socket=%u\n",
+              executionPrefix, ctx.invocations, kind, ctx.operatorInstances[family], ctx.instance);
 #ifndef __riscv
   std::fflush(stdout);
 #endif
 #ifdef SODAP_OP_ESP_HW
+  if(ctx.separateDevices) {
+    unsigned index=ctx.arena[0]==OP_CONV_MAGIC?0:ctx.arena[0]==OP_ADD_MAGIC?1:2;
+    ctx.device=ctx.bindings[index];
+  }
   if (ctx.flush) esp_flush(ACC_COH_NONE);
   __asm__ volatile("fence iorw, iorw" ::: "memory");
   iowrite32(ctx.device, CMD_REG, CMD_MASK_START);
@@ -243,7 +287,8 @@ void complete(Context &ctx) {
   std::printf("\n");
 #endif
   ctx.running = false;
-  std::printf("%s complete=%u socket=%u\n", executionPrefix, ++ctx.invocations, ctx.instance);
+  ++ctx.invocations;
+  OP_LOG("%s complete=%u socket=%u\n", executionPrefix, ctx.invocations, ctx.instance);
 #ifndef __riscv
   std::fflush(stdout);
 #endif
@@ -261,7 +306,8 @@ void copy(int64_t handle, int64_t offset, int64_t rank, void *desc, bool in) {
 }
 } // namespace
 
-static int64_t openContext(int64_t bytes,int64_t instance,unsigned width) {
+static int64_t openContext(int64_t bytes,int64_t instance,unsigned width,
+    bool separate=false,int64_t conv=0,int64_t add=0,int64_t gemm=0) {
   if(width && !sodap::DmaTransport{width}.valid())fail("invalid DMA width");
 #ifdef SODAP_OP_ESP_HW
   if(width && width!=64)fail("ESP backend supports packed DMA64 only");
@@ -275,15 +321,46 @@ static int64_t openContext(int64_t bytes,int64_t instance,unsigned width) {
   ctx->bytes = bytes + OP_HEADER_BYTES;
   ctx->instance = instance;
   ctx->dmaWidth=width;
+  ctx->separateDevices=separate;
+  int64_t indices[]={conv,add,gemm};
+  for(unsigned i=0;i<3;++i) {
+    if(indices[i]<-1 || indices[i]>INT32_MAX)fail("invalid device instance");
+    ctx->operatorInstances[i]=indices[i];
+  }
 #ifdef SODAP_OP_ESP_HW
-  int count = probe(&ctx->devices, VENDOR_SLD, SODAP_ESP_DEVICE_ID, SODAP_ESP_DEVICE_NAME);
-  if (instance >= count) fail("operator socket not found");
-  ctx->device = &ctx->devices[instance];
+  if(separate) {
+#ifdef SODAP_OP_SEPARATE_DEVICES
+    const unsigned ids[]={SODAP_CONV_DEVICE_ID,SODAP_ADD_DEVICE_ID,SODAP_GEMM_DEVICE_ID};
+    const char *names[]={SODAP_CONV_DEVICE_NAME,SODAP_ADD_DEVICE_NAME,SODAP_GEMM_DEVICE_NAME};
+    for(unsigned i=0;i<3;++i) {
+      if(indices[i]<0)continue;
+      int count=probe(&ctx->enumerations[i],VENDOR_SLD,ids[i],names[i]);
+      if(count<=0 || indices[i]>=count)fail("typed operator socket not found");
+      ctx->enumerationCounts[i]=count;
+      ctx->bindings[i]=&ctx->enumerations[i][indices[i]];
+    }
+    for(auto *device:ctx->bindings)if(device) {ctx->device=device;break;}
+    if(!ctx->device)fail("network has no accelerator binding");
+#else
+    fail("runtime was not built for separate operator devices");
+#endif
+  } else {
+#ifdef SODAP_ESP_DEVICE_ID
+    int count = probe(&ctx->devices, VENDOR_SLD, SODAP_ESP_DEVICE_ID, SODAP_ESP_DEVICE_NAME);
+    if (instance >= count) fail("operator socket not found");
+    ctx->device = &ctx->devices[instance];
+#else
+    fail("runtime was not built for a combined operator device");
+#endif
+  }
   unsigned shift = 20;
   unsigned capacity = ioread32(ctx->device, PT_NCHUNK_MAX_REG);
+  if(separate)for(auto *device:ctx->bindings)
+    if(device)capacity=std::min(capacity,ioread32(device,PT_NCHUNK_MAX_REG));
   if (!capacity) fail("missing DMA page table capacity");
   while ((uint64_t(ctx->bytes) + (1u << shift) - 1) >> shift > capacity) ++shift;
   unsigned chunk = 1u << shift, chunks = (uint64_t(ctx->bytes) + chunk - 1) >> shift;
+  ctx->pageChunks=chunks;ctx->pageShift=shift;
   ctx->arena = static_cast<uint32_t *>(allocate(chunks * chunk));
   ctx->pages = static_cast<unsigned **>(allocate(chunks * sizeof(unsigned *)));
   for (unsigned i = 0; i < chunks; ++i) ctx->pages[i] = ctx->arena + i * (chunk / 4);
@@ -293,19 +370,23 @@ static int64_t openContext(int64_t bytes,int64_t instance,unsigned width) {
   int l2 = probe(&cache, VENDOR_CACHE, DEVID_L2_CACHE, DEVNAME_L2_CACHE);
   release(cache);
   ctx->flush = llc > 0 || l2 > 0;
-  iowrite32(ctx->device, COHERENCE_REG, ACC_COH_NONE);
-  iowrite32(ctx->device, PT_ADDRESS_REG, reinterpret_cast<uintptr_t>(ctx->pages));
-  iowrite32(ctx->device, PT_NCHUNK_REG, chunks);
-  iowrite32(ctx->device, PT_SHIFT_REG, shift);
-  iowrite32(ctx->device, SRC_OFFSET_REG, 0);
-  iowrite32(ctx->device, DST_OFFSET_REG, 0);
+  for(unsigned i=0;i<(separate?3u:1u);++i) {
+    auto *device=separate?ctx->bindings[i]:ctx->device;
+    if(!device)continue;
+    iowrite32(device, COHERENCE_REG, ACC_COH_NONE);
+    iowrite32(device, PT_ADDRESS_REG, reinterpret_cast<uintptr_t>(ctx->pages));
+    iowrite32(device, PT_NCHUNK_REG, chunks);
+    iowrite32(device, PT_SHIFT_REG, shift);
+    iowrite32(device, SRC_OFFSET_REG, 0);
+    iowrite32(device, DST_OFFSET_REG, 0);
+  }
 #else
   ctx->arena = static_cast<uint32_t *>(allocate(ctx->bytes));
 #endif
   std::memset(ctx->arena, 0, ctx->bytes);
   ctx->next = live;
   live = ctx;
-  std::printf("%s open socket=%u arena_bytes=%u engines=conv:1,add:1,gemm:1\n", executionPrefix, ctx->instance, ctx->bytes);
+  OP_LOG("%s open socket=%u arena_bytes=%u engines=conv:1,add:1,gemm:1 separate=%u\n", executionPrefix, ctx->instance, ctx->bytes, separate);
   return reinterpret_cast<intptr_t>(ctx);
 }
 extern "C" int64_t esp_op_open(int64_t bytes,int64_t instance) {
@@ -315,6 +396,33 @@ extern "C" int64_t esp_op_open_packed(int64_t bytes,int64_t instance,int64_t wid
   if(width<=0 || width>UINT32_MAX || !sodap::DmaTransport{unsigned(width)}.valid())fail("invalid DMA width");
   return openContext(bytes,instance,unsigned(width));
 }
+extern "C" int64_t esp_op_open_devices(int64_t bytes,int64_t width,
+    int64_t conv,int64_t add,int64_t gemm) {
+  if(width<=0 || width>UINT32_MAX || !sodap::DmaTransport{unsigned(width)}.valid())fail("invalid DMA width");
+  return openContext(bytes,0,unsigned(width),true,conv,add,gemm);
+}
+// Mapping is explicit and independent of the operator's arithmetic contract.
+// The default experiment binds one instance per type; another graph may select
+// additional compatible physical instances between synchronous invocations.
+extern "C" void esp_op_select_device(int64_t h,int64_t family,int64_t instance) {
+  Context &ctx=lookup(h);
+  if(!ctx.separateDevices || ctx.running || family<0 || family>=3 || instance<0 || uint64_t(instance)>UINT32_MAX)
+    fail("invalid typed device binding");
+  if(ctx.operatorInstances[family]==uint32_t(instance))return;
+#ifdef SODAP_OP_ESP_HW
+  if(uint64_t(instance)>=ctx.enumerationCounts[family])fail("typed operator instance not found");
+  auto *device=&ctx.enumerations[family][instance];
+  if(ioread32(device,PT_NCHUNK_MAX_REG)<ctx.pageChunks)fail("selected socket page table too small");
+  iowrite32(device,COHERENCE_REG,ACC_COH_NONE);
+  iowrite32(device,PT_ADDRESS_REG,reinterpret_cast<uintptr_t>(ctx.pages));
+  iowrite32(device,PT_NCHUNK_REG,ctx.pageChunks);
+  iowrite32(device,PT_SHIFT_REG,ctx.pageShift);
+  iowrite32(device,SRC_OFFSET_REG,0);iowrite32(device,DST_OFFSET_REG,0);
+  ctx.bindings[family]=device;
+#endif
+  ctx.operatorInstances[family]=instance;
+}
+
 extern "C" void esp_op_tensor(int64_t handle,int64_t offset,int64_t elements,int64_t cols) {
   Context &ctx=lookup(handle);
   if(!ctx.dmaWidth || ctx.running || offset<0 || offset%(ctx.dmaWidth/8) ||
@@ -337,20 +445,38 @@ extern "C" void esp_op_repack(int64_t handle,int64_t a,int64_t c,int64_t element
   Context &ctx=lookup(handle);
   auto ae=check(ctx,a,product({elements})),ce=check(ctx,c,product({elements}));
   disjoint(a,ae,c,ce);
-  for(int64_t i=0;i<elements;++i)write(ctx,c,i,read(ctx,a,i));
+  copyRange(TensorView(ctx,a,elements),0,TensorView(ctx,c,elements),0,elements);
+}
+
+extern "C" void esp_op_concat(int64_t handle,int64_t a,int64_t b,int64_t c,
+    int64_t outer,int64_t aAxis,int64_t bAxis,int64_t inner) {
+  Context &ctx=lookup(handle);
+  uint64_t aa=product({aAxis,inner}),bb=product({bAxis,inner});
+  if(aAxis<=0 || bAxis<=0 || aAxis>INT64_MAX-bAxis)fail("invalid concatenation extent");
+  auto ae=check(ctx,a,product({outer,aAxis,inner}));
+  auto be=check(ctx,b,product({outer,bAxis,inner}));
+  auto ce=check(ctx,c,product({outer,aAxis+bAxis,inner}));
+  disjoint(a,ae,c,ce);disjoint(b,be,c,ce);
+  TensorView av(ctx,a,outer*aa),bv(ctx,b,outer*bb),cv(ctx,c,outer*(aa+bb));
+  for(int64_t o=0;o<outer;++o) {
+    copyRange(av,o*aa,cv,o*(aa+bb),aa);
+    copyRange(bv,o*bb,cv,o*(aa+bb)+aa,bb);
+  }
 }
 
 extern "C" void esp_op_close(int64_t handle) {
   Context &ctx = lookup(handle);
   if (ctx.running) fail("cannot close a running socket");
-  std::printf("%s close socket=%u invocations=%u\n", executionPrefix, ctx.instance, ctx.invocations);
+  OP_LOG("%s close socket=%u invocations=%u\n", executionPrefix, ctx.instance, ctx.invocations);
   Context **p = &live;
   while (*p != &ctx) p = &(*p)->next;
   *p = ctx.next;
 #ifdef SODAP_OP_ESP_HW
-  iowrite32(ctx.device, PT_NCHUNK_REG, 0);
+  for(unsigned i=0;i<(ctx.separateDevices?3u:1u);++i)
+    iowrite32(ctx.separateDevices?ctx.bindings[i]:ctx.device, PT_NCHUNK_REG, 0);
   release(ctx.pages);
-  release(ctx.devices);
+  if(ctx.devices)release(ctx.devices);
+  for(auto *list:ctx.enumerations)if(list)release(list);
 #endif
   while(ctx.layouts) {auto *next=ctx.layouts->next;release(ctx.layouts);ctx.layouts=next;}
   release(ctx.arena);
@@ -394,6 +520,7 @@ extern "C" void esp_op_conv_activation(int64_t handle, int64_t a, int64_t w, int
   field(ctx,CONV_A,wireAddress(ctx,a)); field(ctx,CONV_W,wireAddress(ctx,w));
   field(ctx,CONV_BIAS,wireAddress(ctx,bias)); field(ctx,CONV_C,wireAddress(ctx,c));
   field(ctx,CONV_ALPHA,bits);
+  field(ctx,CONV_ACTIVATION_FP,mode==OP_ACT_RELU?0x3f800000:0);
   if (!launch(ctx,"conv",c,product({n,oh,ow,oc}))) {
     for (int64_t batch=0;batch<n;++batch)
       for (int64_t y=0;y<oh;++y)
@@ -429,15 +556,20 @@ extern "C" void esp_op_add(int64_t handle, int64_t a, int64_t b, int64_t c,
     if(uint64_t(count)%layout(ctx,a).columns)fail("addition count must contain complete packed rows");
   }
   header(ctx,OP_ADD_MAGIC);
-  if(ctx.dmaWidth)field(ctx,ADD_COLUMNS,layout(ctx,a).columns);
+  if(ctx.dmaWidth) {
+    auto &t=layout(ctx,a);
+    field(ctx,ADD_COLUMNS,t.columns); field(ctx,ADD_ROWS,count/t.columns);
+    field(ctx,ADD_ROW_BYTES,t.rowWords*4);
+    field(ctx,ADD_ACTIVATION_FP,relu?0x3f800000:0);
+  }
   field(ctx,ADD_COUNT,count); field(ctx,ADD_A,wireAddress(ctx,a)); field(ctx,ADD_B,wireAddress(ctx,b));
   field(ctx,ADD_C,wireAddress(ctx,c)); field(ctx,ADD_RELU,relu);
   if (!launch(ctx,"add",c,count))
     for (int64_t i=0;i<count;++i) write(ctx,c,i,activation(read(ctx,a,i)+read(ctx,b,i),relu));
   complete(ctx);
 }
-extern "C" void esp_op_gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
-    int64_t m, int64_t n, int64_t k) {
+static void gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
+    int64_t m, int64_t n, int64_t k, bool source) {
   Context &ctx=lookup(handle);
   columns(ctx,a,k);columns(ctx,b,n);columns(ctx,c,n);
   auto ae=check(ctx,a,product({m,k})), be=check(ctx,b,product({k,n})), ce=check(ctx,c,product({m,n}));
@@ -446,7 +578,8 @@ extern "C" void esp_op_gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
   field(ctx,GEMM_FIELD_M,m); field(ctx,GEMM_FIELD_N,n); field(ctx,GEMM_FIELD_K,k);
   field(ctx,GEMM_FIELD_A,wireAddress(ctx,a)); field(ctx,GEMM_FIELD_B,wireAddress(ctx,b)); field(ctx,GEMM_FIELD_C,wireAddress(ctx,c));
   if(ctx.dmaWidth) {
-    field(ctx,GEMM_FIELD_VERSION,GEMM_PACKED_VERSION);field(ctx,GEMM_FIELD_DMA_WIDTH,ctx.dmaWidth);
+    field(ctx,GEMM_FIELD_VERSION,source?GEMM_SOURCE_VERSION:GEMM_PACKED_VERSION);field(ctx,GEMM_FIELD_DMA_WIDTH,ctx.dmaWidth);
+    if(source)field(ctx,GEMM_FIELD_HAS_C,0); // Pure matmul: C is absent, including NaN-poisoned storage.
     field(ctx,GEMM_FIELD_LDA,layout(ctx,a).rowWords*4);
     field(ctx,GEMM_FIELD_LDB,layout(ctx,b).rowWords*4);
     field(ctx,GEMM_FIELD_LDC,layout(ctx,c).rowWords*4);
@@ -464,6 +597,20 @@ extern "C" void esp_op_gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
   complete(ctx);
 }
 
+extern "C" void esp_op_gemm(int64_t h,int64_t a,int64_t b,int64_t c,int64_t m,int64_t n,int64_t k) {
+  gemm(h,a,b,c,m,n,k,false);
+}
+extern "C" void esp_op_gemm_source(int64_t h,int64_t a,int64_t b,int64_t c,int64_t m,int64_t n,int64_t k) {
+  if(!lookup(h).dmaWidth)fail("GEMM source semantics require packed DMA");
+  gemm(h,a,b,c,m,n,k,true);
+}
+extern "C" void esp_op_relu(int64_t h,int64_t a,int64_t c,int64_t count) {
+  Context &ctx=lookup(h);
+  auto ae=check(ctx,a,product({count})),ce=check(ctx,c,product({count}));
+  disjoint(a,ae,c,ce);
+  for(int64_t i=0;i<count;++i)write(ctx,c,i,activation(read(ctx,a,i),1));
+}
+
 extern "C" void esp_op_transpose(int64_t handle, int64_t a, int64_t c, int64_t rank,
     int64_t d0, int64_t d1, int64_t d2, int64_t d3,
     int64_t p0, int64_t p1, int64_t p2, int64_t p3) {
@@ -479,15 +626,28 @@ extern "C" void esp_op_transpose(int64_t handle, int64_t a, int64_t c, int64_t r
   }
   sourceStrides[3]=1;
   for (int i=2;i>=0;--i) sourceStrides[i]=sourceStrides[i+1]*dims[i+1];
-  for (uint64_t i=0;i<count;++i) {
-    uint64_t remainder=i, source=0;
-    for (int axis=3;axis>=0;--axis) {
-      source+=(remainder%outputDims[axis])*sourceStrides[perm[axis]];
-      remainder/=outputDims[axis];
-    }
-    write(ctx,c,i,read(ctx,a,source));
+  TensorView av(ctx,a,count),cv(ctx,c,count);
+  bool physical=av.rowCompatible(d3);
+  if(physical) {
+    sourceStrides[3]=av.step;
+    sourceStrides[2]=av.stride(d3);
+    for(int axis=1;axis>=0;--axis)sourceStrides[axis]=sourceStrides[axis+1]*dims[axis+1];
   }
-  std::printf("REUSABLE_OP cpu=transpose\n");
+  uint64_t coords[4]={},source=0,dest=0,column=0;
+  for (uint64_t i=0;i<count;++i) {
+    cv.base[dest]=av.base[physical?source:av.address(source)];
+    if(cv.step==2)cv.base[dest+1]=0;
+    dest+=cv.step;
+    if(++column==cv.columns) {column=0;dest+=cv.rowWords-cv.columns*cv.step;}
+    // Odometer traversal preserves arbitrary permutations without decoding
+    // the flattened output index with division/remainder for every element.
+    for(int axis=3;axis>=0;--axis) {
+      source+=sourceStrides[perm[axis]];
+      if(++coords[axis]<uint64_t(outputDims[axis]))break;
+      coords[axis]=0;source-=outputDims[axis]*sourceStrides[perm[axis]];
+    }
+  }
+  OP_LOG("REUSABLE_OP cpu=transpose\n");
 }
 extern "C" void esp_op_pool(int64_t handle, int64_t a, int64_t c,
     int64_t n, int64_t ih, int64_t iw, int64_t ch, int64_t oh, int64_t ow,
@@ -496,6 +656,10 @@ extern "C" void esp_op_pool(int64_t handle, int64_t a, int64_t c,
   auto ae=check(ctx,a,product({n,ih,iw,ch})), ce=check(ctx,c,product({n,oh,ow,ch}));
   disjoint(a,ae,c,ce); spatial({kh,kw,sh,sw}); spatial({pt,pl},true); flag(average);
   if (average && (pt || pl)) fail("padded average pooling is unsupported");
+  TensorView av(ctx,a,n*ih*iw*ch),cv(ctx,c,n*oh*ow*ch);
+  bool inputRows=av.rowCompatible(ch),outputRows=cv.rowCompatible(ch);
+  uint64_t inputStride=av.stride(ch),outputStride=cv.stride(ch);
+  float divisor=float(kh*kw);
   for (int64_t batch=0;batch<n;++batch)
     for (int64_t y=0;y<oh;++y)
       for (int64_t x=0;x<ow;++x)
@@ -505,11 +669,15 @@ extern "C" void esp_op_pool(int64_t handle, int64_t a, int64_t c,
             for (int64_t kx=0;kx<kw;++kx) {
               int64_t sy=y*sh+ky-pt, sx=x*sw+kx-pl;
               if (sy<0 || sy>=ih || sx<0 || sx>=iw) continue;
-              float item=read(ctx,a,((batch*ih+sy)*iw+sx)*ch+channel);
+              uint64_t pixel=(batch*ih+sy)*iw+sx;
+              float item=av.get(inputRows?pixel*inputStride+channel*av.step:
+                                av.address(pixel*ch+channel));
               value=average ? value+item : std::max(value,item);
             }
-          if (average) value=value/float(kh*kw);
-          write(ctx,c,((batch*oh+y)*ow+x)*ch+channel,value);
+          if (average) value=value/divisor;
+          uint64_t pixel=(batch*oh+y)*ow+x;
+          cv.put(outputRows?pixel*outputStride+channel*cv.step:
+                 cv.address(pixel*ch+channel),value);
         }
-  std::printf("REUSABLE_OP cpu=%s_pool\n",average?"average":"max");
+  OP_LOG("REUSABLE_OP cpu=%s_pool\n",average?"average":"max");
 }

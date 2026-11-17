@@ -81,6 +81,20 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  // One source direct-convolution contraction and its scalar epilogue.
+  // The shared tiler creates the loop nest and fuses bias/activation.
+  transform.named_sequence @tasks_conv(%root: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+    %compute = transform.structured.match ops{["linalg.generic"]} in %func : (!transform.any_op) -> !transform.any_op
+    %dispatch = transform.sodap.create_tasks %func groups(%compute)
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.include @tile_tasks failures(propagate) (%func) : (!transform.any_op) -> ()
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.yield
+  }
+
   // Each task gets its own nest, its sizes from the cost model (64 KiB of
   // buffers; a DMA request 64 cycles, a word 1). LCS_TILE_SIZES and
   // LCS_PLM_BYTES, LCS_DMA_REQUEST_CYCLES, LCS_DMA_WORD_CYCLES in

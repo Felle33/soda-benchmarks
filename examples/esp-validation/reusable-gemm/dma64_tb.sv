@@ -27,11 +27,19 @@ module reusable_gemm_tb #(parameter TIMEOUT_CYCLES=2000000, parameter real TOL=0
     .dma_write_ctrl_data_size(),.dma_write_ctrl_data_user(),
     .dma_write_chnl_valid(wdvalid),.dma_write_chnl_ready(wdready),.dma_write_chnl_data(wd));
   function real fp32(input [31:0] value);
+    reg [10:0] exponent;
+    reg [63:0] as_double;
+    begin
     if (value[30:23]==0)
-      fp32=(value[31] ? -1.0 : 1.0)*value[22:0]*(2.0**(-149));
-    else
-      fp32=(value[31] ? -1.0 : 1.0)*(1.0+value[22:0]/8388608.0)*
-           (2.0**(integer'(value[30:23])-127));
+      fp32=(value[31] ? -1.0 : 1.0)*value[22:0]*1.401298464324817e-45;
+    else begin
+      // Exact FP32-to-double widening; avoids simulator-specific real power
+      // evaluation (a Verilator internal error with an integer cast exponent).
+      exponent=value[30:23]==255 ? 11'd2047 : {3'b0,value[30:23]}+11'd896;
+      as_double={value[31],exponent,value[22:0],29'b0};
+      fp32=$bitstoreal(as_double);
+    end
+    end
   endfunction
   always @(posedge clk) if(rst) begin
     cycles<=cycles+1;

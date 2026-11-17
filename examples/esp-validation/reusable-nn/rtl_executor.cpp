@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // Native CPU / real generated RTL co-simulation, using ESP's DMA64 adapter.
+#ifdef SODAP_OP_SEPARATE_RTL
+#include "Vconv.h"
+#include "Vadd.h"
+#include "Vgemm.h"
+#else
 #include "Voperator.h"
+#endif
 #include "verilated.h"
 #include "sodap/ExecutionEngine/ReusableOperatorABI.h"
 #include <cstdio>
@@ -15,14 +21,15 @@ namespace {
   std::fprintf(stderr,"REUSABLE_OP RTL FAILED: %s\n",reason);
   std::abort();
 }
-class Simulator {
-  Voperator dut;
+template<class RTL> class Simulator {
+  RTL dut;
   uint32_t *memory=nullptr;
   uint64_t beats=0, readAt=0, writeAt=0, readLeft=0, writeLeft=0;
   uint64_t outputBegin=0,outputEnd=0,cycles=0,reads=0,writes=0;
   uint64_t readyAt=0,latency=0;
   unsigned invocation=0,stallMask=0;
   bool packed=false;
+  bool resetDone=false;
   uint64_t maxCycles=2000000000ull;
   void tick() {
     bool idle=!readLeft && !writeLeft;
@@ -67,11 +74,14 @@ public:
     if(auto *value=std::getenv("SODAP_RTL_DMA_LATENCY")) latency=std::strtoull(value,nullptr,0);
     if(auto *value=std::getenv("SODAP_RTL_MAX_CYCLES")) maxCycles=std::strtoull(value,nullptr,0);
     dut.rst=0; dut.conf_done=0;
-    for(unsigned i=0;i<8;++i) tick();
-    dut.rst=1;
-    for(unsigned i=0;i<4;++i) tick();
   }
   void run(uint32_t *arena,uint64_t bytes) {
+    if(!resetDone) {
+      for(unsigned i=0;i<8;++i) tick();
+      dut.rst=1;
+      for(unsigned i=0;i<4;++i) tick();
+      resetDone=true;
+    }
     if(readLeft || writeLeft) fail("previous invocation has outstanding DMA");
     memory=arena; beats=bytes/8;
     auto f=[&](unsigned index)->uint64_t{return arena[index*2];};
@@ -115,6 +125,21 @@ extern "C" void esp_op_execute_rtl(uint32_t *arena,uint64_t bytes) {
     return true;
   }();
   (void)initialized;
-  static Simulator simulator;
+#ifdef SODAP_OP_SEPARATE_RTL
+  // Testbench dispatch only: each family has independent generated RTL state.
+  // The compiled host and production runtime still create every descriptor.
+  // Verilator requires all models to exist before simulation time advances.
+  static Simulator<Vconv> conv;
+  static Simulator<Vadd> add;
+  static Simulator<Vgemm> gemm;
+  switch(arena[0]) {
+  case OP_CONV_MAGIC: conv.run(arena,bytes);break;
+  case OP_ADD_MAGIC: add.run(arena,bytes);break;
+  case GEMM_MAGIC: gemm.run(arena,bytes);break;
+  default:fail("unknown operator family");
+  }
+#else
+  static Simulator<Voperator> simulator;
   simulator.run(arena,bytes);
+#endif
 }

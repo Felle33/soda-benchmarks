@@ -91,11 +91,24 @@ def BankMatmulBuffers : Pass<"sodap-bank-matmul-buffers", "::mlir::ModuleOp"> {
   let options = [
     Option<"rows", "rows", "unsigned", "8", "A row banks">,
     Option<"cols", "cols", "unsigned", "8", "B and C column banks">,
+    Option<"pointwise", "pointwise", "bool", "false", "Also bank independent pointwise lanes along the last loop axis">,
     Option<"plmBytes", "plm-bytes", "uint64_t", "0", "Physical local array bytes after padding, zero disables check">,
     Option<"report", "report", "std::string", "\"\"", "Optional physical storage report JSON">
   ];
   let dependentDialects = ["::mlir::LLVM::LLVMDialect",
     "::mlir::arith::ArithDialect", "::mlir::memref::MemRefDialect"];
+}
+
+def LegalizeFPMinMax : Pass<"sodap-legalize-fp-minmax", "::mlir::ModuleOp"> {
+  let summary = "Lower FP32 IEEE minimum/maximum to bit comparisons supported by Bambu";
+  let dependentDialects = ["::mlir::arith::ArithDialect"];
+}
+
+def RegisterBlockPointwise : Pass<"sodap-register-block-pointwise", "::mlir::ModuleOp"> {
+  let summary = "Unroll independent pointwise lanes by cloning the source scalar region";
+  let options = [Option<"lanes", "lanes", "unsigned", "4", "Independent pointwise lanes">];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::affine::AffineDialect",
+    "::mlir::memref::MemRefDialect", "::mlir::scf::SCFDialect", "::mlir::linalg::LinalgDialect"];
 }
 
 def FinalizeBankedMemRefsToLLVM :

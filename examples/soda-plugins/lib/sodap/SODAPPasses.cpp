@@ -158,6 +158,14 @@ static OpFoldResult sizeOf(Value t, int64_t i, int depth = 0) {
   if (!type.isDynamicDim(i))
     return b.getIndexAttr(type.getDimSize(i));
   for (; depth < 16; ++depth) {
+    if (auto arg = dyn_cast<BlockArgument>(t)) {
+      if (auto fn = dyn_cast<func::FuncOp>(arg.getOwner()->getParentOp()))
+        if (auto dims = fn.getArgAttrOfType<DenseI64ArrayAttr>(
+                arg.getArgNumber(), "sodap.dims"))
+          if (i >= 0 && i < int64_t(dims.size()) && dims[i] >= 0 &&
+              dims[i] < fn.getNumArguments())
+            return fn.getArgument(dims[i]);
+    }
     if (auto empty = t.getDefiningOp<tensor::EmptyOp>())
       return empty.getMixedSizes()[i];
     auto dps = t.getDefiningOp<DestinationStyleOpInterface>();

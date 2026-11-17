@@ -112,9 +112,13 @@ static LogicalResult normalize(linalg::LinalgOp op) {
   }
   for (unsigned d = 0; d != types.size(); ++d) {
     if (types[d] == utils::IteratorType::reduction) {
-      if (k != -1 || !contains(0,d) || !contains(1,d) || contains(2,d))
-        return op.emitError("expected one shared reduction dimension");
-      k = d;
+      if (!contains(0,d) || !contains(1,d) || contains(2,d))
+        return op.emitError("expected shared reduction dimensions");
+      // Tiled direct convolution retains unit kernel axes. They carry no
+      // arithmetic reassociation; only one non-unit local reduction may remain.
+      if(k>=0 && bounds[k]>1 && bounds[d]>1)
+        return op.emitError("expected one non-unit local reduction dimension");
+      if(k<0 || bounds[d]>=bounds[k])k=d;
     } else {
       if (!contains(2,d)) return op.emitError("parallel contraction dimension absent from output");
       if (contains(0,d) && !contains(1,d) && (m < 0 || bounds[d] > bounds[m])) m = d;

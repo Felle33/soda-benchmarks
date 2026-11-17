@@ -184,4 +184,65 @@ def JoinMultipleTiles : Pass<"sodap-join-multiple-tiles", "::mlir::ModuleOp"> {
   ];
 }
 
+def TosaFoldConvAffine : Pass<"sodap-tosa-fold-conv-affine", "::mlir::func::FuncOp"> {
+  let summary = "Fold inference channelwise affine operations into constant convolution parameters";
+  let description = [{
+    Explicit inference optimization: reassociates FP32 arithmetic, so numerical
+    validation uses the model's inference tolerances, not bitwise equivalence.
+    Only finite constant parameters, single-consumer convolutions and NHWC
+    channel broadcasts qualify. Residual consumers prevent folding.
+  }];
+  let dependentDialects = ["::mlir::tosa::TosaDialect"];
+}
+
+def TosaOutlineAdditions : Pass<"sodap-tosa-outline-additions", "::mlir::ModuleOp"> {
+  let summary = "Generalize source additions to a descriptor-backed pointwise tile";
+  let options = [Option<"lanes", "lanes", "unsigned", "4", "Pointwise compute budget">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Total local storage budget">];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::tensor::TensorDialect",
+    "::mlir::func::FuncDialect", "::mlir::tosa::TosaDialect"];
+}
+
+def TosaOutlineConvolutions : Pass<"sodap-tosa-outline-convolutions", "::mlir::ModuleOp"> {
+  let summary = "Represent direct convolution as a structured contraction over a DMA window view";
+  let options = [Option<"lanes", "lanes", "unsigned", "32", "Convolution MAC budget">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Total local storage budget">];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::tensor::TensorDialect",
+    "::mlir::func::FuncDialect", "::mlir::linalg::LinalgDialect"];
+}
+
+def TosaExtractHardware : Pass<"sodap-tosa-extract-hardware", "::mlir::ModuleOp"> {
+  let summary = "Retain only compiler-outlined hardware modules";
+  let description = [{
+    Used after source operator outlining when the host has already been lowered.
+    Remove the outer source functions and their model constants, retaining all
+    child modules marked sodap.tile. This is extraction, not hardware generation.
+  }];
+}
+
+def TosaNetworkHost : Pass<"sodap-tosa-network-host", "::mlir::ModuleOp"> {
+  let summary = "Lower a TOSA SSA network to persistent ESP host entrypoints";
+  let description = [{
+    Externalize FP32 constants, allocate packed DRAM tensors from SSA lifetimes,
+    and lower supported tensor operations to typed synchronous launches or CPU
+    tensor operations. Emit init/run/close functions, parameters and manifests.
+    The source graph, including each accelerator operation, is preserved in
+    source.mlir for the hardware pipeline. This pass does not generate hardware.
+    Instance selection is a target configuration, independent of semantic family.
+  }];
+  let options = [
+    Option<"directory", "directory", "std::string", "\".\"", "Output directory for parameters and manifests">,
+    Option<"dmaWidth", "dma-width", "unsigned", "64", "Packed DMA transport width">,
+    Option<"convInstance", "conv-instance", "unsigned", "0", "Convolution device instance">,
+    Option<"addInstance", "add-instance", "unsigned", "0", "Addition device instance">,
+    Option<"gemmInstance", "gemm-instance", "unsigned", "0", "GEMM device instance">
+    ,Option<"convLanes", "conv-lanes", "unsigned", "32", "Default convolution MAC budget">
+    ,Option<"gemmLanes", "gemm-lanes", "unsigned", "64", "Default GEMM MAC budget">
+    ,Option<"addLanes", "add-lanes", "unsigned", "4", "Default addition lane budget">
+    ,Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Per-implementation local storage budget">
+  ];
+  let dependentDialects = ["::mlir::arith::ArithDialect", "::mlir::func::FuncDialect",
+    "::mlir::memref::MemRefDialect", "::mlir::tosa::TosaDialect"];
+}
+
 #endif // SODAP_TOSA_PASSES

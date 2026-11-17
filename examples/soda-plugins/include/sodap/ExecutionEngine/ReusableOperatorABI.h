@@ -4,14 +4,17 @@
 #include <stdint.h>
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
 
-// One instance of each engine shares an ESP socket and a DMA arena. Header
+// Typed engine instances share a DMA arena; each has its own ESP socket. Header
 // fields always occupy the low 32 bits of eight-byte slots. Legacy v1/v2
 // tensors use one FP32 per eight bytes and wire addresses count 32-bit words.
 // Packed v3 tensors use beat-aligned packed rows and byte addresses; field 31
-// records the DMA width. GEMM uses its matching v1/v2 descriptor format.
+// records the DMA width. GEMM uses v1/v2 for legacy calls and v3 for source-semantics calls.
 // Public APIs use byte offsets into the DATA area; the runtime adds the header.
 enum {
   OP_PACKED_VERSION = 3, OP_DMA_WIDTH = 31, ADD_COLUMNS = 7,
+  // Additive fields in previously reserved slots. Older v3 engines ignore
+  // them; the common compiler backend binds dimensions/strides explicitly.
+  ADD_ROWS = 8, ADD_ROW_BYTES = 9, ADD_ACTIVATION_FP = 10,
   OP_VERSION = 1, OP_SLOT_BYTES = 8, OP_HEADER_FIELDS = 32,
   OP_HEADER_BYTES = OP_HEADER_FIELDS * OP_SLOT_BYTES,
   OP_CONV_MAGIC = 0x434f4e56, OP_ADD_MAGIC = 0x41444431,
@@ -19,6 +22,7 @@ enum {
   CONV_OH, CONV_OW, CONV_SH, CONV_SW, CONV_PT, CONV_PL, CONV_DH, CONV_DW,
   CONV_RELU, CONV_A, CONV_W, CONV_BIAS, CONV_C, CONV_ALPHA,
   CONV_ACTIVATION = CONV_RELU, CONV_VERSION = 2,
+  CONV_ACTIVATION_FP = 25, // Reserved v3 slot: 0/1 FP32 for common scalar epilogue.
   OP_ACT_NONE = 0, OP_ACT_RELU = 1, OP_ACT_LEAKY_RELU = 2,
   ADD_COUNT = 2, ADD_A, ADD_B, ADD_C, ADD_RELU
 };
@@ -28,10 +32,18 @@ extern "C" {
 #endif
 int64_t esp_op_open(int64_t data_bytes, int64_t instance);
 int64_t esp_op_open_packed(int64_t data_bytes, int64_t instance, int64_t dma_width);
+// Three typed sockets share one arena and descriptor. Calls are synchronous;
+// descriptor storage can be reused only after the previous DMA completes.
+int64_t esp_op_open_devices(int64_t data_bytes, int64_t dma_width,
+    int64_t conv_instance, int64_t add_instance, int64_t gemm_instance);
 // Bind a logical tensor to its physical packed row layout before copying or
 // invoking it. Rebinding an offset is legal after the previous tensor dies.
+// Select a compatible physical device; family 0=conv, 1=add, 2=gemm.
+void esp_op_select_device(int64_t context,int64_t family,int64_t instance);
 void esp_op_tensor(int64_t context, int64_t offset, int64_t elements, int64_t columns);
 void esp_op_repack(int64_t context, int64_t source, int64_t target, int64_t elements);
+void esp_op_concat(int64_t context, int64_t a, int64_t b, int64_t c,
+    int64_t outer, int64_t a_axis, int64_t b_axis, int64_t inner);
 void esp_op_close(int64_t context);
 void esp_op_copy_in(int64_t context, int64_t offset, int64_t rank, void *descriptor);
 void esp_op_copy_out(int64_t context, int64_t offset, int64_t rank, void *descriptor);
@@ -49,6 +61,10 @@ void esp_op_add(int64_t context, int64_t a, int64_t b, int64_t c, int64_t count,
     int64_t relu);
 void esp_op_gemm(int64_t context, int64_t a, int64_t b, int64_t c,
     int64_t m, int64_t n, int64_t k);
+// Pure source matmul, compatible with the clean common GEMM backend (v3).
+void esp_op_gemm_source(int64_t context,int64_t a,int64_t b,int64_t c,
+    int64_t m,int64_t n,int64_t k);
+void esp_op_relu(int64_t context,int64_t a,int64_t c,int64_t count);
 void esp_op_pool(int64_t context, int64_t a, int64_t c,
     int64_t n, int64_t ih, int64_t iw, int64_t ch, int64_t oh, int64_t ow,
     int64_t kh, int64_t kw, int64_t sh, int64_t sw, int64_t pt, int64_t pl,

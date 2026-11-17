@@ -140,10 +140,36 @@ struct SinkTranspose : RewritePattern {
   }
 };
 
+// Concatenation is not elementwise: its axis must follow the permutation.
+// Keep SSA branches intact and move only a common layout change.
+struct SinkConcatTranspose : OpRewritePattern<tosa::ConcatOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tosa::ConcatOp op,PatternRewriter &r) const override {
+    SmallVector<Value> inputs;std::optional<SmallVector<int64_t>> permutation;
+    Value permValue;
+    for(Value v:op.getOperands()) {
+      auto transpose=movable(v);if(!transpose)return failure();
+      auto p=permsOf(transpose);
+      if(!p || (permutation && *permutation!=*p))return failure();
+      permutation=p;permValue=transpose.getPerms();inputs.push_back(transpose.getInput1());
+    }
+    if(!permutation)return failure();
+    int64_t axis=op.getAxis();
+    if(axis<0 || axis>=int64_t(permutation->size()))return failure();
+    auto type=cast<RankedTensorType>(op.getType());
+    auto *concat=r.clone(*op);concat->setOperands(inputs);
+    concat->getResult(0).setType(permuted(type,inverse(*permutation)));
+    concat->setAttr("axis",r.getI32IntegerAttr((*permutation)[axis]));
+    r.replaceOpWithNewOp<tosa::TransposeOp>(op,type,concat->getResult(0),permValue);
+    return success();
+  }
+};
+
 struct TosaSinkTransposes : impl::TosaSinkTransposesBase<TosaSinkTransposes> {
   void runOnOperation() final {
     RewritePatternSet patterns(&getContext());
     patterns.add<SinkTranspose>(&getContext());
+    patterns.add<SinkConcatTranspose>(&getContext());
     tosa::TransposeOp::getCanonicalizationPatterns(patterns, &getContext());
     if (failed(
             applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))

@@ -111,6 +111,9 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ ${LCS_TILES:-kernel} == network ]]; then
+  exec bash "$REPO_DIR/scripts/lcs/network.sh" "$1" "${2:-$(dirname "$1")}"
+fi
 source "$REPO_DIR/scripts/check_docker.sh"
 INPUT=$(realpath "$1")
 OUT_DIR="${2:-$(dirname "$1")}"
@@ -123,6 +126,7 @@ PLUGIN="--load-dialect-plugin=$MLIR_PLUGIN_PATH --load-pass-plugin=$MLIR_PLUGIN_
 TOSA_PLUGIN="--load-pass-plugin=${SODAP_TOSA_PLUGIN:-$(dirname "$MLIR_PLUGIN_PATH")/SODATosaPlugin.so}"
 TRANSFORM="${LCS_TRANSFORM:-$REPO_DIR/scripts/lcs/transform.mlir}"
 TILES="${LCS_TILES:-kernel}"
+OPERATOR_FAMILY=${LCS_OPERATOR_FAMILY:-gemm}
 DEFAULT_ENTRY=tasks
 [ "$TILES" = operators ] && DEFAULT_ENTRY=tasks_gemm
 ENTRY="${LCS_ENTRY:-$DEFAULT_ENTRY}"
@@ -136,7 +140,18 @@ case "$TILES" in
       blas) FP_SOURCE=false ;;
       *) echo 'LCS_GEMM_FP_SEMANTICS must be source or blas' >&2; exit 1 ;;
     esac
-    OUTLINE="sodap-tosa-outline-operators{source-semantics=$FP_SOURCE}, sodap-join-multiple-tiles, func.func(canonicalize)" ;;
+    case $OPERATOR_FAMILY in
+      gemm) OUTLINE="sodap-tosa-outline-operators{source-semantics=$FP_SOURCE}, sodap-join-multiple-tiles, func.func(canonicalize)" ;;
+      add)
+        [[ ${LCS_HARDWARE_ONLY:-false} == true ]] || { echo 'Network addition uses the compiler network host; request hardware-only extraction here' >&2; exit 1; }
+        OUTLINE="sodap-tosa-outline-additions{lanes=${LCS_COMPUTE_LANES:-4} plm-bytes=${LCS_PLM_BYTES:-327680}}"
+        ENTRY=tasks ;;
+      conv)
+        [[ ${LCS_HARDWARE_ONLY:-false} == true ]] || { echo 'Network convolution uses the compiler network host; request hardware-only extraction here' >&2; exit 1; }
+        OUTLINE="sodap-tosa-outline-convolutions{lanes=${LCS_COMPUTE_LANES:-32} plm-bytes=${LCS_PLM_BYTES:-327680}}"
+        ENTRY=tasks_conv ;;
+      *) echo 'Unsupported operator family' >&2; exit 1 ;;
+    esac ;;
   *) echo 'LCS_TILES must be kernel or operators' >&2; exit 1 ;;
 esac
 TOP=forward_kernel
@@ -252,8 +267,11 @@ done
 step() {
   local where=$1
   shift
-  $DOCKER_RUN "$@" --mlir-disable-threading --mlir-print-ir-after-all \
-    --mlir-print-ir-module-scope 2> >(tee -a "$DUMP" "$where" > /dev/null) \
+  local debug_flags=(--mlir-disable-threading)
+  if [[ ${LCS_DUMP_IR:-true} == true ]]; then
+    debug_flags+=(--mlir-print-ir-after-all --mlir-print-ir-module-scope)
+  fi
+  $DOCKER_RUN "$@" "${debug_flags[@]}" 2> >(tee -a "$DUMP" "$where" > /dev/null) \
     || { grep -E "(error|note):" "$where" >&2 || tail -20 "$where" >&2; return 1; }
 }
 
@@ -303,15 +321,17 @@ BUFFERIZE="one-shot-bufferize{bufferize-function-boundaries function-boundary-ty
     buffer-results-to-out-params"
 
 section "$FRONTEND_DUMP" "The kernel into a tile, the transposes to the host, mlir-opt"
+EXTRACT_HARDWARE=
+[[ ${LCS_HARDWARE_ONLY:-false} == true ]] && EXTRACT_HARDWARE=",sodap-tosa-extract-hardware"
 step "$FRONTEND_DUMP" mlir-opt "$INPUT" $TOSA_PLUGIN --pass-pipeline="builtin.module(
     func.func(
       sodap-tosa-raise-transposes,
       sodap-tosa-fold-constant-transposes
     ),
-    $OUTLINE
+    $OUTLINE $EXTRACT_HARDWARE
   )" -o outlined.mlir
 
-if [ "$TILES" = operators ] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+if [ "$TILES" = operators ] && [ "$OPERATOR_FAMILY" = gemm ] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
   step "$FRONTEND_DUMP" mlir-opt outlined.mlir $PLUGIN \
     --pass-pipeline="builtin.module(sodap-select-reusable-hardware{lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES report=$PWD/hardware_selection.json})" \
     -o hardware_selected.mlir
@@ -434,7 +454,7 @@ if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
 fi
 if [ "$TILES" = operators ] && [[ ${LCS_REGISTER_BLOCK:-} == auto && ${LCS_BANK_LOCAL:-true} == true ]]; then
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
-    builtin.module(sodap-reusable-operator-backend{lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES dma-width=$DMA_WIDTH compute-report=$PWD/compute_plan.json storage-report=$PWD/compute_storage.json}),
+    builtin.module(sodap-reusable-operator-backend{family=$OPERATOR_FAMILY lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES dma-width=$DMA_WIDTH compute-report=$PWD/compute_plan.json storage-report=$PWD/compute_storage.json}),
     sodap-tiles-to-llvm)" -o acc.mlir
 else
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
@@ -479,6 +499,10 @@ for dir in tiles/*/; do
     | $DOCKER_RUN opt -passes=always-inline -S -o "$dir/05_hw_acc.ll"
 done
 cp "$TILE/05_hw_acc.ll" "$TILE/architecture.xml" .
+if [[ ${LCS_HARDWARE_ONLY:-false} == true ]]; then
+  python3 "$REPO_DIR/scripts/lcs/native_dma_contract.py" record "$PWD" --hardware-only
+  exit 0
+fi
 
 section "$HOST_DUMP" "Host: TOSA to linalg, bufferization, the ESP calls, mlir-opt"
 step "$HOST_DUMP" mlir-opt acc.mlir $PLUGIN --pass-pipeline="builtin.module(

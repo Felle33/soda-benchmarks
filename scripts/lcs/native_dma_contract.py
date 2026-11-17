@@ -34,14 +34,17 @@ def validate_socket(directory, platform, require_generated=True):
     if not match or int(match[1]) != contract['dma_data_width']:
         raise ValueError(f'Packed hardware DMA width does not match {vhdl}')
 
-def record(directory):
+def record(directory, hardware_only=False):
     layout = dict(line.split('=', 1) for line in (directory/'layout.txt').read_text().splitlines())
     contract = {
         'version': 1,
         'producer': 'tosa_to_lcs: receiver admission and retained output-tile readiness',
         'dma_word_stride': int(layout['dma_word_stride']),
-        'sha256': {name: digest(directory/name) for name in FILES},
+        'sha256': {name: digest(directory/name) for name in FILES
+                   if not hardware_only or name != '05_kernel_riscv.ll'},
     }
+    if hardware_only:
+        contract['scope'] = 'hardware-only; host generated from the network graph separately'
     if layout.get('dma_abi') == 'packed':
         width=int(layout['dma_data_width'])
         if width!=64: raise ValueError('Bambu backend supports packed DMA64 only')
@@ -77,7 +80,10 @@ def select(directory, mode):
     packed=contract.get('version')==2 and contract.get('dma_data_width')==64
     if not packed and (contract['version'] != 1 or contract['dma_word_stride'] != 2):
         raise ValueError('Thin 64-bit wrapper requires native DMA contract v1 with dma_word_stride=2')
-    for name in FILES:
+    required = set(FILES) - ({'05_kernel_riscv.ll'} if contract.get('scope', '').startswith('hardware-only;') else set())
+    if set(contract['sha256']) != required:
+        raise ValueError('Incomplete DMA contract artifact set')
+    for name in required:
         if digest(directory/name) != contract['sha256'][name]:
             raise ValueError(f'Stale native DMA contract: {name}')
     for generated, source in (('accelerator.ll','05_hw_acc.ll'), ('architecture.xml','architecture.xml')):
@@ -93,10 +99,11 @@ def main():
     parser.add_argument('action', choices=['record', 'select'])
     parser.add_argument('directory', type=Path)
     parser.add_argument('--wrapper', choices=['thin', 'buffered'], default='thin')
+    parser.add_argument('--hardware-only', action='store_true')
     args = parser.parse_args()
     try:
         if args.action == 'record':
-            record(args.directory)
+            record(args.directory, args.hardware_only)
         else:
             print(select(args.directory, args.wrapper))
     except (OSError, KeyError, ValueError) as error:
