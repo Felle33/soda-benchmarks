@@ -359,13 +359,28 @@ struct BankMatmulBuffers : sodap::impl::BankMatmulBuffersBase<BankMatmulBuffers>
     }
     // Existing slices now inherit the padded row stride. Their logical shape
     // and rank reduction stay unchanged.
-    getOperation().walk<WalkOrder::PreOrder>([&](memref::SubViewOp sub) {
-      auto old = sub.getType();
-      auto type = memref::SubViewOp::inferRankReducedResultType(old.getShape(),
-          cast<MemRefType>(sub.getSource().getType()), sub.getMixedOffsets(),
-          sub.getMixedSizes(), sub.getMixedStrides());
-      sub.getResult().setType(cast<MemRefType>(type));
+    getOperation().walk<WalkOrder::PreOrder>([&](Operation *op) {
+      if (auto sub = dyn_cast<memref::SubViewOp>(op)) {
+        auto type = memref::SubViewOp::inferRankReducedResultType(sub.getType().getShape(),
+            cast<MemRefType>(sub.getSource().getType()), sub.getMixedOffsets(),
+            sub.getMixedSizes(), sub.getMixedStrides());
+        sub.getResult().setType(cast<MemRefType>(type));
+      } else if (auto expand = dyn_cast<memref::ExpandShapeOp>(op)) {
+        // Padding changes the source view's strides even when the logical
+        // shape is unchanged. Propagate them through inserted unit axes before
+        // visiting consumers; retaining an identity layout can be invalid.
+        auto type = memref::ExpandShapeOp::computeExpandedType(
+            expand.getSrcType(), expand.getType().getShape(),
+            expand.getReassociationIndices());
+        if (failed(type)) {
+          expand.emitError("cannot infer expanded layout after bank padding");
+          invalid = true;
+        } else {
+          expand.getResult().setType(*type);
+        }
+      }
     });
+    if (invalid) return signalPassFailure();
     uint64_t physicalBytes = 0;
     getOperation().walk([&](Operation *op) {
       if (!isa<memref::AllocOp, memref::AllocaOp>(op)) return;

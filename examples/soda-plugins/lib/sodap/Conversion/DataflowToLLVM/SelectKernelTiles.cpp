@@ -69,12 +69,14 @@ struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles>
       " word-cycles=" + std::to_string(wordCycles) + " dma-word-stride=" +
       std::to_string(wordStride) + " plm-bytes=" + std::to_string(plmBytes) + "}";
   }
-  Candidate evaluate(uint64_t cap, bool historical, bool overlap,
+  Candidate evaluate(uint64_t cap, bool historical, bool overlap, bool doubleCopy,
                      StringRef path) {
     Candidate result;
     result.report["proposal"] = historical ? llvm::json::Object{{"max_tile",10}} :
                                              llvm::json::Object{{"plm",cap}};
     result.report["directory"] = path.str();
+    result.report["proposal_set"] = doubleCopy ? "double-copy" : "single-copy";
+    result.report["scored_schedule"] = overlap ? "overlap" : "nonoverlap";
     result.report["status"] = "REJECTED";
     result.report["returncode"] = 1;
     std::string diagnostics;
@@ -99,7 +101,7 @@ struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles>
         for (StringRef attr : {"tile_sizes","max_tile_size","plm_bytes"}) op->removeAttr(attr);
         op->setAttr(historical ? "max_tile_size" : "plm_bytes", b.getI64IntegerAttr(historical ? 10 : cap));
         op->setAttr("compute_lanes",b.getI64IntegerAttr(lanes));
-        op->setAttr("double_buffer",b.getBoolAttr(overlap));
+        op->setAttr("double_buffer",b.getBoolAttr(doubleCopy));
         op->setAttr("dma_request_cycles",b.getI64IntegerAttr(requestCycles));
         op->setAttr("dma_word_cycles",b.getI64IntegerAttr(wordCycles));
         configured=true;
@@ -182,10 +184,10 @@ struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles>
     SmallVector<std::pair<uint64_t,bool>> proposals;
     for (uint64_t cap:caps) proposals.emplace_back(cap,false);
     proposals.emplace_back(10,true);
-    auto search=[&](bool overlap, StringRef suffix) {
+    auto search=[&](bool overlap, bool doubleCopy, StringRef suffix) {
       std::vector<Candidate> candidates;
       for (auto [cap,historical] : proposals)
-        candidates.push_back(evaluate(cap,historical,overlap,root+"/.tile-search/"+
+        candidates.push_back(evaluate(cap,historical,overlap,doubleCopy,root+"/.tile-search/"+
                                       suffix.str()+"/"+std::to_string(candidates.size())));
       return candidates;
     };
@@ -195,10 +197,18 @@ struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles>
         if (candidates[i].score && (best<0 || *candidates[i].score<*candidates[best].score)) best=i;
       return best;
     };
-    auto selected=search(schedule=="overlap",schedule);
+    // Stable ties retain the historical proposal. Both sets are admitted and
+    // scored on the schedule actually generated, never on overlap for serial.
+    auto selected=search(schedule=="overlap",true,"double-copy");
+    if (schedule=="nonoverlap") {
+      auto single=search(false,false,"single-copy");
+      for (auto &candidate:single) selected.push_back(std::move(candidate));
+    }
     int best=winner(selected);
+    std::string winnerSet=best<0 ? "none" :
+      selected[best].report.getString("proposal_set")->str();
     std::vector<Candidate> old;
-    if (schedule=="nonoverlap") old=search(true,"old-overlap");
+    if (schedule=="nonoverlap") old=search(true,true,"old-overlap");
     int oldBest=schedule=="overlap" ? best : winner(old);
     llvm::json::Array reports,oldReports;
     for (auto &c:selected) reports.push_back(std::move(c.report));
@@ -206,7 +216,7 @@ struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles>
     llvm::json::Object report{{"implementation","sodap-select-kernel-tiles"},
       {"plm_budget",uint64_t(plmBytes)}, {"reuse_budget",uint64_t(reuseBytes)},
       {"scope","scheduled DMA cost, compute iterations, logical storage; physical banked admission"},
-      {"schedule",schedule.getValue()}, {"selected",best}, {"candidates",std::move(reports)},
+      {"schedule",schedule.getValue()}, {"selected_set",winnerSet}, {"selected",best}, {"candidates",std::move(reports)},
       {"old_overlap_selected",oldBest}, {"old_overlap_candidates",std::move(oldReports)}};
     std::string reportText;
     llvm::raw_string_ostream out(reportText); out << llvm::formatv("{0:2}\n",llvm::json::Value(std::move(report)));

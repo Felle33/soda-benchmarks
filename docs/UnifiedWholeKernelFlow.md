@@ -47,3 +47,16 @@ transform sed editing, and compiler emission of Bambu FP constraints. The old
 Python helpers remain for explicit legacy reproduction but are not invoked by
 either new mode. Do not treat this candidate as qualified or promote its costs
 into experimental results.
+
+## Follow-up qualification
+
+The serial selector now evaluates the union of double-copy and single-copy
+proposals on the actual serial schedule, with historical proposals first on
+ties. A local banking fix propagates inferred layouts through unit-axis
+expansions. It preserves all 40 frozen base designs and Exp2/Exp3 artifacts.
+A-H qualification passes: 133 lit tests, 40 PyTorch/native cases, unchanged MINI
+hardware and repeated GEMM component smoke (including the 50000-cycle stall).
+There are no analytical regressions. Fixing DOITGEN admits a cheaper single-copy
+proposal, so its final hardware differs from the release despite the initial
+union-only result retaining the release design. Evidence is under
+`../followup-20261117/evidence/` relative to this checkout. No FPGA/board work.

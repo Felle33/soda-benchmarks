@@ -7,6 +7,9 @@ for report in [old,new]:
  assert all(c['cost']['plm_bytes']<=report['plm_budget'] for c in report['candidates'] if c['status']=='VALID')
  assert isinstance(report['candidates'][report['selected']]['tiles'],list)
 assert new['schedule']=='nonoverlap' and old['schedule']=='overlap'
+assert len(new['candidates'])==2*len(old['candidates'])
+assert {c['proposal_set'] for c in new['candidates']}=={'single-copy','double-copy'}
+assert all(c['scored_schedule']=='nonoverlap' for c in new['candidates'])
 assert new['old_overlap_selected']==old['selected']
 for a,b in zip(old['candidates'],new['old_overlap_candidates']):
  assert a['status']==b['status']
