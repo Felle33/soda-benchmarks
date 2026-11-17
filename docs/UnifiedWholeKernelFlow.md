@@ -1,62 +1,104 @@
-# Unified kernel/network entry point (local, unqualified candidate)
+# Unified kernel/network entry point
 
-The local `experiment/flow-unified-20261117` branch starts at `ba29c43`.
-The whole-kernel migration is implemented, but qualification stopped at gate I:
-LARGE nonoverlap scheduled DMA cost regresses for 2MM, TRMM and DOITGEN.
-No new HLS, FPGA implementation or board campaign was started. Phase 2 is pending.
-The campaign report is `../REPORT.md` relative to this checkout's root; machine
-readable gate evidence is `../evidence/`.
+This local branch starts at `ba29c43`; the follow-up starts at `dfcdb4e`.
+Phase 1 correctness/identity qualification and Phase 2 script cleanup are
+complete. All 135 compiler tests pass. This is not a promoted FPGA campaign:
+the new nonoverlap GEMM MEDIUM selection is **12.8% slower in component RTL**
+despite a lower analytical DMA cost. No LARGE HLS, FPGA implementation or board
+work was performed in the follow-up. Detailed evidence and the read-only serial
+schedule diagnosis are in `../followup-20261117/REPORT.md` from this checkout.
 
-Use `scripts/pytorch_to_esp.py --mode kernel --schedule overlap|nonoverlap`
-for a whole-kernel accelerator, and `--mode network` (alias `--network`) for
-reusable operators. Both accept a PyTorch factory, model options and a fresh
-output directory. The existing PolyBench factory now accepts all ten kernels.
-The kernel mode retains `sodap-launches-to-esp`; network mode retains
-`sodap-tosa-network-host` and `ReusableOperatorRuntime.cpp`.
+## Entry points
 
-`sodap-whole-kernel-backend` is the registered kernel pipeline. Its options
-include `schedule`, `lanes`, `plm-bytes`, `reuse-bytes`, `dma-width`,
-`request-cycles`, `word-cycles`, `transform-file`, and `report-dir`.
-`sodap-select-kernel-tiles` evaluates the original five storage-cap proposals
-and historical max-tile-10 proposal through the existing passes. It ranks
-scheduled DMA cost, then compute iterations, then logical storage. Physical
-banked storage is checked independently. The serial proposal model counts one
-copy of transported/yielded tiles; overlap counts two. It records the old
-opposite/overlap-scored reference as well, without using measured/HLS results.
+Run in the pinned campaign container. Output directories must be new.
 
-`tile_search.json` records candidates, failures, costs, tiles and banked
-storage; `tile_sizes.txt` is emitted from transform metadata. Argument-order
-files are emitted by the outline/host and CPU-order passes, rather than Python
-IR parsing. Shared compute/banking/LLVM helpers preserve operator hardware and
-host identity. Tests cover both selection schedules, all-candidate rejection,
-outline ABI metadata and argument-order files.
+```bash
+python3 scripts/pytorch_to_esp.py \
+  examples/esp-validation/reusable-gemm/operators/polybench_models.py \
+  --model-options '{"kernel":"gemm","dataset":"LARGE"}' \
+  --mode kernel --schedule overlap --compute-lanes 64 \
+  --plm-bytes 327680 --reuse-bytes 262144 --dma-width 64 \
+  --output /campaign/my-gemm-overlap
 
-All 20 overlap designs and 10 MINI serial designs reproduce the frozen LLVM,
-XML and host. Ten LARGE serial LLVM files change due to the tile-copy model;
-all XML and host files remain identical. All 132 lit tests pass. Exp2 six
-host/engine cases and Exp3 three network host/engine sets remain identical.
+# Use the same command with --schedule nonoverlap and a different output path.
 
-The stop has two causes. The finite proposal set can omit the older better
-choice after changing the copy model (2MM/TRMM). DOITGEN's five storage-based
-proposals expose an existing unit-axis `memref.expand_shape` layout-verifier
-failure in the compute/banking path, leaving the expensive max-tile-10 fallback.
-These issues have not been tuned around or fixed beyond the specified plan.
+python3 scripts/pytorch_to_esp.py \
+  examples/esp-validation/reusable-gemm/operators/polybench_models.py \
+  --model-options '{"kernel":"twomm","dataset":"LARGE"}' \
+  --mode network --compute-lanes 64 --plm-bytes 327680 --dma-width 64 \
+  --output /campaign/my-reusable-2mm
+```
 
-Remaining Phase 2 work is behavior-selecting environment plumbing, operator
-transform sed editing, and compiler emission of Bambu FP constraints. The old
-Python helpers remain for explicit legacy reproduction but are not invoked by
-either new mode. Do not treat this candidate as qualified or promote its costs
-into experimental results.
+`--network` remains an alias for `--mode network`. Omitting mode preserves the
+historical network-driver default. `--schedule` is kernel-only. Network flags
+also expose `--conv-lanes`, `--add-lanes` and family device-instance indices;
+the compiler chooses the established GEMM default when `--compute-lanes` is
+omitted. Kernel cost parameters are `--dma-request-cycles` and
+`--dma-word-cycles`. These are analytical inputs, never RTL measurements.
 
-## Follow-up qualification
+## Compiler responsibilities
 
-The serial selector now evaluates the union of double-copy and single-copy
-proposals on the actual serial schedule, with historical proposals first on
-ties. A local banking fix propagates inferred layouts through unit-axis
-expansions. It preserves all 40 frozen base designs and Exp2/Exp3 artifacts.
-A-H qualification passes: 133 lit tests, 40 PyTorch/native cases, unchanged MINI
-hardware and repeated GEMM component smoke (including the 50000-cycle stall).
-There are no analytical regressions. Fixing DOITGEN admits a cheaper single-copy
-proposal, so its final hardware differs from the release despite the initial
-union-only result retaining the release design. Evidence is under
-`../followup-20261117/evidence/` relative to this checkout. No FPGA/board work.
+`sodap-tosa-esp-outline` extracts kernel or operator hardware.
+`sodap-whole-kernel-backend` owns kernel selection, task scheduling, transport,
+compute allocation, banking and LLVM emission. Both schedules use this pipeline.
+Its options include schedule, lanes, PLM/reuse budgets, DMA width, analytical
+request/word costs, transform library and report directory. Shared C++ helpers
+also implement the matching portions of `sodap-operator-pipeline` and
+`sodap-reusable-operator-backend`.
+
+`sodap-select-kernel-tiles` keeps the historical five storage-cap proposals and
+max-tile-10 proposal. Overlap evaluates the double-copy proposal set.
+Nonoverlap evaluates the union of double-copy and single-copy proposals, each
+on the actual serial schedule. The objective is lexicographic DMA cycles,
+compute iterations, then logical storage. Actual banked local storage is an
+additional admission check. Historical proposals win exact ties.
+`tile_search.json` identifies each candidate's proposal set, status, costs,
+storage and selected tiles, plus the historical overlap-scored selection.
+
+The banking pass now re-infers `memref.expand_shape` layouts after allocation
+padding changes the source view. This repairs a unit-axis DOITGEN verifier
+error without changing any of the 40 frozen base designs. It admits a new
+DOITGEN candidate under the union search; no special DOITGEN workaround exists.
+
+The outline/host and CPU-order passes emit and consume argument metadata.
+`sodap-whole-kernel-host` retains `sodap-launches-to-esp` for kernel mode.
+`sodap-tosa-network-pipeline` retains the single network host pass and
+`ReusableOperatorRuntime.cpp` for all reusable operators. No host, descriptor,
+adapter, socket or Bambu semantics changed in this follow-up.
+
+## Phase 2: options and HLS contract
+
+`sodap-apply-lcs-transform` configures the transform module in C++, replacing
+shell `sed` edits. Registered C++ pipelines hold the pass sequences formerly
+assembled by shell. The shell receives explicit arguments; it rejects obsolete
+`LCS_*` behavior variables. The PyTorch driver isolates its options from inherited
+experiment environments. `LCS_DUMP_IR` and tool-path variables remain supported.
+
+`sodap-emit-hls-configuration` writes the unchanged `compute_config.json` and
+the complete Bambu FP-resource argument to `bambu_fp_constraints.txt`. The HLS
+script reads that file verbatim. Old artifacts without it must use their
+archived HLS script. Python/shell still import PyTorch, export reference fixtures,
+invoke tools, read compiler manifests, link, hash and report. The legacy
+`select_tiles.py` and `argument_order.py` are not invoked by either clean mode.
+
+All 40 kernel LLVM/XML/host sets and all six Exp2 plus three Exp3 host/engine
+sets remain byte-identical across Phase 2. Intermediate compiler IR and stable
+cost/storage reports also match. Logs and provenance records naturally differ;
+the generated `sed` transform file is eliminated and the HLS-constraint file is
+new. Forty fresh PyTorch lowerings reproduce the archived-TOSA results, and
+the corresponding native numerical checks pass.
+
+## Qualification limit
+
+All overlap and MINI designs remain identical to the release. LARGE nonoverlap
+2MM/TRMM also remain identical. GEMM, 3MM, SYRK, SYR2K, SYMM, ATAX, GESUMMV and
+DOITGEN have changed LARGE hardware and would require new qualification/builds.
+Every LARGE analytical cost is no worse than the release. However, measured
+GEMM MEDIUM takes 5,085,030 cycles versus 4,507,884 with release-policy tiles.
+Fewer DMA beats are offset by more controller/local-memory service cycles.
+No selection was changed using this measurement.
+
+The parity audit confirms shared compute, banking, reuse and transport policies.
+The schedule-dependent differences are serial task fusion, ping-pong ownership
+and decoupled outstanding-load generation. Their HLS scheduling consequences
+mean that the remaining gap cannot be described solely as hidden DMA latency.

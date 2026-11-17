@@ -3,9 +3,10 @@
 #define SODAP_KERNEL_PIPELINE_H
 #include <string>
 namespace mlir::sodap::kernel {
-inline std::string frontend() {
+inline std::string frontend(bool operators=false) {
   return "func.func(tosa-to-arith,tosa-to-tensor,tosa-to-linalg-named,tosa-to-linalg,"
-         "sodap-linalg-rank-reduce-contractions),linalg-fold-unit-extent-dims,"
+         "sodap-linalg-rank-reduce-contractions),linalg-fold-unit-extent-dims," +
+         std::string(operators ? "func.func(sodap-dataflow-bind-dims,sodap-linalg-fold-runtime-broadcasts)," : "") +
          "linalg-fuse-elementwise-ops,func.func(sodap-linalg-constants-to-indices,"
          "sodap-dataflow-bind-dims),canonicalize";
 }

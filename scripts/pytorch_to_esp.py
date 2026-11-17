@@ -25,6 +25,12 @@ def main():
     p.add_argument('--compute-lanes', type=int, default=None,
                    help='FP32 compute lanes (kernel default 64; network compiler default 16 with conv, otherwise 64)')
     p.add_argument('--plm-bytes', type=int, default=327680)
+    p.add_argument('--reuse-bytes', type=int, default=262144)
+    p.add_argument('--dma-request-cycles', type=int, default=64)
+    p.add_argument('--dma-word-cycles', type=int, default=1)
+    p.add_argument('--conv-instance', type=int, default=0)
+    p.add_argument('--gemm-instance', type=int, default=0)
+    p.add_argument('--add-instance', type=int, default=0)
     p.add_argument('--dma-width', type=int, choices=[64], default=64)
     p.add_argument('--network-host-only', action='store_true',
                    help='Validate compiler-owned CNN host lowering; no hardware qualification')
@@ -89,25 +95,25 @@ def main():
                                  torch_mlir_module=torchscript.__file__),
                    tosa_sha256=sha(out/'01_tosa.mlir'))
     (out/'fixture.json').write_text(json.dumps(fixture, indent=2)+'\n')
-    env = {**os.environ, 'LCS_TILES':'operators', 'LCS_REUSABLE_GEMM':'false',
-           'LCS_DMA_ABI':'packed', 'LCS_DMA_DATA_WIDTH':str(a.dma_width),
-           'LCS_COMPUTE_LANES':str(a.compute_lanes if a.compute_lanes is not None else 0), 'LCS_PLM_BYTES':str(a.plm_bytes),
-           'LCS_GEMM_FP_SEMANTICS':'source', 'LCS_PROFILE':'true'}
-    env.update(LCS_CONV_LANES=str(a.conv_lanes),LCS_ADD_LANES=str(a.add_lanes),
-               LCS_GEMM_LANES=str(a.compute_lanes if a.compute_lanes is not None else 0),LCS_DUMP_IR='false')
-    # Reproducible defaults: unrelated experiments must not inject schedules.
-    for key in ('LCS_TILE_SIZES','LCS_REGISTER_BLOCK','LCS_TRANSFORM','LCS_ENTRY',
-                'LCS_SEQUENTIAL','LCS_OVERLAP','LCS_FP_UNITS','LCS_BANK_LOCAL'):
-        env.pop(key, None)
+    # Behavior is explicit in command-line/pass options. Only dumping and tool
+    # paths remain environmental; inherited experiments cannot alter this flow.
+    env = {k:v for k,v in os.environ.items() if not k.startswith(('LCS_','_LCS_'))}
+    env['LCS_DUMP_IR'] = os.environ.get('LCS_DUMP_IR','false')
+    options = ['--mode',a.mode,'--plm-bytes',str(a.plm_bytes),'--dma-width',str(a.dma_width),
+               '--reuse-bytes',str(a.reuse_bytes)]
     if a.mode == 'kernel':
-        env['LCS_TILES'] = 'kernel'
-        env['LCS_OVERLAP'] = 'false' if a.schedule == 'nonoverlap' else 'true'
-        if a.compute_lanes is None:
-            env.pop('LCS_COMPUTE_LANES', None)  # Compiler pipeline default.
-    (out/'lowering-env.json').write_text(json.dumps({k:v for k,v in env.items() if k.startswith('LCS_')},indent=2)+'\n')
+        options += ['--schedule',a.schedule or 'overlap','--request-cycles',str(a.dma_request_cycles),
+                        '--word-cycles',str(a.dma_word_cycles)]
+        if a.compute_lanes is not None: options += ['--compute-lanes',str(a.compute_lanes)]
+    else:
+        options += ['--gemm-lanes',str(a.compute_lanes if a.compute_lanes is not None else 0),
+                    '--conv-lanes',str(a.conv_lanes),'--add-lanes',str(a.add_lanes),
+                    '--conv-instance',str(a.conv_instance),'--gemm-instance',str(a.gemm_instance),
+                    '--add-instance',str(a.add_instance)]
+    (out/'lowering-options.json').write_text(json.dumps(options,indent=2)+'\n')
     driver = 'scripts/lcs/network_host.sh' if a.network_host_only else 'scripts/tosa_to_lcs.sh'
     with (out/'compile.log').open('w') as log:
-        subprocess.run(['bash',str(repo/driver),str(out/'01_tosa.mlir'),str(out/'generated')],
+        subprocess.run(['bash',str(repo/driver),str(out/'01_tosa.mlir'),str(out/'generated'),*options],
                        env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
     if a.mode == 'kernel':
         result = dict(status='KERNEL_LOWERED_NOT_HARDWARE_VALIDATED',

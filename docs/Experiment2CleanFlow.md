@@ -3,7 +3,7 @@
 Operator mode has one host generator: `sodap-tosa-network-host` in
 `Tosa/NetworkHost.cpp`, linked with `ReusableOperatorRuntime.cpp` (`esp_op_*`).
 GEMM chains and mixed CNN graphs use the same host lowering and runtime.
-Whole-kernel mode (`LCS_TILES=kernel`, Experiment 1) retains
+Whole-kernel mode (`--mode kernel`, Experiment 1) retains
 `sodap-launches-to-esp`; operator-mode drivers reject that legacy host route.
 
 ## Compile a PyTorch program
@@ -15,6 +15,7 @@ tensors, including scalar coefficient tensors. For example:
 python3 scripts/pytorch_to_esp.py \
   examples/esp-validation/reusable-gemm/operators/polybench_models.py \
   --model-options '{"kernel":"twomm","dataset":"LARGE"}' \
+  --mode network \
   --compute-lanes 64 --plm-bytes 327680 --dma-width 64 \
   --output /campaign/cases/LARGE/twomm
 ```
@@ -23,6 +24,14 @@ The frontend executes the actual model for reference data and imports fresh
 TOSA. Canonical 2MM retains its alpha/beta expressions; `twomm_mm` is not used.
 Python exports fixtures and invokes tools. It makes no fusion, scheduling,
 tiling, banking or allocation decision.
+
+The shared shell path now takes explicit options and invokes registered C++
+pipelines (`sodap-tosa-network-pipeline`, `sodap-tosa-esp-outline`,
+`sodap-operator-pipeline`). Transform configuration and complete Bambu FP
+constraints are emitted by compiler passes, not shell edits or Python policy.
+Only IR dumping and tool locations remain environmental. See
+[UnifiedWholeKernelFlow.md](UnifiedWholeKernelFlow.md) for the cleanup and
+identity evidence; this migration leaves Exp2 hardware and hosts unchanged.
 
 Outputs under `generated/` include `host.mlir`, `host.ll`, `host-riscv.o`,
 `parameters.bin`, `network.json`, and `engines/<implementation>/05_hw_acc.ll`

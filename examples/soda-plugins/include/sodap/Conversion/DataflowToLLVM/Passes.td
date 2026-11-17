@@ -67,6 +67,24 @@ def EmitBambuArchitecture :
   let dependentDialects = ["::mlir::sodap::dataflow::DataflowDialect"];
 }
 
+def ApplyLCSTransform : Pass<"sodap-apply-lcs-transform", "::mlir::ModuleOp"> {
+  let summary = "Configure and apply operator transform library inside the compiler";
+  let options = [
+    Option<"family", "family", "std::string", "\"gemm\"", "Operator family">,
+    Option<"lanes", "lanes", "unsigned", "64", "Core lanes">,
+    Option<"transformFile", "transform-file", "std::string", "\"\"", "Transform library">,
+    Option<"reportDir", "report-dir", "std::string", "\".\"", "Reports directory">
+  ];
+}
+
+def EmitHLSConfiguration : Pass<"sodap-emit-hls-configuration", "::mlir::ModuleOp"> {
+  let summary = "Write fixed-format HLS constraints and compute provenance";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "FP32 unit constraint per task">,
+    Option<"directory", "directory", "std::string", "\".\"", "Output directory">
+  ];
+}
+
 def SelectKernelTiles : Pass<"sodap-select-kernel-tiles", "::mlir::ModuleOp"> {
   let summary = "Select whole-kernel tiles using the requested scheduled IR";
   let options = [

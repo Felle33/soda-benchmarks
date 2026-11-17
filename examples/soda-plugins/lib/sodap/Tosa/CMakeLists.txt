@@ -2,6 +2,7 @@ add_mlir_library(MLIRSODAPTosa
         JoinMultipleTiles.cpp
         TosaTransposes.cpp
         NetworkHost.cpp
+        Pipelines.cpp
         OutlineAdditions.cpp
         OutlineConvolutions.cpp
         FoldConvAffine.cpp

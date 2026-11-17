@@ -22,6 +22,8 @@
 namespace mlir {
 namespace sodap {
 
+void registerSODAPTosaPipelines();
+
 #define GEN_PASS_DECL
 #include "sodap/Tosa/Passes.h.inc"
 

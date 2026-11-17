@@ -17,12 +17,19 @@ PyTorch + checkpoint -> torch-mlir/TOSA
             -> accelerator LLVM + architecture.xml -> Bambu -> native ESP
 ```
 
-`scripts/pytorch_to_esp.py` (optionally spelled `--network`) loads the model, invokes torch-mlir, saves
+`scripts/pytorch_to_esp.py --mode network` (alias `--network`) loads the model, invokes torch-mlir, saves
 test fixtures and runs tools. Python does not recognize layers, assign buffers,
 emit the network schedule, optimize a datapath or generate accelerator C++.
 The shell driver reads the compiler's engine manifest and invokes the common
 operator backend. Packaging scripts only embed data, link objects and namespace
 RTL/interface names.
+
+The common shell path takes explicit driver options and invokes registered C++
+pipelines for the network host, hardware extraction and operator backend.
+Transform configuration and Bambu FP constraints are compiler outputs. The
+Phase 2 cleanup preserves all three network hosts and engine artifacts;
+[UnifiedWholeKernelFlow.md](UnifiedWholeKernelFlow.md) records its scope and
+the separate whole-kernel performance limitation.
 
 The new C++ network host pass handles mixed CPU/accelerator operations and
 residual lifetimes, which the original GEMM-only host pass did not support.

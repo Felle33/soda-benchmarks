@@ -6,9 +6,10 @@ repo=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 input=$(realpath "${1:?input TOSA}")
 mkdir -p "${2:?output directory}"
 out=$(realpath "$2")
+source "$repo/scripts/lcs/options.sh" "${@:3}"
 plugin=${SODAP_LIB_DIR:-$repo/build/plugin/lib}/SODATosaPlugin.so
 mlir-opt "$input" --load-pass-plugin="$plugin" \
-  --pass-pipeline="builtin.module(func.func(sodap-tosa-sink-transposes,tosa-layerwise-constant-fold,sodap-tosa-sink-transposes,tosa-layerwise-constant-fold,sodap-tosa-fold-conv-affine,sodap-tosa-sink-transposes,tosa-layerwise-constant-fold,sodap-tosa-fold-conv-affine),canonicalize,sodap-tosa-network-host{directory=$out dma-width=${LCS_DMA_DATA_WIDTH:-64} conv-instance=${LCS_CONV_INSTANCE:-0} add-instance=${LCS_ADD_INSTANCE:-0} gemm-instance=${LCS_GEMM_INSTANCE:-0} conv-lanes=${LCS_CONV_LANES:-64} gemm-lanes=${LCS_GEMM_LANES:-${LCS_COMPUTE_LANES:-0}} add-lanes=${LCS_ADD_LANES:-4} plm-bytes=${LCS_PLM_BYTES:-327680}})" \
+  --pass-pipeline="builtin.module(sodap-tosa-network-pipeline{directory=$out dma-width=$dma_width conv-instance=$conv_instance add-instance=$add_instance gemm-instance=$gemm_instance conv-lanes=$conv_lanes gemm-lanes=$gemm_lanes add-lanes=$add_lanes plm-bytes=$plm_bytes})" \
   -o "$out/host.mlir"
 soda-opt "$out/host.mlir" --lower-all-to-llvm=use-bare-ptr-memref-call-conv \
   --convert-func-to-llvm --reconcile-unrealized-casts -o "$out/host-llvm.mlir"

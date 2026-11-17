@@ -14,6 +14,8 @@
 #include <tuple>
 
 namespace mlir::sodap {
+#define GEN_PASS_DEF_APPLYLCSTRANSFORM
+#define GEN_PASS_DEF_EMITHLSCONFIGURATION
 #define GEN_PASS_DEF_SELECTKERNELTILES
 #define GEN_PASS_DEF_SNAPSHOTKERNELIR
 #include "sodap/Conversion/DataflowToLLVM/Passes.h.inc"
@@ -38,6 +40,71 @@ struct SnapshotKernelIR : sodap::impl::SnapshotKernelIRBase<SnapshotKernelIR> {
   using Base::Base;
   void runOnOperation() override {
     if (!file.empty() && failed(writeText(file, print(getOperation())))) signalPassFailure();
+  }
+};
+struct EmitHLSConfiguration : sodap::impl::EmitHLSConfigurationBase<EmitHLSConfiguration> {
+  using Base::Base;
+  void runOnOperation() override {
+    if (!lanes || lanes>256) {
+      getOperation().emitError("HLS core unit budget must be 1..256");
+      return signalPassFailure();
+    }
+    std::string config="{\"enabled\":true,\"selection\":\"compiler_compute_budget\","
+      "\"register_rows\":null,\"register_columns\":null,\"dimensions_report\":\"compute_plan.json\","
+      "\"fp_units_per_task\":"+std::to_string(lanes)+",\"bank_local\":true}\n";
+    std::string constraint="-C=__float_mule8m23b_127nih="+std::to_string(lanes)+
+      ",__float_adde8m23b_127nih="+std::to_string(lanes)+"\n";
+    if (failed(writeText(directory+"/compute_config.json",config)) ||
+        failed(writeText(directory+"/bambu_fp_constraints.txt",constraint))) signalPassFailure();
+  }
+};
+struct ApplyLCSTransform : sodap::impl::ApplyLCSTransformBase<ApplyLCSTransform> {
+  using Base::Base;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<transform::TransformDialect>();
+  }
+  void runOnOperation() override {
+    if (family!="gemm" && family!="conv" && family!="add") {
+      getOperation().emitError("unsupported operator transform family");
+      return signalPassFailure();
+    }
+    OwningOpRef<ModuleOp> library;
+    if (failed(transform::detail::parseTransformModuleFromFile(&getContext(),transformFile,library)))
+      return signalPassFailure();
+    OpBuilder b(&getContext());
+    library->walk([&](Operation *op) {
+      if(op->getName().getStringRef()!="transform.sodap.tile_and_fuse") return;
+      auto name=op->getParentOp()->getAttrOfType<StringAttr>("sym_name");
+      if(!name || name.getValue()!="tile_tasks") return;
+      for(StringRef key:{"tile_sizes","max_tile_size"}) op->removeAttr(key);
+      op->setAttr("plm_bytes",b.getI64IntegerAttr(65536));
+      op->setAttr("compute_lanes",b.getI64IntegerAttr(lanes));
+      op->setAttr("dma_request_cycles",b.getI64IntegerAttr(64));
+      op->setAttr("dma_word_cycles",b.getI64IntegerAttr(1));
+    });
+    StringRef entry=family=="gemm" ? "tasks_gemm" : family=="conv" ? "tasks_conv" : "tasks";
+    std::string sizesText;
+    llvm::raw_string_ostream sizesStream(sizesText);
+    for(ModuleOp tile:getOperation().getOps<ModuleOp>()) {
+      tile->setAttr("sodap.capture_tile_selection",b.getUnitAttr());
+      auto root=transform::detail::findTransformEntryPoint(tile,*library,entry);
+      if(!root || failed(transform::applyTransformNamedSequence(tile,root,*library,transform::TransformOptions())))
+        return signalPassFailure();
+      if(auto sizes=tile->getAttrOfType<ArrayAttr>("sodap.selected_tile_sizes")) {
+        sizesStream << "[";
+        llvm::interleaveComma(sizes,sizesStream,[&](Attribute row) {
+          sizesStream << "[";
+          llvm::interleaveComma(cast<ArrayAttr>(row),sizesStream,[&](Attribute n) {
+            sizesStream << cast<IntegerAttr>(n).getInt();
+          });
+          sizesStream << "]";
+        });
+        sizesStream << "]\n";
+      }
+      tile->removeAttr("sodap.capture_tile_selection");
+      tile->removeAttr("sodap.selected_tile_sizes");
+    }
+    if(failed(writeText(reportDir+"/tile_sizes.txt",sizesText))) signalPassFailure();
   }
 };
 struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles> {

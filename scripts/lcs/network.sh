@@ -6,18 +6,17 @@ repo=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 input=$(realpath "${1:?input TOSA}")
 mkdir -p "${2:?output directory}"
 out=$(realpath "$2")
-bash "$repo/scripts/lcs/network_host.sh" "$input" "$out"
+source "$repo/scripts/lcs/options.sh" "${@:3}"
+bash "$repo/scripts/lcs/network_host.sh" "$input" "$out" "${@:3}"
 python3 - "$out/network.json" > "$out/engines.tsv" <<'PY'
 import json,sys
 for engine in json.load(open(sys.argv[1]))['engines']:
     print(engine['name'],engine['operator'],engine['lanes'],engine['plm_bytes'],sep='\t')
 PY
 while IFS=$'\t' read -r name family lanes storage; do
-  env LCS_TILES=operators LCS_OPERATOR_FAMILY="$family" LCS_HARDWARE_ONLY=true \
-    LCS_COMPUTE_LANES="$lanes" LCS_PLM_BYTES="$storage" LCS_DMA_ABI=packed \
-    LCS_DMA_DATA_WIDTH=64 LCS_GEMM_FP_SEMANTICS=source \
-    LCS_DUMP_IR=${LCS_DUMP_IR:-false} \
-    bash "$repo/scripts/tosa_to_lcs.sh" "$out/source.mlir" "$out/engines/$name" \
+  bash "$repo/scripts/tosa_to_lcs.sh" "$out/source.mlir" "$out/engines/$name" \
+    --mode network --hardware-family "$family" --compute-lanes "$lanes" \
+    --plm-bytes "$storage" --reuse-bytes "$reuse_bytes" --dma-width "$dma_width" \
     > "$out/engine-$name.log" 2>&1
 done < "$out/engines.tsv"
 python3 - "$out" <<'PY'
