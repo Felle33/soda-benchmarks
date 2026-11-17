@@ -28,7 +28,8 @@ step() {
 for file in frontend acc host cpu; do : > "ir_after_each_pass_$file.mlir"; done
 : > ir_after_each_pass.mlir
 outstanding=true; sequential=false; overlap=true
-[[ $schedule == nonoverlap ]] && { outstanding=false; sequential=true; overlap=false; }
+[[ $schedule == serial-tasks ]] && { sequential=true; overlap=false; }
+[[ $schedule == fused || $schedule == nonoverlap ]] && { outstanding=false; sequential=true; overlap=false; }
 [[ -n $family ]] && outstanding=false
 printf 'dma_word_stride=2\nprofile=%s\noutstanding_loads=%s\nsequential=%s\ndma_abi=packed\ndma_data_width=%s\n' \
   "$profile" "$outstanding" "$sequential" "$dma_width" > layout.txt

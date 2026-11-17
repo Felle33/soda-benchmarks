@@ -137,6 +137,8 @@ def Schedule :
   }];
   let options = [Option<"reuseBufferBudget", "reuse-buffer-budget", "uint64_t",
       "0", "Byte budget for inferred intermediate reuse buffers (two slots plus accumulator); zero preserves the always-load schedule">,
+      Option<"serialTasks", "serial-tasks", "bool", "false",
+      "Serialize distinct LCS tasks with explicit stage handoffs">,
       Option<"serial", "serial", "bool", "false",
       "Emit the same demand-driven schedule as one sequential LCS task with single-copy tiles/slabs; preserve reuse selection">];
   let dependentDialects = [
@@ -201,6 +203,8 @@ def Tails :
 def PingPong :
     Pass<"sodap-dataflow-ping-pong", "::mlir::func::FuncOp"> {
   let summary = "Synchronise the tasks of a dispatch with ping-pong buffers";
+  let options = [Option<"singleSlot", "single-slot", "bool", "false",
+                        "Use slot zero under the serial task handoff">];
   let description = [{
     Works on the dispatches `sodap-dataflow-schedule` leaves: tasks sharing
     buffers a tile at a time, the writer and the readers of each walking the

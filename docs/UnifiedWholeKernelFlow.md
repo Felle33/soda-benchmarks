@@ -20,7 +20,8 @@ python3 scripts/pytorch_to_esp.py \
   --plm-bytes 327680 --reuse-bytes 262144 --dma-width 64 \
   --output /campaign/my-gemm-overlap
 
-# Use the same command with --schedule nonoverlap and a different output path.
+# For serial tasks or fusion use --schedule serial-tasks or --schedule fused
+# and a separate output directory. --schedule nonoverlap remains an alias for fused.
 
 python3 scripts/pytorch_to_esp.py \
   examples/esp-validation/reusable-gemm/operators/polybench_models.py \
@@ -40,7 +41,7 @@ omitted. Kernel cost parameters are `--dma-request-cycles` and
 
 `sodap-tosa-esp-outline` extracts kernel or operator hardware.
 `sodap-whole-kernel-backend` owns kernel selection, task scheduling, transport,
-compute allocation, banking and LLVM emission. Both schedules use this pipeline.
+compute allocation, banking and LLVM emission. All three schedules use this pipeline.
 Its options include schedule, lanes, PLM/reuse budgets, DMA width, analytical
 request/word costs, transform library and report directory. Shared C++ helpers
 also implement the matching portions of `sodap-operator-pipeline` and
@@ -48,13 +49,21 @@ also implement the matching portions of `sodap-operator-pipeline` and
 
 `sodap-select-kernel-tiles` keeps the historical five storage-cap proposals and
 max-tile-10 proposal. Overlap evaluates the double-copy proposal set.
-Nonoverlap also defaults to the double-copy proposals and evaluates them on
+The fused schedule also defaults to the double-copy proposals and evaluates them on
 the actual serial schedule. Set the pass or backend pipeline option
 `single-copy-proposals=true` to include the experimental single-copy set. The objective is lexicographic DMA cycles,
 compute iterations, then logical storage. Actual banked local storage is an
 additional admission check. Historical proposals win exact ties.
 `tile_search.json` identifies each candidate's proposal set, status, costs,
 storage and selected tiles, plus the historical overlap-scored selection.
+
+The serial-tasks schedule uses the overlap winner and the same separate compute
+and DMA tasks. It allocates one shared slot per tile operand and checks the
+actual allocation against the storage budget. The store grants work to one
+receiver or compute task at a time and waits for completion. Tile publication,
+reuse scopes and compute lane allocation follow the overlap path. In designs
+with a packed DMA broker, the final row of each output tile returns a completion
+token to the store. The comparison includes the time spent on these handoffs.
 
 The banking pass now re-infers `memref.expand_shape` layouts after allocation
 padding changes the source view. This repairs a unit-axis DOITGEN verifier

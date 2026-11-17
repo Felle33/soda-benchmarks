@@ -35,7 +35,7 @@ def main():
     p.add_argument('--network-host-only', action='store_true',
                    help='Validate compiler-owned CNN host lowering; no hardware qualification')
     p.add_argument('--mode', choices=['kernel','network'], default=None)
-    p.add_argument('--schedule', choices=['overlap','nonoverlap'], default=None,
+    p.add_argument('--schedule', choices=['overlap','serial-tasks','fused','nonoverlap'], default=None,
                    help='Whole-kernel LCS schedule (default overlap)')
     p.add_argument('--network', action='store_true', help='Alias for --mode network')
     p.add_argument('--conv-lanes', type=int, default=64)

@@ -146,6 +146,7 @@ struct PackedClient {
   DMAStreams dma;
   Value meta, notice;
   TaskOp task;
+  Value storeCompleted = {};
 };
 // A finite round-robin broker exists only if stores can touch valid neighbors.
 // Each client admits its receive buffer or acquires a ready output token before
@@ -170,6 +171,8 @@ packedBroker(OpBuilder &b, func::FuncOp top, const DMAStreams &physical,
     Value ctrl = channel(64), rd = channel(width), wd = channel(width),
           meta = channel(64), notice = channel(8);
     result[task] = {{ctrl, rd, ctrl, wd}, meta, notice, task};
+    if (task->hasAttr("sodap.serial_coordinator"))
+      result[task].storeCompleted = channel(8);
   }
   auto broker = b.create<TaskOp>(loc, TypeRange{});
   broker->setAttr("sodap.dma_broker", b.getUnitAttr());
@@ -229,6 +232,11 @@ packedBroker(OpBuilder &b, func::FuncOp top, const DMAStreams &physical,
                           e.integer(255)));
                       e.store(physical, addr, count, first, end,
                               [&](Value) { return e.read(c.dma.writeData); });
+                      // Bit 1 identifies the final row of a serial tile. Return
+                      // ownership after the last physical payload handshake.
+                      if (c.storeCompleted)
+                        e.when(e.eq(e.band(meta, e.integer(2)), e.integer(2)),
+                               [&] { e.write(c.storeCompleted, e.integer(1, 8)); });
                     });
                     e.when(
                         b.create<arith::XOrIOp>(loc, writing, e.integer(1, 1)),

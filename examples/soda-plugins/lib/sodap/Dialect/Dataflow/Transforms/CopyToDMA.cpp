@@ -577,7 +577,9 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
         DMAStreams ports=it!=clients.end()?it->second.dma:dma;
         Value meta=it!=clients.end()?it->second.meta:Value();
         Value notice=it!=clients.end()?it->second.notice:Value();
-        if(transfer.view.empty())lowerPackedTransfer(b,transfer,ports,dmaDataWidth,meta,notice,taskFields);
+        if(transfer.view.empty())
+          lowerPackedTransfer(b, transfer, ports, dmaDataWidth, meta, notice,
+                              taskFields, it == clients.end() ? Value() : it->second.storeCompleted);
         else lowerPackedViewTransfer(b,transfer,ports,dmaDataWidth,meta,notice,taskFields,mergeWindowRuns);
       } else lowerTransfer(b, transfer, dma, wordStride, taskFields);
       transfer.copy.erase();

@@ -215,7 +215,9 @@ void splitParts(DispatchOp dispatch) {
     }
 }
 
-LogicalResult pingPong(DispatchOp dispatch) {
+LogicalResult pingPong(DispatchOp dispatch, bool singleSlot) {
+  if (singleSlot != dispatch->hasAttr("sodap.serial_tasks"))
+    return dispatch.emitOpError("single-slot storage requires the serial-tasks handoff");
   splitParts(dispatch);
   Block &body = dispatch.getBody().front();
   OpBuilder builder(dispatch.getContext());
@@ -282,9 +284,9 @@ LogicalResult pingPong(DispatchOp dispatch) {
                << *read << " and " << *written << " (sodap-dataflow-schedule)";
     }
 
-    // The two slots, and a token stream per reader.
+    // Allocate the tile slots and a publication stream per reader.
     Location loc = alloc.getLoc();
-    SmallVector<int64_t> shape{2};
+    SmallVector<int64_t> shape{singleSlot ? 1 : 2};
     llvm::append_range(shape, tile.getShape());
     builder.setInsertionPoint(alloc);
     Value slots = builder.create<memref::AllocOp>(
@@ -301,9 +303,12 @@ LogicalResult pingPong(DispatchOp dispatch) {
     // the slot at the end: Bambu wants each task on a ping-pong buffer to be
     // a writer or a reader, not both.
     builder.setInsertionPointToStart(&writer->task.getBody().front());
-    Value var = builder.create<memref::AllocaOp>(loc, MemRefType::get({}, i8));
-    builder.create<memref::StoreOp>(
-        loc, builder.create<arith::ConstantIntOp>(loc, 0, 8), var);
+    Value var;
+    if (!singleSlot)
+      var = builder.create<memref::AllocaOp>(loc, MemRefType::get({}, i8));
+    Value zero = builder.create<arith::ConstantIntOp>(loc, 0, 8);
+    if (var)
+      builder.create<memref::StoreOp>(loc, zero, var);
     Value target;
     if (writer->reads)
       target = builder.create<memref::AllocOp>(
@@ -312,7 +317,7 @@ LogicalResult pingPong(DispatchOp dispatch) {
       builder.setInsertionPointAfter(writer->last);
     else
       builder.setInsertionPoint(writer->first);
-    Value slot = builder.create<memref::LoadOp>(loc, var);
+    Value slot = singleSlot ? zero : builder.create<memref::LoadOp>(loc, var).getResult();
     Value view = slotView(builder, loc, slots, slot);
     if (writer->reads)
       builder.create<linalg::CopyOp>(loc, target, view);
@@ -325,15 +330,21 @@ LogicalResult pingPong(DispatchOp dispatch) {
       builder.setInsertionPointAfter(writer->last);
     for (Value stream : streams)
       builder.create<StreamWriteOp>(loc, stream, slot);
-    Value next = builder.create<arith::XOrIOp>(
-        loc, slot, builder.create<arith::ConstantIntOp>(loc, 1, 8));
-    builder.create<memref::StoreOp>(loc, next, var);
+    if (!singleSlot) {
+      Value next = builder.create<arith::XOrIOp>(
+          loc, slot, builder.create<arith::ConstantIntOp>(loc, 1, 8));
+      builder.create<memref::StoreOp>(loc, next, var);
+    }
 
     // A reader peeks the slot at the start of its tile and frees it at the
     // end.
     for (auto [reader, stream] : llvm::zip(readers, streams)) {
       builder.setInsertionPoint(reader.first);
-      Value peek = builder.create<StreamPeekOp>(loc, i8, stream);
+      Value peek;
+      if (singleSlot)
+        peek = builder.create<arith::ConstantIntOp>(loc, 0, 8);
+      else
+        peek = builder.create<StreamPeekOp>(loc, i8, stream);
       Value view = slotView(builder, loc, slots, peek);
       for (const Access &access : reader.accesses)
         if (failed(replaceAccess(builder, access, view, reuseDims)))
@@ -354,10 +365,11 @@ LogicalResult pingPong(DispatchOp dispatch) {
 }
 
 struct PingPong : public mlir::sodap::dataflow::impl::PingPongBase<PingPong> {
+  using PingPongBase::PingPongBase;
   void runOnOperation() override {
     for (DispatchOp dispatch :
          llvm::to_vector(getOperation().front().getOps<DispatchOp>()))
-      if (failed(pingPong(dispatch)))
+      if (failed(pingPong(dispatch, singleSlot)))
         return signalPassFailure();
   }
 };

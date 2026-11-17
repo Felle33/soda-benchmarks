@@ -161,6 +161,12 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
       "Select and lower whole-kernel tiles with shared compute/storage heuristics",
       [](OpPassManager &pm, const WholeKernelBackendOptions &o) {
         std::string dir=o.reportDir;
+        bool serialTasks = o.schedule == "serial-tasks";
+        bool fused = o.schedule == "fused" || o.schedule == "nonoverlap";
+        if (!serialTasks && !fused && o.schedule != "overlap")
+          llvm::report_fatal_error("unknown whole-kernel schedule");
+        // Freeze the overlap winner before lowering and admitting a one-slot design.
+        std::string selectionSchedule = fused ? "nonoverlap" : "overlap";
         std::string common="dma-data-width="+std::to_string(o.dmaWidth)+
           " request-cycles="+std::to_string(o.requestCycles)+" word-cycles="+
           std::to_string(o.wordCycles)+" dma-word-stride="+std::to_string(o.wordStride)+
@@ -169,7 +175,7 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
           return "sodap-snapshot-kernel-ir{file="+dir+"/"+name.str()+".mlir},";
         };
         std::string pipeline=
-          "sodap-select-kernel-tiles{schedule="+o.schedule.getValue()+
+          "sodap-select-kernel-tiles{schedule="+selectionSchedule+
           " single-copy-proposals="+(o.singleCopyProposals ? "true" : "false")+" lanes="+
           std::to_string(o.lanes)+" plm-bytes="+std::to_string(o.plmBytes)+
           " reuse-bytes="+std::to_string(o.reuseBytes)+" dma-width="+std::to_string(o.dmaWidth)+
@@ -177,9 +183,9 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
           std::to_string(o.requestCycles)+" word-cycles="+std::to_string(o.wordCycles)+
           " transform-file="+o.transformFile.getValue()+" report-dir="+dir+"},"+
           snapshot("tasks")+"builtin.module("+kernel::bufferize()+"),"+snapshot("bufferized")+
-          "builtin.module("+kernel::schedule(o.schedule=="overlap",o.reuseBytes)+"),"+
+          "builtin.module("+kernel::schedule(!fused,o.reuseBytes,serialTasks)+"),"+
           snapshot("dataflow")+"sodap-dataflow-report-cost{"+common+" file="+dir+"/schedule_cost.json},"+
-          "builtin.module("+kernel::transport(o.schedule=="overlap",o.dmaWidth,o.wordStride)+
+          "builtin.module("+kernel::transport(!fused,o.dmaWidth,o.wordStride)+
           kernel::compute(o.lanes,o.plmBytes,dir+"/compute_plan.json",dir+"/compute_storage.json")+
           ",sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,"
           "func.func(convert-linalg-to-loops),"+kernel::llvmBackend()+"),sodap-tiles-to-llvm,sodap-emit-hls-configuration{lanes="+

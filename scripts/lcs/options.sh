@@ -37,7 +37,7 @@ while (($#)); do
   shift 2
 done
 [[ $mode == kernel || $mode == network ]] || { echo 'mode must be kernel or network' >&2; exit 1; }
-[[ $schedule == overlap || $schedule == nonoverlap ]] || { echo 'schedule must be overlap or nonoverlap' >&2; exit 1; }
+[[ $schedule == overlap || $schedule == nonoverlap || $schedule == fused || $schedule == serial-tasks ]] || { echo 'expected overlap, serial-tasks, fused or its alias nonoverlap' >&2; exit 1; }
 [[ $profile == true || $profile == false ]] || { echo 'profile must be true or false' >&2; exit 1; }
 [[ $dma_width == 64 ]] || { echo 'Bambu backend supports DMA64; wider layouts require direct MLIR tests' >&2; exit 1; }
 [[ -z $family || $family == gemm || $family == conv || $family == add ]] || { echo 'Unsupported hardware family' >&2; exit 1; }

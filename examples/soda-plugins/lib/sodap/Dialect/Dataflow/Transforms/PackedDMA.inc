@@ -72,7 +72,7 @@ static bool packedNeedsBoundary(Transfer t, unsigned width) {
 static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
                                 const DMAStreams &dma, unsigned width,
                                 Value meta = {}, Value notice = {},
-                                ArrayRef<Value> fields = {}) {
+                                ArrayRef<Value> fields = {}, Value storeCompleted = {}) {
   b.setInsertionPoint(t.copy);
   Location loc = t.copy.getLoc();
   PackedEmitter e{b, loc, width};
@@ -179,8 +179,15 @@ static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
       }
     });
   } else if (meta) {
-    e.write(meta, e.bor(e.integer(1), e.bor(e.shift(e.i64(first), 8),
-                                            e.shift(e.i64(lastEnd), 16))));
+    Value flags = e.integer(1);
+    if (storeCompleted) {
+      Value lastRow = e.integer(1, 1);
+      for (auto [axis, iv] : llvm::enumerate(ivs))
+        lastRow = e.band(lastRow, e.eq(e.add(iv, e.idx(1)), sizeOf(sizes[axis])));
+      flags = e.select(lastRow, e.integer(3), flags);
+    }
+    e.write(meta, e.bor(flags, e.bor(e.shift(e.i64(first), 8),
+                                     e.shift(e.i64(lastEnd), 16))));
     e.write(dma.writeCtrl, e.request(start, count));
     if (notice)
       e.write(notice, e.integer(1, 8));
@@ -194,4 +201,11 @@ static void lowerPackedTransfer(OpBuilder &b, Transfer &t,
       e.write(notice, e.integer(1, 8));
     e.loop(count, [&](Value beat) { e.write(dma.writeData, payload(beat)); });
   }
+  if (storeCompleted && !t.read) {
+    b.setInsertionPoint(t.copy);
+    auto barrier = b.create<StreamPeekOp>(loc, b.getI8Type(), storeCompleted);
+    barrier->setAttr("sodap.dma_ordered", b.getUnitAttr());
+    e.read(storeCompleted);
+  }
+
 }

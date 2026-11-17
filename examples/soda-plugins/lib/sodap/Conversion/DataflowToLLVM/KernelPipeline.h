@@ -14,12 +14,13 @@ inline std::string bufferize() {
   return "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
          "canonicalize,cse,canonicalize,buffer-results-to-out-params";
 }
-inline std::string schedule(bool overlap, uint64_t reuse) {
+inline std::string schedule(bool overlap, uint64_t reuse, bool serialTasks = false) {
   return "canonicalize,func.func(sodap-dataflow-bind-dims,sodap-dataflow-load-store,"
          "sodap-dataflow-bind-dims),canonicalize,func.func(sodap-dataflow-schedule{reuse-buffer-budget=" +
-         std::to_string(reuse) + (overlap ? "" : " serial=true") +
+         std::to_string(reuse) + (serialTasks ? " serial-tasks=true" : overlap ? "" : " serial=true") +
          "}),fold-memref-alias-ops," +
-         (overlap ? "func.func(sodap-dataflow-ping-pong)," : "") + "canonicalize";
+         (serialTasks ? "func.func(sodap-dataflow-ping-pong{single-slot=true})," :
+          overlap ? "func.func(sodap-dataflow-ping-pong)," : "") + "canonicalize";
 }
 inline std::string transport(bool overlap, unsigned width, unsigned stride=2) {
   return "sodap-dataflow-copy-to-dma{dma-word-stride=" + std::to_string(stride) +
