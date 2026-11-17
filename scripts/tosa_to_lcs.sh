@@ -72,7 +72,7 @@
 #   LCS_DMA_WORD_CYCLES  cost per 32-bit DMA word (default 1).
 #                        A bounded search ranks the scheduled cost of proposals
 #                        from Tommaso's divisor model and a generic max-size-10
-#                        proposal. Both ablations use the overlap selection policy.
+#                        proposal. Each schedule uses its actual storage/cost model in the C++ selector.
 #                        This is a heuristic, not a measured latency predictor.
 #
 # Writes in <outdir>:
@@ -197,13 +197,10 @@ printf 'dma_abi=%s\ndma_data_width=%s\n' "$DMA_ABI" "$DMA_WIDTH" >> layout.txt
 # reusable-GEMM harness (examples/esp-validation/reusable-gemm) takes it.
 [ "$TILES" = operators ] && printf 'tiles=operators\n' >> layout.txt
 printf 'reuse_buffer_budget=%s\nplm_budget=%s\noverlap=%s\n' "$REUSE_BUFFER_BUDGET" "$TOTAL_PLM_BYTES" "$OVERLAP" >> layout.txt
-# Rank proposals using the actual scheduled IR, with the same overlap/reuse
-# policy for both ablation variants. Explicit tile sizes remain reproducible.
-# ponytail: no search with LCS_TILES=operators (it reruns the whole script per
-# candidate); each tile takes the cost model's sizes.
-if [ -z "${LCS_TILE_SIZES:-}" ] && [ "${_LCS_INTERNAL_CANDIDATE:-false}" = false ] && [ "$TILES" = kernel ]; then
-  python3 "$REPO_DIR/scripts/lcs/select_tiles.py" "$INPUT" "$PWD" "$REPO_DIR/scripts/tosa_to_lcs.sh"
-  export LCS_TILE_SIZES="$(cat selected_tile_sizes.txt)"
+# Whole-kernel search and scheduling are one registered C++ pipeline.
+if [[ "$TILES" == kernel && -n ${LCS_TILE_SIZES:-} ]]; then
+  echo 'Whole-kernel tiles are selected by sodap-whole-kernel-backend; explicit legacy tiles require the archived flow.' >&2
+  exit 1
 fi
 # One accelerator per operator, with a compute budget: the tile comes from
 # the hardware budget alone (lanes and PLM bytes) in the compiler, never from
@@ -213,6 +210,7 @@ fi
 # No Python helper chooses tiles or register blocks in this path.
 # LCS_TILE_SIZES or the model's variables replace the attributes of
 # @tile_tasks's tile_and_fuse, the only one on %tasks.
+if [[ "$TILES" == operators ]]; then
 TILE_ATTRS=
 if [ -n "${LCS_TILE_SIZES:-}" ]; then
   TILE_ATTRS="tile_sizes = $LCS_TILE_SIZES"
@@ -233,6 +231,7 @@ if [ -n "$TILE_ATTRS" ]; then
   sed "s|$TILE_PATTERN|tile_and_fuse %tasks {$TILE_ATTRS}|" \
     "$TRANSFORM" > transform_tile_sizes.mlir
   TRANSFORM=$PWD/transform_tile_sizes.mlir
+fi
 fi
 OUTSTANDING_LOAD=
 [ "$OUTSTANDING_LOADS" = true ] && OUTSTANDING_LOAD="func.func(sodap-dataflow-outstanding-load), canonicalize,"
@@ -289,8 +288,7 @@ outline() {
   step "$where" soda-opt "$input" $PLUGIN --convert-all-to-soda -soda-outline-bambu-code \
     -o "$dir/outlined_raw.mlir"
   step "$where" soda-opt "$dir/outlined_raw.mlir" $PLUGIN \
-    --pass-pipeline="builtin.module(sodap-order-kernel-arguments)" -o "$dir/outlined.mlir"
-  python3 "$REPO_DIR/scripts/lcs/argument_order.py" "$dir/outlined.mlir" > "$dir/argument_order.txt"
+    --pass-pipeline="builtin.module(sodap-order-kernel-arguments{argument-order-file=$PWD/$dir/argument_order.txt})" -o "$dir/outlined.mlir"
   step "$where" soda-opt "$dir/outlined.mlir" $PLUGIN \
     -soda-extract-arguments-to-c-testbench=using-bare-ptr \
     -soda-generate-bambu-accelcode=no-aa -o "$dir/kernel.mlir"
@@ -331,6 +329,15 @@ step "$FRONTEND_DUMP" mlir-opt "$INPUT" $TOSA_PLUGIN --pass-pipeline="builtin.mo
     $OUTLINE $EXTRACT_HARDWARE
   )" -o outlined.mlir
 
+if [[ "$TILES" == kernel ]]; then
+  SCHEDULE=overlap
+  [[ "$OVERLAP" == false ]] && SCHEDULE=nonoverlap
+  step "$ACC_DUMP" mlir-opt outlined.mlir $PLUGIN \
+    --pass-pipeline="builtin.module(sodap-whole-kernel-backend{schedule=$SCHEDULE lanes=${LCS_COMPUTE_LANES:-64} dma-width=$DMA_WIDTH word-stride=$WORD_STRIDE plm-bytes=$TOTAL_PLM_BYTES reuse-bytes=$REUSE_BUFFER_BUDGET request-cycles=${LCS_DMA_REQUEST_CYCLES:-64} word-cycles=${LCS_DMA_WORD_CYCLES:-1} transform-file=$TRANSFORM report-dir=$PWD})" -o acc.mlir
+  printf '{"enabled":true,"selection":"compiler_compute_budget","register_rows":null,"register_columns":null,"dimensions_report":"compute_plan.json","fp_units_per_task":%s,"bank_local":true}\n' "${LCS_COMPUTE_LANES:-64}" > compute_config.json
+  python3 -c 'import json; c=json.load(open("schedule_cost.json")); print("dma_cycles = %d, plm_bytes = %d" % (c["dma_cycles"], c["plm_bytes"]))' > tile_cost.txt
+  { grep 'remark: reuse_buffer ' "$ACC_DUMP" || true; } | sed 's/^.*remark: / /' > reuse_decisions.txt
+else
 if [ "$TILES" = operators ] && [[ "$OPERATOR_FAMILY" = gemm || "$OPERATOR_FAMILY" = conv ]] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
   step "$FRONTEND_DUMP" mlir-opt outlined.mlir $PLUGIN \
     --pass-pipeline="builtin.module(sodap-select-reusable-hardware{lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES report=$PWD/hardware_selection.json})" \
@@ -494,6 +501,8 @@ step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
   )" -o acc.mlir
 fi
 
+fi
+
 for dir in tiles/*/; do
   $DOCKER_RUN llvm-link -S - "$dir/ac_channel_specializations.ll" < "$dir/acc.ll" \
     | $DOCKER_RUN opt -passes=always-inline -S -o "$dir/05_hw_acc.ll"
@@ -514,11 +523,8 @@ step "$HOST_DUMP" mlir-opt acc.mlir $PLUGIN --pass-pipeline="builtin.module(
       tosa-to-linalg
     ),
     $BUFFERIZE,
-    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH invocations-file=$PWD/invocations.json}
+    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH invocations-file=$PWD/invocations.json argument-order-file=$PWD/argument_order.txt}
   )" -o host.mlir
-# forward_kernel's arguments are @forward's, then its results.
-N_ARGS=$(grep -m1 -oE "func.func @$TOP\([^)]*\)" host.mlir | grep -oE '%arg[0-9]+:' | wc -l)
-seq -s ' ' 0 $((N_ARGS - 1)) > argument_order.txt
 HOST=host.mlir
 if [ "$PROFILE" = true ]; then
   step "$HOST_DUMP" soda-opt host.mlir $PLUGIN \

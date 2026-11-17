@@ -67,6 +67,27 @@ def EmitBambuArchitecture :
   let dependentDialects = ["::mlir::sodap::dataflow::DataflowDialect"];
 }
 
+def SelectKernelTiles : Pass<"sodap-select-kernel-tiles", "::mlir::ModuleOp"> {
+  let summary = "Select whole-kernel tiles using the requested scheduled IR";
+  let options = [
+    Option<"schedule", "schedule", "std::string", "\"overlap\"", "overlap or nonoverlap">,
+    Option<"lanes", "lanes", "unsigned", "64", "Core FP32 lane budget">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Final local storage budget">,
+    Option<"reuseBytes", "reuse-bytes", "uint64_t", "262144", "Reuse admission budget">,
+    Option<"dmaWidth", "dma-width", "unsigned", "64", "Packed transport width">,
+    Option<"wordStride", "word-stride", "unsigned", "2", "Legacy DMA word stride">,
+    Option<"requestCycles", "request-cycles", "unsigned", "64", "DMA request cost">,
+    Option<"wordCycles", "word-cycles", "unsigned", "1", "DMA word cost">,
+    Option<"transformFile", "transform-file", "std::string", "\"\"", "Transform library">,
+    Option<"reportDir", "report-dir", "std::string", "\".\"", "Search reports directory">
+  ];
+}
+
+def SnapshotKernelIR : Pass<"sodap-snapshot-kernel-ir", "::mlir::ModuleOp"> {
+  let summary = "Write an intermediate whole-kernel module without changing it";
+  let options = [Option<"file", "file", "std::string", "\"\"", "Output filename">];
+}
+
 def SelectReusableHardware : Pass<"sodap-select-reusable-hardware", "::mlir::ModuleOp"> {
   let summary = "Select shape-independent GEMM tiles from compute and storage budgets";
   let options = [

@@ -449,6 +449,12 @@ struct TosaOutlineKernel : impl::TosaOutlineKernelBase<TosaOutlineKernel> {
     auto host = builder.create<func::FuncOp>(kernel.getLoc(),
                                              kernel.getSymName(),
                                              kernel.getFunctionType());
+    // Record the public ABI before outlining/transposes obscure provenance.
+    // Bufferization appends outputs in result order; the host pass consumes it.
+    SmallVector<int64_t> argumentOrder;
+    for (unsigned i=0; i<kernel.getNumArguments()+kernel.getNumResults(); ++i)
+      argumentOrder.push_back(i);
+    host->setAttr("sodap.kernel_argument_order", builder.getDenseI64ArrayAttr(argumentOrder));
     Block *hostBody = host.addEntryBlock();
     builder.setInsertionPointToStart(hostBody);
     IRMapping map;

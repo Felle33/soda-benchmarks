@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "sodap/Conversion/DataflowToLLVM/Passes.h"
+#include "KernelPipeline.h"
 #include "sodap/Dialect/Dataflow/Transforms/Passes.h"
 
 #include "mlir/Conversion/Passes.h"
@@ -52,6 +53,18 @@ struct ReusableOperatorBackendOptions
   Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680),llvm::cl::desc("Local array storage budget")};
   Option<std::string> computeReport{*this,"compute-report",llvm::cl::init("compute_plan.json")};
   Option<std::string> storageReport{*this,"storage-report",llvm::cl::init("compute_storage.json")};
+};
+struct WholeKernelBackendOptions : public PassPipelineOptions<WholeKernelBackendOptions> {
+  Option<std::string> schedule{*this,"schedule",llvm::cl::init("overlap")};
+  Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64)};
+  Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64)};
+  Option<unsigned> wordStride{*this,"word-stride",llvm::cl::init(2)};
+  Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680)};
+  Option<uint64_t> reuseBytes{*this,"reuse-bytes",llvm::cl::init(262144)};
+  Option<unsigned> requestCycles{*this,"request-cycles",llvm::cl::init(64)};
+  Option<unsigned> wordCycles{*this,"word-cycles",llvm::cl::init(1)};
+  Option<std::string> transformFile{*this,"transform-file",llvm::cl::init("")};
+  Option<std::string> reportDir{*this,"report-dir",llvm::cl::init(".")};
 };
 } // namespace
 
@@ -112,9 +125,8 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
         // passes target budgets and orchestrates frontends/tool invocations.
         std::string compute;
         if(o.family=="gemm" || o.family=="conv") compute=
-          "sodap-prepare-compute-budget{lanes=" + std::to_string(o.lanes) + " report=" + o.computeReport.getValue() + "},"
-          "sodap-bank-matmul-buffers{rows=1 cols=1 plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
-          "sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,";
+          kernel::compute(o.lanes,o.plmBytes,o.computeReport,o.storageReport)+
+          ",sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,";
         else if(o.family=="add") compute=
           "sodap-bank-matmul-buffers{pointwise=true rows=1 cols=" + std::to_string(o.lanes) +
           " plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
@@ -125,14 +137,38 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
           "sodap-dataflow-copy-to-dma{dma-word-stride=2 dma-data-width=" + std::to_string(o.dmaWidth) + "},"
           "func.func(sodap-dataflow-tasks-to-nodes),sodap-dataflow-nodes-to-func,"
           + compute +
-          "func.func(convert-linalg-to-loops),sodap-legalize-fp-minmax,sodap-dataflow-infer-top-interface,"
-          "sodap-emit-bambu-architecture{file=architecture.xml},sodap-convert-dataflow-to-llvm,"
-          "func.func(promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}),"
-          "func.func(fold-memref-alias-ops),lower-affine,convert-scf-to-cf,convert-math-to-llvm,"
-          "expand-strided-metadata,lower-affine,sodap-finalize-banked-memrefs-to-llvm,"
-          "convert-func-to-llvm{use-bare-ptr-memref-call-conv=true},"
-          "convert-index-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts";
+          "func.func(convert-linalg-to-loops),sodap-legalize-fp-minmax," + kernel::llvmBackend();
         if (failed(parsePassPipeline(pipeline, pm)))
           llvm::report_fatal_error("cannot construct reusable operator backend pipeline");
       });
+  PassPipelineRegistration<WholeKernelBackendOptions>(
+      "sodap-whole-kernel-backend",
+      "Select and lower whole-kernel tiles with shared compute/storage heuristics",
+      [](OpPassManager &pm, const WholeKernelBackendOptions &o) {
+        std::string dir=o.reportDir;
+        std::string common="dma-data-width="+std::to_string(o.dmaWidth)+
+          " request-cycles="+std::to_string(o.requestCycles)+" word-cycles="+
+          std::to_string(o.wordCycles)+" dma-word-stride="+std::to_string(o.wordStride)+
+          " plm-bytes="+std::to_string(o.plmBytes);
+        auto snapshot=[&](StringRef name) {
+          return "sodap-snapshot-kernel-ir{file="+dir+"/"+name.str()+".mlir},";
+        };
+        std::string pipeline=
+          "sodap-select-kernel-tiles{schedule="+o.schedule.getValue()+" lanes="+
+          std::to_string(o.lanes)+" plm-bytes="+std::to_string(o.plmBytes)+
+          " reuse-bytes="+std::to_string(o.reuseBytes)+" dma-width="+std::to_string(o.dmaWidth)+
+          " word-stride="+std::to_string(o.wordStride)+" request-cycles="+
+          std::to_string(o.requestCycles)+" word-cycles="+std::to_string(o.wordCycles)+
+          " transform-file="+o.transformFile.getValue()+" report-dir="+dir+"},"+
+          snapshot("tasks")+"builtin.module("+kernel::bufferize()+"),"+snapshot("bufferized")+
+          "builtin.module("+kernel::schedule(o.schedule=="overlap",o.reuseBytes)+"),"+
+          snapshot("dataflow")+"sodap-dataflow-report-cost{"+common+" file="+dir+"/schedule_cost.json},"+
+          "builtin.module("+kernel::transport(o.schedule=="overlap",o.dmaWidth,o.wordStride)+
+          kernel::compute(o.lanes,o.plmBytes,dir+"/compute_plan.json",dir+"/compute_storage.json")+
+          ",sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,"
+          "func.func(convert-linalg-to-loops),"+kernel::llvmBackend()+"),sodap-tiles-to-llvm";
+        if (failed(parsePassPipeline(pipeline,pm)))
+          llvm::report_fatal_error("cannot construct whole-kernel backend pipeline");
+      });
+
 }

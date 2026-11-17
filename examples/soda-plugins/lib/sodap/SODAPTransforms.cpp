@@ -234,7 +234,8 @@ static ::mlir::SmallVector<int64_t> loopRanges(::mlir::linalg::LinalgOp op,
 /// ping-pong buffer, stored a tile at a time if read outside the tasks; values
 /// computed in the nest keep a buffer of their own.
 static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
-                                ::llvm::ArrayRef<int64_t> inv = {}, int64_t computeLanes = 0) {
+                                ::llvm::ArrayRef<int64_t> inv = {}, int64_t computeLanes = 0,
+                                bool doubleBuffer = true) {
   using namespace ::mlir;
   using sodap::dataflow::TaskOp;
   TileModel m;
@@ -290,7 +291,7 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
       bool stored = llvm::any_of(taskResult.getUsers(), [](Operation *user) {
         return !user->getParentOfType<TaskOp>();
       });
-      m.tiles.push_back({tile, elementBytes(type), 2, stored, parallel});
+      m.tiles.push_back({tile, elementBytes(type), doubleBuffer ? 2 : 1, stored, parallel});
       written[taskResult] = tile;
     }
 
@@ -330,7 +331,7 @@ static TileModel buildTileModel(::llvm::ArrayRef<::mlir::Operation *> lasts,
           continue;
         }
         bool everyIteration = isLast && !current.isDpsInit(&operand);
-        m.tiles.push_back({tile, elementBytes(type), 2, true,
+        m.tiles.push_back({tile, elementBytes(type), doubleBuffer ? 2 : 1, true,
                            everyIteration ? all : parallel});
       }
     }
@@ -629,9 +630,9 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
       llvm::to_vector(llvm::make_first_range(lasts));
   SmallVector<TileModel, 1> models;
   if (invocations.empty())
-    models.push_back(buildTileModel(lastOps, {}, getComputeLanes()));
+    models.push_back(buildTileModel(lastOps, {}, getComputeLanes(), getDoubleBuffer()));
   for (ArrayRef<int64_t> inv : invocations)
-    models.push_back(buildTileModel(lastOps, inv, getComputeLanes()));
+    models.push_back(buildTileModel(lastOps, inv, getComputeLanes(), getDoubleBuffer()));
   const TileModel &model = models.front();
   // Before tiling replaces the ops.
   SetVector<func::FuncOp> funcs;
@@ -667,6 +668,23 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
         tile = range;
     auto [cycles, bytes] = tileCost(models, size, requestCycles, wordCycles);
     emitRemark() << "dma_cycles = " << cycles << ", plm_bytes = " << bytes;
+  }
+
+  // Selection is compiler metadata, not a diagnostic parsed by a driver.
+  // Opt in only for the bounded whole-kernel search; operator IR is unchanged.
+  if (!lastOps.empty()) {
+    auto module = lastOps.front()->getParentOfType<ModuleOp>();
+    if (module->hasAttr("sodap.capture_tile_selection")) {
+      SmallVector<Attribute> selected;
+      for (auto &[last, sizes] : lasts) {
+        SmallVector<int64_t> all(sizes);
+        llvm::append_range(all, fusedSizes.lookup(last));
+        SmallVector<Attribute> dims;
+        for (int64_t size : all) dims.push_back(rewriter.getI64IntegerAttr(size));
+        selected.push_back(rewriter.getArrayAttr(dims));
+      }
+      module->setAttr("sodap.selected_tile_sizes", rewriter.getArrayAttr(selected));
+    }
   }
 
   // The sizes used, as tile_sizes would give them.

@@ -22,18 +22,28 @@ def main():
     p.add_argument('--factory', default='create_model')
     p.add_argument('--model-options', default='{}', help='JSON passed to the factory')
     p.add_argument('--output', required=True, type=Path)
-    p.add_argument('--compute-lanes', type=int, default=0,
-                   help='GEMM lanes; 0 selects 16 with convolution, otherwise 64 in the compiler')
+    p.add_argument('--compute-lanes', type=int, default=None,
+                   help='FP32 compute lanes (kernel default 64; network compiler default 16 with conv, otherwise 64)')
     p.add_argument('--plm-bytes', type=int, default=327680)
     p.add_argument('--dma-width', type=int, choices=[64], default=64)
     p.add_argument('--network-host-only', action='store_true',
                    help='Validate compiler-owned CNN host lowering; no hardware qualification')
-    p.add_argument('--network', action='store_true', help='Compile a network host and its reusable operator engines')
+    p.add_argument('--mode', choices=['kernel','network'], default=None)
+    p.add_argument('--schedule', choices=['overlap','nonoverlap'], default=None,
+                   help='Whole-kernel LCS schedule (default overlap)')
+    p.add_argument('--network', action='store_true', help='Alias for --mode network')
     p.add_argument('--conv-lanes', type=int, default=64)
     p.add_argument('--add-lanes', type=int, default=4)
     p.add_argument('--atol', type=float, default=0.001)
     p.add_argument('--rtol', type=float, default=0.0001)
     a = p.parse_args()
+    if a.network and a.mode == 'kernel':
+        p.error('--network conflicts with --mode kernel')
+    a.mode = a.mode or 'network'  # Preserve the existing operator-driver API.
+    if a.mode == 'network' and a.schedule is not None:
+        p.error('--schedule is only valid in --mode kernel')
+    if a.mode == 'kernel' and a.network_host_only:
+        p.error('--network-host-only is only valid in --mode network')
     import torch
     from torch_mlir import torchscript
     repo = Path(__file__).resolve().parents[1]
@@ -81,20 +91,32 @@ def main():
     (out/'fixture.json').write_text(json.dumps(fixture, indent=2)+'\n')
     env = {**os.environ, 'LCS_TILES':'operators', 'LCS_REUSABLE_GEMM':'false',
            'LCS_DMA_ABI':'packed', 'LCS_DMA_DATA_WIDTH':str(a.dma_width),
-           'LCS_COMPUTE_LANES':str(a.compute_lanes), 'LCS_PLM_BYTES':str(a.plm_bytes),
+           'LCS_COMPUTE_LANES':str(a.compute_lanes if a.compute_lanes is not None else 0), 'LCS_PLM_BYTES':str(a.plm_bytes),
            'LCS_GEMM_FP_SEMANTICS':'source', 'LCS_PROFILE':'true'}
     env.update(LCS_CONV_LANES=str(a.conv_lanes),LCS_ADD_LANES=str(a.add_lanes),
-               LCS_GEMM_LANES=str(a.compute_lanes),LCS_DUMP_IR='false')
+               LCS_GEMM_LANES=str(a.compute_lanes if a.compute_lanes is not None else 0),LCS_DUMP_IR='false')
     # Reproducible defaults: unrelated experiments must not inject schedules.
     for key in ('LCS_TILE_SIZES','LCS_REGISTER_BLOCK','LCS_TRANSFORM','LCS_ENTRY',
                 'LCS_SEQUENTIAL','LCS_OVERLAP','LCS_FP_UNITS','LCS_BANK_LOCAL'):
         env.pop(key, None)
+    if a.mode == 'kernel':
+        env['LCS_TILES'] = 'kernel'
+        env['LCS_OVERLAP'] = 'false' if a.schedule == 'nonoverlap' else 'true'
+        if a.compute_lanes is None:
+            env.pop('LCS_COMPUTE_LANES', None)  # Compiler pipeline default.
     (out/'lowering-env.json').write_text(json.dumps({k:v for k,v in env.items() if k.startswith('LCS_')},indent=2)+'\n')
     driver = 'scripts/lcs/network_host.sh' if a.network_host_only else 'scripts/tosa_to_lcs.sh'
     with (out/'compile.log').open('w') as log:
         subprocess.run(['bash',str(repo/driver),str(out/'01_tosa.mlir'),str(out/'generated')],
                        env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-    if a.network_host_only:
+    if a.mode == 'kernel':
+        result = dict(status='KERNEL_LOWERED_NOT_HARDWARE_VALIDATED',
+                      schedule=a.schedule or 'overlap',
+                      accelerator_sha256=sha(out/'generated/05_hw_acc.ll'),
+                      architecture_sha256=sha(out/'generated/architecture.xml'),
+                      host_sha256=sha(out/'generated/05_kernel_riscv.ll'),
+                      fixture_sha256=sha(out/'fixture.json'))
+    elif a.network_host_only:
         result = dict(status='NETWORK_HOST_LOWERED_NOT_HARDWARE_VALIDATED',
                       host_sha256=sha(out/'generated/host.ll'),
                       parameter_sha256=sha(out/'generated/parameters.bin'),

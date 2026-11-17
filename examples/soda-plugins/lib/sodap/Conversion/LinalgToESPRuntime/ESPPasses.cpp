@@ -967,6 +967,18 @@ public:
       host.setSymName(this->host);
       return;
     }
+    auto argumentOrder=host->getAttrOfType<DenseI64ArrayAttr>("sodap.kernel_argument_order");
+    if (!argumentOrderFile.empty()) {
+      if (!argumentOrder || argumentOrder.size()!=host.getNumArguments()) {
+        host.emitError("missing or inconsistent whole-kernel argument order from outline pass");
+        return signalPassFailure();
+      }
+      std::error_code ec;
+      llvm::raw_fd_ostream out(argumentOrderFile,ec);
+      if (ec) { host.emitError(ec.message()); return signalPassFailure(); }
+      llvm::interleave(argumentOrder.asArrayRef(),out," "); out << "\n";
+    }
+    host->removeAttr("sodap.kernel_argument_order");
     for (dataflow::LaunchOp launch : launches) {
       if (launch->getParentOfType<func::FuncOp>() != host ||
           launch->getBlock() != launches.front()->getBlock()) {
@@ -1126,6 +1138,7 @@ public:
 class OrderKernelArguments
     : public impl::OrderKernelArgumentsBase<OrderKernelArguments> {
 public:
+  using Base::Base;
   void runOnOperation() override {
     ModuleOp module = getOperation();
     WalkResult result = module.walk([&](Operation *launch) {
@@ -1211,6 +1224,13 @@ private:
       for (unsigned i : order)
         permuted.push_back(attrs[i]);
       kernel->setAttr("arg_attrs", ArrayAttr::get(&getContext(), permuted));
+    }
+    if (!argumentOrderFile.empty()) {
+      std::error_code ec;
+      llvm::raw_fd_ostream out(argumentOrderFile,ec);
+      if (ec) return launch->emitError(ec.message());
+      llvm::interleave(order,out,[&](unsigned i) { out << numbers[i]; }," ");
+      out << "\n";
     }
     return success();
   }

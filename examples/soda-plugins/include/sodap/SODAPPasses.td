@@ -421,6 +421,8 @@ def LaunchesToESP : Pass<"sodap-launches-to-esp", "::mlir::ModuleOp"> {
     Operands must be f32 memrefs with static shapes and the identity layout.
   }];
   let options = [
+    Option<"argumentOrderFile", "argument-order-file", "std::string", "\"\"",
+           "Write the public argument order recorded by kernel outlining">,
     Option<"invocationsFile", "invocations-file", "std::string", "\"\"",
            "Export the same checked operator invocation graph used by host lowering">,
     Option<"host", "host", "std::string", /*default=*/"\"forward_kernel\"",
@@ -465,6 +467,8 @@ def OrderKernelArguments : Pass<"sodap-order-kernel-arguments", "::mlir::ModuleO
     or with async dependencies. The soda ops are matched by name: the plugin
     doesn't link the soda dialect.
   }];
+  let options = [Option<"argumentOrderFile", "argument-order-file", "std::string", "\"\"",
+                       "Write the checked original caller argument numbers">];
 }
 
 def LinalgBatchMatmulToESP : Pass<"sodap-linalg-batch-matmul-to-esp", "::mlir::ModuleOp"> {

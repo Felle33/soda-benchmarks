@@ -3,6 +3,7 @@ add_mlir_dialect_library(MLIRSODAPDataflowToLLVM
         BankedMemrefs.cpp
         ComputeBudget.cpp
         SelectReusableHardware.cpp
+        SelectKernelTiles.cpp
         EmitBambuArchitecture.cpp
         Pipelines.cpp
 
