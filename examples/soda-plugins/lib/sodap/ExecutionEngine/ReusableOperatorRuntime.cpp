@@ -506,8 +506,10 @@ extern "C" void esp_op_close(int64_t handle) {
   while (*p != &ctx) p = &(*p)->next;
   *p = ctx.next;
 #ifdef SODAP_OP_ESP_HW
-  for(unsigned i=0;i<(ctx.separateDevices?3u:1u);++i)
-    iowrite32(ctx.separateDevices?ctx.bindings[i]:ctx.device, PT_NCHUNK_REG, 0);
+  for(unsigned i=0;i<(ctx.separateDevices?3u:1u);++i) {
+    auto *device=ctx.separateDevices?ctx.bindings[i]:ctx.device;
+    if(device)iowrite32(device, PT_NCHUNK_REG, 0);
+  }
   release(ctx.pages);
   if(ctx.devices)release(ctx.devices);
   for(auto *list:ctx.enumerations)if(list)release(list);
