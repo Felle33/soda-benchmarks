@@ -255,7 +255,8 @@ static void lowerTransfer(OpBuilder &b, Transfer &transfer,
 /// task's fields, as index values.
 static FailureOr<DenseMap<Operation *, SmallVector<Value>>>
 readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma,
-               unsigned width, const DenseMap<Operation *, PackedClient> &clients) {
+               unsigned width, const DenseMap<Operation *, PackedClient> &clients,
+               unsigned version) {
   MLIRContext *ctx = b.getContext();
   Location loc = dispatch.getLoc();
   Block &body = dispatch.getBody().front();
@@ -333,7 +334,7 @@ readDescriptor(OpBuilder &b, DispatchOp dispatch, const DMAStreams &dma,
     // guard so all participants still terminate on an invalid invocation.
     if (width) {
       Value valid = e.band(e.eq(fields[task][GEMM_FIELD_MAGIC], e.idx(GEMM_MAGIC)),
-          e.band(e.eq(fields[task][GEMM_FIELD_VERSION], e.idx(GEMM_PACKED_VERSION)),
+          e.band(e.eq(fields[task][GEMM_FIELD_VERSION], e.idx(version)),
                  e.eq(fields[task][GEMM_FIELD_DMA_WIDTH], e.idx(width))));
       auto guarded = b.create<scf::IfOp>(loc, valid, false);
       for (Operation *op = guarded->getNextNode(); op && !op->hasTrait<OpTrait::IsTerminator>() &&
@@ -469,7 +470,10 @@ struct CopyToDMA : public dataflow::impl::CopyToDMABase<CopyToDMA> {
         top.emitError("a descriptor needs one dataflow.dispatch");
         return signalPassFailure();
       }
-      auto read = readDescriptor(b, dispatches.front(), dma, dmaDataWidth, clients);
+      unsigned version = GEMM_PACKED_VERSION;
+      if (auto attr = top->getAttrOfType<IntegerAttr>("sodap.descriptor_version"))
+        version = attr.getInt();
+      auto read = readDescriptor(b, dispatches.front(), dma, dmaDataWidth, clients, version);
       if (failed(read))
         return signalPassFailure();
       fields = std::move(*read);

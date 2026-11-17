@@ -74,7 +74,14 @@ module reusable_gemm_tb #(parameter TIMEOUT_CYCLES=2000000, parameter real TOL=0
         if(mask[i]==2) begin
           difference=fp32(mem[i])-fp32(gold[i]);
           if(difference<0) difference=-difference;
-          if($isunknown(mem[i]) || mem[i][30:23]==255 || difference>TOL) begin
+          // Source-expression mode preserves explicit 0*NaN. Accept a NaN
+          // only when the independent reference also expects one; infinities
+          // must match sign. Finite references still reject all nonfinite data.
+          if($isunknown(mem[i]) ||
+             ((gold[i][30:23]==255 && gold[i][22:0]!=0) ?
+                !(mem[i][30:23]==255 && mem[i][22:0]!=0) :
+              (gold[i][30:23]==255 ? mem[i]!=gold[i] :
+                (mem[i][30:23]==255 || difference>TOL)))) begin
             if(errors<8) $display("mismatch word=%0d got=%h expected=%h",i,mem[i],gold[i]);
             errors++;
           end

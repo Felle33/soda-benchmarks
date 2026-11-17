@@ -25,7 +25,7 @@ namespace mlir::sodap {
 #include "sodap/Tosa/Passes.h.inc"
 
 Value buildGemmBody(OpBuilder &b, Location loc, Value a, Value rhs, Value c,
-                    Value alpha, Value beta) {
+                    Value alpha, Value beta, Value hasC) {
   auto matrix = cast<RankedTensorType>(c.getType());
   auto at = cast<RankedTensorType>(a.getType()),
        bt = cast<RankedTensorType>(rhs.getType());
@@ -48,7 +48,8 @@ Value buildGemmBody(OpBuilder &b, Location loc, Value a, Value rhs, Value c,
       loc, scalar, DenseElementsAttr::get(scalar, b.getF32FloatAttr(0)));
   // An ordered equality: a NaN beta reads C, as in the measured engine
   // (GenerateReusableGemm.cpp, `hasC = beta UNE 0`).
-  Value noC = b.create<tosa::EqualOp>(loc, flag, betaT, zero);
+  Value guard = hasC ? b.create<tensor::FromElementsOp>(loc, scalar, hasC) : betaT;
+  Value noC = b.create<tosa::EqualOp>(loc, flag, guard, zero);
   return b.create<tosa::SelectOp>(loc, matrix, noC, scaled, sum);
 }
 
@@ -60,18 +61,21 @@ constexpr llvm::StringLiteral kName = "forward_kernel";
 /// beta == 0 gives alpha * A.B whatever C holds (a NaN or nothing): the
 /// accelerator then doesn't read C (sodap.read_unless_zero, D2). The shapes
 /// reach the body only through M, K and N.
-func::FuncOp buildGemm(OpBuilder &b, Location loc) {
+func::FuncOp buildGemm(OpBuilder &b, Location loc, bool sourceSemantics) {
   MLIRContext *ctx = b.getContext();
   Type f32 = b.getF32Type();
   int64_t dyn = ShapedType::kDynamic;
   auto matrix = RankedTensorType::get({dyn, dyn}, f32);
   auto batch = RankedTensorType::get({1, dyn, dyn}, f32);
   Type index = b.getIndexType();
-  auto fn = b.create<func::FuncOp>(
-      loc, kName,
-      FunctionType::get(
-          ctx, {matrix, matrix, matrix, index, index, index, f32, f32}, matrix));
-  enum { A, B, C, M, K, N, Alpha, Beta };
+  SmallVector<Type> inputs{matrix, matrix, matrix, index, index, index, f32, f32};
+  if (sourceSemantics) inputs.push_back(f32);
+  auto fn = b.create<func::FuncOp>(loc, kName, FunctionType::get(ctx, inputs, matrix));
+  enum { A, B, C, M, K, N, Alpha, Beta, HasC };
+  if (sourceSemantics) {
+    fn->setAttr("sodap.descriptor_version", b.getI64IntegerAttr(GEMM_SOURCE_VERSION));
+    fn.setArgAttr(HasC, "sodap.descriptor_field", b.getI64IntegerAttr(GEMM_FIELD_HAS_C));
+  }
   // The descriptor's fields (ReusableGemmABI.h), argument by argument. C and
   // D are one matrix: the accelerator reads C and writes D in its place.
   int64_t fields[] = {GEMM_FIELD_A, GEMM_FIELD_B,     GEMM_FIELD_C,
@@ -93,7 +97,7 @@ func::FuncOp buildGemm(OpBuilder &b, Location loc) {
   fn.setArgAttr(C, "sodap.dims", b.getDenseI64ArrayAttr({M, N}));
   fn.setResultAttr(0, "sodap.dims", b.getDenseI64ArrayAttr({M, N}));
   // C is read only when beta isn't 0 (sodap-dataflow-guard-reads).
-  fn.setArgAttr(C, "sodap.read_unless_zero", b.getI64IntegerAttr(Beta));
+  fn.setArgAttr(C, "sodap.read_unless_zero", b.getI64IntegerAttr(sourceSemantics ? HasC : Beta));
 
   Block *body = fn.addEntryBlock();
   OpBuilder::InsertionGuard guard(b);
@@ -107,14 +111,14 @@ func::FuncOp buildGemm(OpBuilder &b, Location loc) {
   };
   Value d = buildGemmBody(b, loc, expand(arg(A), arg(M), arg(K)),
                           expand(arg(B), arg(K), arg(N)), arg(C), arg(Alpha),
-                          arg(Beta));
+                          arg(Beta), sourceSemantics ? arg(HasC) : Value());
   b.create<func::ReturnOp>(loc, d);
   return fn;
 }
 
 /// A GEMM launch's dimensions, M, K and N, from its static operand types.
 FailureOr<SmallVector<int64_t>> gemmDims(dataflow::LaunchOp launch) {
-  if (launch.getInputs().size() != 5 || launch.getNumResults() != 1)
+  if ((launch.getInputs().size() != 5 && launch.getInputs().size() != 6) || launch.getNumResults() != 1)
     return launch.emitOpError("expected a gemm launch: A, B, C, alpha, beta "
                               "and one result");
   auto a = dyn_cast<RankedTensorType>(launch.getInputs()[0].getType());
@@ -153,8 +157,13 @@ struct JoinMultipleTiles
       return signalPassFailure();
     }
     SmallVector<ModuleOp> &tiles = groups.front().second;
+    bool sourceSemantics = tiles.front()->hasAttr("sodap.source_semantics");
     DenseSet<Attribute> names;
     for (ModuleOp tile : tiles) {
+      if (tile->hasAttr("sodap.source_semantics") != sourceSemantics) {
+        tile.emitError("cannot join operators with different FP semantics");
+        return signalPassFailure();
+      }
       names.insert(tile.getSymNameAttr());
       int matmuls = 0;
       tile.walk([&](Operation *op) {
@@ -174,8 +183,9 @@ struct JoinMultipleTiles
     joined->setAttr("sodap.tile", b.getI64IntegerAttr(0));
     joined->setAttr("sodap.tile_dir", b.getStringAttr(("tiles/" + kName).str()));
     joined->setAttr("sodap.operator", b.getStringAttr("gemm"));
+    if (sourceSemantics) joined->setAttr("sodap.source_semantics", b.getUnitAttr());
     b.setInsertionPointToStart(joined.getBody());
-    buildGemm(b, loc);
+    buildGemm(b, loc, sourceSemantics);
 
     SmallVector<dataflow::LaunchOp> launches;
     module.walk([&](dataflow::LaunchOp l) {

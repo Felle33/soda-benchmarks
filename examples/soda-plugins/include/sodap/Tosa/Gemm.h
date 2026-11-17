@@ -16,7 +16,7 @@ namespace mlir::sodap {
 /// whatever C holds. `a` and `b` are tosa.matmul's operands, 1xMxK and 1xKxN;
 /// `c`, MxN, has D's type; `alpha` and `beta` are f32.
 Value buildGemmBody(OpBuilder &b, Location loc, Value a, Value rhs, Value c,
-                    Value alpha, Value beta);
+                    Value alpha, Value beta, Value hasC = {});
 } // namespace mlir::sodap
 
 #endif // SODAP_TOSA_GEMM_H

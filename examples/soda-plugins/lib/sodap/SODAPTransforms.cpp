@@ -492,6 +492,16 @@ searchTileSizes(::llvm::ArrayRef<TileModel> models, int64_t budget,
     if (!func)
       return emitSilenceableError()
              << "expected a dataflow.task in a func.func";
+    // A compiler-selected reusable implementation uses one hardware tile
+    // independent of all invocation shapes. Explicit transform sizes win.
+    if (auto module = func->getParentOfType<ModuleOp>())
+      if (auto selected = module->getAttrOfType<ArrayAttr>("sodap.hardware_tile_sizes")) {
+        if (!getTileSizesAttr()) {
+          explicitSizes = selected;
+          plmBytes.reset();
+          maxTileSize.reset();
+        }
+      }
     if (auto module = func->getParentOfType<ModuleOp>())
       if (auto list = module->getAttrOfType<ArrayAttr>("sodap.invocations")) {
         invocations.clear();

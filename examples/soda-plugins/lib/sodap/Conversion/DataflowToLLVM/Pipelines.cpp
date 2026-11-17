@@ -15,6 +15,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
 
@@ -42,6 +43,14 @@ struct DataflowToLLVMPipelineOptions
   Option<std::string> includePandaPath{
       *this, "include-panda-path", llvm::cl::init(SODAP_BAMBU_INCLUDE),
       llvm::cl::desc("Directory holding ac_channel.h")};
+};
+struct ReusableOperatorBackendOptions
+    : public PassPipelineOptions<ReusableOperatorBackendOptions> {
+  Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64),llvm::cl::desc("FP32 core lane budget")};
+  Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64),llvm::cl::desc("Packed DMA width")};
+  Option<uint64_t> plmBytes{*this,"plm-bytes",llvm::cl::init(327680),llvm::cl::desc("Local array storage budget")};
+  Option<std::string> computeReport{*this,"compute-report",llvm::cl::init("compute_plan.json")};
+  Option<std::string> storageReport{*this,"storage-report",llvm::cl::init("compute_storage.json")};
 };
 } // namespace
 
@@ -92,5 +101,29 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
         // drop the memref descriptors func-to-llvm rebuilt at every entry.
         pm.addPass(createCanonicalizerPass());
         pm.addPass(createCSEPass());
+      });
+  PassPipelineRegistration<ReusableOperatorBackendOptions>(
+      "sodap-reusable-operator-backend",
+      "Lower a scheduled model-derived operator tile through guarded/tail DMA, "
+      "shared compute-budget/banking passes and LLVM conversion",
+      [](OpPassManager &pm, const ReusableOperatorBackendOptions &o) {
+        // Keep the registered sequence in the compiler. The shell driver only
+        // passes target budgets and orchestrates frontends/tool invocations.
+        std::string pipeline =
+          "func.func(sodap-dataflow-guard-reads,sodap-dataflow-tails),"
+          "sodap-dataflow-copy-to-dma{dma-word-stride=2 dma-data-width=" + std::to_string(o.dmaWidth) + "},"
+          "func.func(sodap-dataflow-tasks-to-nodes),sodap-dataflow-nodes-to-func,"
+          "sodap-prepare-compute-budget{lanes=" + std::to_string(o.lanes) + " report=" + o.computeReport.getValue() + "},"
+          "sodap-bank-matmul-buffers{rows=1 cols=1 plm-bytes=" + std::to_string(o.plmBytes) + " report=" + o.storageReport.getValue() + "},"
+          "sodap-register-block-matmul{rows=1 cols=1},canonicalize,cse,"
+          "func.func(convert-linalg-to-loops),sodap-dataflow-infer-top-interface,"
+          "sodap-emit-bambu-architecture{file=architecture.xml},sodap-convert-dataflow-to-llvm,"
+          "func.func(promote-buffers-to-stack{max-alloc-size-in-bytes=1048576}),"
+          "func.func(fold-memref-alias-ops),lower-affine,convert-scf-to-cf,convert-math-to-llvm,"
+          "expand-strided-metadata,lower-affine,sodap-finalize-banked-memrefs-to-llvm,"
+          "convert-func-to-llvm{use-bare-ptr-memref-call-conv=true},"
+          "convert-index-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts";
+        if (failed(parsePassPipeline(pipeline, pm)))
+          llvm::report_fatal_error("cannot construct reusable operator backend pipeline");
       });
 }

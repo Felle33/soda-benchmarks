@@ -586,6 +586,7 @@ static Gemm matchGemm(tosa::MatMulOp op) {
 /// several invocations.
 struct TosaOutlineOperators
     : impl::TosaOutlineOperatorsBase<TosaOutlineOperators> {
+  using Base::Base;
   void runOnOperation() final {
     ModuleOp module = getOperation();
     MLIRContext *ctx = module.getContext();
@@ -611,8 +612,9 @@ struct TosaOutlineOperators
         op.emitError("expected a matmul with a batch of 1");
         return signalPassFailure();
       }
-      auto signature =
-          FunctionType::get(ctx, {aType, bType, dType, f32, f32}, dType);
+      SmallVector<Type> inputTypes{aType, bType, dType, f32, f32};
+      if (sourceSemantics) inputTypes.push_back(f32);
+      auto signature = FunctionType::get(ctx, inputTypes, dType);
       auto [it, isNew] = tiles.try_emplace(
           signature, ("gemm_" + Twine(tiles.size())).str());
       std::string name = it->second;
@@ -622,6 +624,7 @@ struct TosaOutlineOperators
         tile->setAttr("sodap.tile", builder.getI64IntegerAttr(tiles.size() - 1));
         tile->setAttr("sodap.tile_dir", builder.getStringAttr("tiles/" + name));
         tile->setAttr("sodap.operator", builder.getStringAttr("gemm"));
+        if (sourceSemantics) tile->setAttr("sodap.source_semantics", builder.getUnitAttr());
         builder.setInsertionPointToStart(tile.getBody());
         auto fn = builder.create<func::FuncOp>(loc, name, signature);
         Block *body = fn.addEntryBlock();
@@ -630,7 +633,7 @@ struct TosaOutlineOperators
         Value d = buildGemmBody(
             builder, loc, reshape(builder, loc, arg(0), op.getA().getType()),
             reshape(builder, loc, arg(1), op.getB().getType()), arg(2), arg(3),
-            arg(4));
+            arg(4), sourceSemantics ? arg(5) : Value());
         builder.create<func::ReturnOp>(loc, d);
       }
 
@@ -656,6 +659,7 @@ struct TosaOutlineOperators
           scalar(g.alpha, 1.0f),
           // C without a mul is beta = 1; no C, beta = 0.
           scalar(g.beta, g.c ? 1.0f : 0.0f)};
+      if (sourceSemantics) inputs.push_back(scalar({}, g.c ? 1.0f : 0.0f));
       auto launch = builder.create<dataflow::LaunchOp>(
           loc, TypeRange{dType},
           SymbolRefAttr::get(ctx, name, {FlatSymbolRefAttr::get(ctx, name)}),

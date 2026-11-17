@@ -216,10 +216,12 @@ extern "C" void esp_gemm_copy_out(int64_t ctx, int64_t offset,
   copy(ctx, offset, rank, descriptor, false);
 }
 
-extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
+static void invoke(int64_t handle, int64_t a, int64_t b,
     int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
-    int64_t ldc, float alpha, float beta) {
+    int64_t ldc, float alpha, float beta, float hasC, bool sourceSemantics) {
   Context &ctx = lookup(handle);
+  if (sourceSemantics && (!ctx.dmaWidth || (hasC != 0.0f && hasC != 1.0f)))
+    fail("source GEMM requires packed DMA and an explicit C-presence flag");
   GEMM_PROFILE(ESP_PROF_ACCEL);
   GEMM_EVENT(1, ctx.invocations);
   if (ctx.running) fail("instance is already running");
@@ -230,7 +232,8 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
     fail("output overlaps an input");
   uint32_t descriptor[GEMM_FIELD_COUNT] = {};
   descriptor[GEMM_FIELD_MAGIC] = GEMM_MAGIC;
-  descriptor[GEMM_FIELD_VERSION] = ctx.dmaWidth ? GEMM_PACKED_VERSION : GEMM_VERSION;
+  descriptor[GEMM_FIELD_VERSION] = sourceSemantics ? GEMM_SOURCE_VERSION :
+      (ctx.dmaWidth ? GEMM_PACKED_VERSION : GEMM_VERSION);
   descriptor[GEMM_FIELD_DMA_WIDTH] = ctx.dmaWidth;
   const unsigned addressUnit = ctx.dmaWidth ? 1 : 4;
   descriptor[GEMM_FIELD_M] = m;
@@ -244,6 +247,7 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
   descriptor[GEMM_FIELD_LDC] = ldc / addressUnit;
   std::memcpy(&descriptor[GEMM_FIELD_ALPHA], &alpha, sizeof(float));
   std::memcpy(&descriptor[GEMM_FIELD_BETA], &beta, sizeof(float));
+  if (sourceSemantics) std::memcpy(&descriptor[GEMM_FIELD_HAS_C], &hasC, sizeof(float));
   for (unsigned i = 0; i < GEMM_FIELD_COUNT; ++i) {
     ctx.arena[2 * i] = descriptor[i];
     ctx.arena[2 * i + 1] = 0;
@@ -274,7 +278,8 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
       for (int64_t q = 0; q < k; ++q)
         sum = sum + read(a, i, q, lda) * read(b, q, j, ldb);
       float value = alpha * sum;
-      if (beta != 0) value = value + beta * read(c, i, j, ldc);
+      if (sourceSemantics ? hasC != 0 : beta != 0)
+        value = beta * read(c, i, j, ldc) + value;
       char *slot = reinterpret_cast<char *>(ctx.arena) + c + i * ldc + j * (ctx.dmaWidth ? 4 : 8);
       std::memcpy(slot, &value, 4);
       if (!ctx.dmaWidth) std::memset(slot + 4, 0, 4);
@@ -285,6 +290,17 @@ extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
   GEMM_EVENT(0, ctx.invocations);
   ++ctx.invocations;
   GEMM_LOG("REUSABLE_GEMM complete=%u instance=%u\n", ctx.invocations, ctx.instance);
+}
+
+extern "C" void esp_gemm_invoke(int64_t handle, int64_t a, int64_t b,
+    int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
+    int64_t ldc, float alpha, float beta) {
+  invoke(handle,a,b,c,m,n,k,lda,ldb,ldc,alpha,beta,0,false);
+}
+extern "C" void esp_gemm_invoke_source(int64_t handle, int64_t a, int64_t b,
+    int64_t c, int64_t m, int64_t n, int64_t k, int64_t lda, int64_t ldb,
+    int64_t ldc, float alpha, float beta, float hasC) {
+  invoke(handle,a,b,c,m,n,k,lda,ldb,ldc,alpha,beta,hasC,true);
 }
 
 extern "C" void esp_gemm_close(int64_t handle) {

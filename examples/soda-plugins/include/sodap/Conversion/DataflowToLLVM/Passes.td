@@ -67,6 +67,15 @@ def EmitBambuArchitecture :
   let dependentDialects = ["::mlir::sodap::dataflow::DataflowDialect"];
 }
 
+def SelectReusableHardware : Pass<"sodap-select-reusable-hardware", "::mlir::ModuleOp"> {
+  let summary = "Select shape-independent GEMM tiles from compute and storage budgets";
+  let options = [
+    Option<"lanes", "lanes", "unsigned", "64", "FP32 contraction lane budget">,
+    Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Total local storage budget">,
+    Option<"report", "report", "std::string", "\"\"", "Optional hardware selection JSON">
+  ];
+}
+
 def PrepareComputeBudget : Pass<"sodap-prepare-compute-budget", "::mlir::ModuleOp"> {
   let summary = "Normalize FP32 contractions and allocate one shared compute budget";
   let options = [

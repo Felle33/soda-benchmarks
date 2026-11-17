@@ -13,6 +13,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 
 #include "sodap/Dialect/Dataflow/Dataflow.h"
 #include "sodap/ExecutionEngine/ReusableGemmABI.h"
@@ -717,13 +719,18 @@ static bool isEmptyC(Value c, dataflow::LaunchOp launch) {
 /// into D's place, with the other copies in when it is a host argument (no
 /// launch but its own writes D), else just before its launch.
 static LogicalResult lowerInvocations(ModuleOp module,
-                                      MutableArrayRef<dataflow::LaunchOp> launches, unsigned width) {
+                                      MutableArrayRef<dataflow::LaunchOp> launches, unsigned width,
+                                      StringRef report) {
+  bool sourceSemantics = launches.front().getInputs().size() == 9;
+  if (sourceSemantics && !width)
+    return module.emitError("source GEMM semantics require packed DMA (descriptor v3)");
   SetVector<Value> buffers, read, written;
   for (dataflow::LaunchOp launch : launches) {
     // A GEMM: (A, B, C, M, K, N, alpha, beta) outs(D).
-    if (launch.getInputs().size() != 8 || launch.getOuts().size() != 1 ||
+    if (launch.getInputs().size() != (sourceSemantics ? 9 : 8) || launch.getOuts().size() != 1 ||
         !launch.getInputs()[6].getType().isF32() ||
-        !launch.getInputs()[7].getType().isF32())
+        !launch.getInputs()[7].getType().isF32() ||
+        (sourceSemantics && !launch.getInputs()[8].getType().isF32()))
       return launch.emitOpError("expected a gemm launch: (A, B, C, M, K, N, "
                                 "alpha, beta) outs(D)");
     Value c = launch.getInputs()[2], d = launch.getOuts()[0];
@@ -772,6 +779,66 @@ static LogicalResult lowerInvocations(ModuleOp module,
   if (bytes > (int64_t(1) << 30))
     return module.emitError("GEMM arena exceeds the one-GiB interface limit");
 
+  if (!report.empty()) {
+    DenseMap<Value, int64_t> ids;
+    llvm::json::Array tensors, calls, initializations, outputs;
+    for (auto [id, buffer] : llvm::enumerate(buffers)) {
+      ids[buffer] = id;
+      llvm::json::Array shape;
+      for (int64_t d : cast<MemRefType>(buffer.getType()).getShape()) shape.push_back(d);
+      tensors.push_back(llvm::json::Object{{"id",int64_t(id)},
+          {"shape",std::move(shape)}, {"offset_bytes",offset[buffer]}});
+    }
+    auto binding = [&](Value value, int64_t id, llvm::json::Array &into) -> LogicalResult {
+      auto arg = dyn_cast<BlockArgument>(value);
+      if (!arg) return module.emitError("invocation manifest needs host-argument bindings");
+      into.push_back(llvm::json::Object{{"buffer",id}, {"argument",int64_t(arg.getArgNumber())}});
+      return success();
+    };
+    auto scalar = [&](Value value, StringRef name, llvm::json::Object &call) -> LogicalResult {
+      if (auto c = value.getDefiningOp<arith::ConstantOp>()) {
+        if (auto f = dyn_cast<FloatAttr>(c.getValue())) {
+          call[(name + "_constant").str()] = f.getValueAsDouble();
+          return success();
+        }
+      }
+      if (auto load = value.getDefiningOp<memref::LoadOp>()) {
+        Value source = load.getMemRef();
+        while (auto cast = source.getDefiningOp<memref::CastOp>()) source = cast.getSource();
+        if (auto arg = dyn_cast<BlockArgument>(source)) {
+          call[(name + "_argument").str()] = int64_t(arg.getArgNumber());
+          return success();
+        }
+      }
+      return module.emitError("invocation manifest requires scalar constants or host scalar inputs: ") << name;
+    };
+    for (Value arg : read)
+      if (failed(binding(arg,ids[arg],initializations))) return failure();
+    for (dataflow::LaunchOp launch : launches) {
+      auto in = launch.getInputs();
+      Value d = launch.getOuts()[0];
+      auto a = cast<MemRefType>(in[0].getType()), b = cast<MemRefType>(in[1].getType());
+      llvm::json::Object call{{"a",ids[in[0]]}, {"b",ids[in[1]]}, {"c",ids[d]},
+          {"m",a.getDimSize(0)}, {"n",b.getDimSize(1)}, {"k",a.getDimSize(1)},
+          {"alpha_constant",1.0}, {"beta_constant",0.0}};
+      if (failed(scalar(in[6],"alpha",call)) || failed(scalar(in[7],"beta",call))) return failure();
+      if (sourceSemantics && failed(scalar(in[8],"has_c",call))) return failure();
+      if (!isEmptyC(in[2],launch) && failed(binding(in[2],ids[d],initializations))) return failure();
+      calls.push_back(std::move(call));
+    }
+    for (Value arg : written)
+      if (failed(binding(arg,ids[arg],outputs))) return failure();
+    std::error_code error;
+    llvm::raw_fd_ostream out(report,error,llvm::sys::fs::OF_Text);
+    if (error) return module.emitError("cannot write invocation manifest: ") << error.message();
+    out << llvm::json::Value(llvm::json::Object{{"schema_version",1},
+        {"kernel","forward_kernel"}, {"instance",0}, {"dma_data_width",width},
+        {"descriptor_version",int64_t(sourceSemantics ? GEMM_SOURCE_VERSION : (width ? GEMM_PACKED_VERSION : GEMM_VERSION))},
+        {"fp_semantics",sourceSemantics ? "source_expression" : "blas_beta_zero"},
+        {"arena_bytes",bytes}, {"buffers",std::move(tensors)}, {"invocations",std::move(calls)},
+        {"initializations",std::move(initializations)}, {"outputs",std::move(outputs)}}) << '\n';
+  }
+
   OpBuilder b(module.getContext());
   Location loc = launches.front()->getLoc();
   Type i64 = b.getI64Type(), f32 = b.getF32Type();
@@ -791,7 +858,9 @@ static LogicalResult lowerInvocations(ModuleOp module,
   declare("esp_gemm_copy_out", {i64, i64, unranked}, {});
   SmallVector<Type> invokeTypes(10, i64);
   invokeTypes.append({f32, f32});
-  declare("esp_gemm_invoke", invokeTypes, {});
+  if (sourceSemantics) invokeTypes.push_back(f32);
+  StringRef invokeName = sourceSemantics ? "esp_gemm_invoke_source" : "esp_gemm_invoke";
+  declare(invokeName, invokeTypes, {});
   auto constant = [&](int64_t n) -> Value {
     return b.create<arith::ConstantIntOp>(loc, n, 64);
   };
@@ -830,11 +899,11 @@ static LogicalResult lowerInvocations(ModuleOp module,
       }
       return constant(cols * GEMM_SLOT_BYTES);
     };
-    b.create<func::CallOp>(
-        launch.getLoc(), "esp_gemm_invoke", TypeRange{},
-        ValueRange{context, constant(offset[a]), constant(offset[rhs]),
+    SmallVector<Value> invokeArgs{context, constant(offset[a]), constant(offset[rhs]),
                    constant(offset[c]), i64Of(in[3]), i64Of(in[5]),
-                   i64Of(in[4]), ld(a), ld(rhs), ld(c), in[6], in[7]});
+                   i64Of(in[4]), ld(a), ld(rhs), ld(c), in[6], in[7]};
+    if (sourceSemantics) invokeArgs.push_back(in[8]);
+    b.create<func::CallOp>(launch.getLoc(), invokeName, TypeRange{}, invokeArgs);
   }
   b.setInsertionPointAfter(launches.back().getOperation());
   for (Value arg : written)
@@ -892,7 +961,7 @@ public:
         }
         forwardOutParams(launch);
       }
-      if (failed(lowerInvocations(module, launches, dmaDataWidth)))
+      if (failed(lowerInvocations(module, launches, dmaDataWidth, invocationsFile)))
         return signalPassFailure();
       tiles.front().erase();
       host.setSymName(this->host);

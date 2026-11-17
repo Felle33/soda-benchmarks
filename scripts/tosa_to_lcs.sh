@@ -56,7 +56,7 @@
 #   LCS_SEQUENTIAL=true  alias for LCS_OVERLAP=false (default false)
 #                        With LCS_COMPUTE_LANES and no LCS_TILE_SIZES, operators
 #                        mode takes the tile from the hardware budget alone
-#                        (scripts/lcs/reusable_gemm_config.py with LCS_PLM_BYTES,
+#                        (sodap-select-reusable-hardware with LCS_PLM_BYTES,
 #                        written to hardware_selection.json): 128x64x64 for 64
 #                        lanes and 327680 bytes. Tile sizes need not divide the
 #                        shapes: sodap-dataflow-tails cuts the transfers at run time.
@@ -100,7 +100,7 @@
 set -eou pipefail
 
 case "${LCS_REUSABLE_GEMM:-false}" in
-  true) exec bash "$(dirname -- "$0")/tosa_to_reusable_gemm.sh" "$@" ;;
+  true) echo 'LCS_REUSABLE_GEMM selects the superseded dedicated generator. Use LCS_TILES=operators; archived reproduction can invoke tosa_to_reusable_gemm.sh explicitly.' >&2; exit 1 ;;
   false) ;;
   *) echo 'LCS_REUSABLE_GEMM must be true or false' >&2; exit 1 ;;
 esac
@@ -130,7 +130,13 @@ case "$TILES" in
   kernel) OUTLINE=sodap-tosa-outline-kernel ;;
   # One tile per operator, its shapes as arguments (one accelerator, one
   # launch per invocation); the host's reshapes cancel with the model's.
-  operators) OUTLINE='sodap-tosa-outline-operators, sodap-join-multiple-tiles, func.func(canonicalize)' ;;
+  operators)
+    case ${LCS_GEMM_FP_SEMANTICS:-source} in
+      source) FP_SOURCE=true ;;
+      blas) FP_SOURCE=false ;;
+      *) echo 'LCS_GEMM_FP_SEMANTICS must be source or blas' >&2; exit 1 ;;
+    esac
+    OUTLINE="sodap-tosa-outline-operators{source-semantics=$FP_SOURCE}, sodap-join-multiple-tiles, func.func(canonicalize)" ;;
   *) echo 'LCS_TILES must be kernel or operators' >&2; exit 1 ;;
 esac
 TOP=forward_kernel
@@ -185,13 +191,11 @@ if [ -z "${LCS_TILE_SIZES:-}" ] && [ "${_LCS_INTERNAL_CANDIDATE:-false}" = false
   export LCS_TILE_SIZES="$(cat selected_tile_sizes.txt)"
 fi
 # One accelerator per operator, with a compute budget: the tile comes from
-# the hardware budget alone (lanes and PLM bytes), as tosa_to_reusable_gemm.sh
-# chooses it, never from the invocations: one hardware for every workload.
+# the hardware budget alone (lanes and PLM bytes) in the compiler, never from
+# the invocations: one hardware for every workload.
 # Sizes need not divide the shapes (sodap-dataflow-tails).
-if [ "$TILES" = operators ] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
-  python3 "$REPO_DIR/scripts/lcs/reusable_gemm_config.py" "$LCS_COMPUTE_LANES" "$TOTAL_PLM_BYTES" > hardware_selection.json
-  LCS_TILE_SIZES=$(python3 -c 'import json; c=json.load(open("hardware_selection.json")); print("[[%d, %d, %d]]" % (c["tile_m"], c["tile_n"], c["tile_k"]))')
-fi
+# Reusable hardware selection is a compiler pass on the model-derived tile.
+# No Python helper chooses tiles or register blocks in this path.
 # LCS_TILE_SIZES or the model's variables replace the attributes of
 # @tile_tasks's tile_and_fuse, the only one on %tasks.
 TILE_ATTRS=
@@ -307,6 +311,13 @@ step "$FRONTEND_DUMP" mlir-opt "$INPUT" $TOSA_PLUGIN --pass-pipeline="builtin.mo
     $OUTLINE
   )" -o outlined.mlir
 
+if [ "$TILES" = operators ] && [ -z "${LCS_TILE_SIZES:-}" ] && [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
+  step "$FRONTEND_DUMP" mlir-opt outlined.mlir $PLUGIN \
+    --pass-pipeline="builtin.module(sodap-select-reusable-hardware{lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES report=$PWD/hardware_selection.json})" \
+    -o hardware_selected.mlir
+  cp hardware_selected.mlir outlined.mlir
+fi
+
 section "$FRONTEND_DUMP" "Tile: front end, compute tasks and tiling ($ENTRY), mlir-opt"
 step "$FRONTEND_DUMP" mlir-opt outlined.mlir $PLUGIN --pass-pipeline="builtin.module(
     transform-preload-library{transform-library-paths=$TRANSFORM},
@@ -368,10 +379,9 @@ BANK_PREPARE=
 MEMREF_BACKEND=finalize-memref-to-llvm
 COMPUTE_SELECTION=explicit
 if [[ -n ${LCS_COMPUTE_LANES:-} ]]; then
-  BLOCK_FROM_BUDGET=$(python3 "$REPO_DIR/scripts/lcs/compute_budget.py" "$LCS_COMPUTE_LANES")
   if [[ -z ${LCS_REGISTER_BLOCK:-} ]]; then
-    LCS_REGISTER_BLOCK=$BLOCK_FROM_BUDGET
-    COMPUTE_SELECTION=balanced_factorization
+    LCS_REGISTER_BLOCK=auto
+    COMPUTE_SELECTION=compiler_compute_budget
   fi
   COMPUTE_PREPARE="sodap-prepare-compute-budget{lanes=$LCS_COMPUTE_LANES report=$PWD/compute_plan.json},"
   LCS_FP_UNITS=${LCS_FP_UNITS:-$LCS_COMPUTE_LANES}
@@ -383,10 +393,15 @@ fi
 # previously held an optimized build; stale metadata must not alter HLS.
 printf '{"enabled":false}\n' > compute_config.json
 if [[ -n ${LCS_REGISTER_BLOCK:-} ]]; then
-  if [[ ! $LCS_REGISTER_BLOCK =~ ^([1-9][0-9]*),([1-9][0-9]*)$ ]]; then
+  if [[ $LCS_REGISTER_BLOCK == auto && -n ${LCS_COMPUTE_LANES:-} ]]; then
+    # Placeholders are never used: the preceding compiler budget pass writes
+    # the bank/register dimensions on every contraction, verified below.
+    MR=1; NR=1
+  elif [[ $LCS_REGISTER_BLOCK =~ ^([1-9][0-9]*),([1-9][0-9]*)$ ]]; then
+    MR=${BASH_REMATCH[1]}; NR=${BASH_REMATCH[2]}
+  else
     echo 'LCS_REGISTER_BLOCK must be positive rows,columns' >&2; exit 1
   fi
-  MR=${BASH_REMATCH[1]}; NR=${BASH_REMATCH[2]}
   FP_UNITS=${LCS_FP_UNITS:-$((MR * NR))}
   if [[ ! $FP_UNITS =~ ^[1-9][0-9]*$ ]] || (( MR * NR > 256 || FP_UNITS > 256 )); then
     echo 'Register block and FP unit count must be in 1..256' >&2; exit 1
@@ -401,6 +416,10 @@ if [[ -n ${LCS_REGISTER_BLOCK:-} ]]; then
   esac
   printf '{"enabled":true,"selection":"%s","register_rows":%s,"register_columns":%s,"fp_units_per_task":%s,"bank_local":%s}\n' \
     "$COMPUTE_SELECTION" "$MR" "$NR" "$FP_UNITS" "${LCS_BANK_LOCAL:-true}" > compute_config.json
+  if [[ $LCS_REGISTER_BLOCK == auto ]]; then
+    printf '{"enabled":true,"selection":"compiler_compute_budget","register_rows":null,"register_columns":null,"dimensions_report":"compute_plan.json","fp_units_per_task":%s,"bank_local":%s}\n' \
+      "$FP_UNITS" "${LCS_BANK_LOCAL:-true}" > compute_config.json
+  fi
 fi
 if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
   if [[ -n $COMPUTE_PREPARE ]]; then
@@ -413,6 +432,11 @@ if [ "${_LCS_INTERNAL_CANDIDATE:-false}" = true ]; then
   fi
   exit 0
 fi
+if [ "$TILES" = operators ] && [[ ${LCS_REGISTER_BLOCK:-} == auto && ${LCS_BANK_LOCAL:-true} == true ]]; then
+step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
+    builtin.module(sodap-reusable-operator-backend{lanes=$LCS_COMPUTE_LANES plm-bytes=$TOTAL_PLM_BYTES dma-width=$DMA_WIDTH compute-report=$PWD/compute_plan.json storage-report=$PWD/compute_storage.json}),
+    sodap-tiles-to-llvm)" -o acc.mlir
+else
 step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     builtin.module(
       $TAILS
@@ -448,6 +472,7 @@ step "$ACC_DUMP" mlir-opt dataflow.mlir $PLUGIN --pass-pipeline="builtin.module(
     ),
     sodap-tiles-to-llvm
   )" -o acc.mlir
+fi
 
 for dir in tiles/*/; do
   $DOCKER_RUN llvm-link -S - "$dir/ac_channel_specializations.ll" < "$dir/acc.ll" \
@@ -464,7 +489,7 @@ step "$HOST_DUMP" mlir-opt acc.mlir $PLUGIN --pass-pipeline="builtin.module(
       tosa-to-linalg
     ),
     $BUFFERIZE,
-    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH}
+    sodap-launches-to-esp{host=$TOP profile=$PROFILE dma-word-stride=$WORD_STRIDE dma-data-width=$DMA_WIDTH invocations-file=$PWD/invocations.json}
   )" -o host.mlir
 # forward_kernel's arguments are @forward's, then its results.
 N_ARGS=$(grep -m1 -oE "func.func @$TOP\([^)]*\)" host.mlir | grep -oE '%arg[0-9]+:' | wc -l)

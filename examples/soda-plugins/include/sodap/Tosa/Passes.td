@@ -127,6 +127,8 @@ def TosaOutlineKernel : Pass<"sodap-tosa-outline-kernel", "::mlir::ModuleOp"> {
 
 def TosaOutlineOperators : Pass<"sodap-tosa-outline-operators", "::mlir::ModuleOp"> {
   let summary = "Move each GEMM into a tile module of its own";
+  let options = [Option<"sourceSemantics", "source-semantics", "bool", "false",
+      "Distinguish absent C from explicit beta*C, preserving NaN behavior (descriptor v3)">];
   let description = [{
     The per-operator alternative to `sodap-tosa-outline-kernel`. Each
     `tosa.matmul`, in program order, with the ops around it that make a GEMM,

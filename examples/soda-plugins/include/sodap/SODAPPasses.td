@@ -421,6 +421,8 @@ def LaunchesToESP : Pass<"sodap-launches-to-esp", "::mlir::ModuleOp"> {
     Operands must be f32 memrefs with static shapes and the identity layout.
   }];
   let options = [
+    Option<"invocationsFile", "invocations-file", "std::string", "\"\"",
+           "Export the same checked operator invocation graph used by host lowering">,
     Option<"host", "host", "std::string", /*default=*/"\"forward_kernel\"",
            "New name of the function holding the launches">,
     Option<"profile", "profile", "bool", /*default=*/"false",
