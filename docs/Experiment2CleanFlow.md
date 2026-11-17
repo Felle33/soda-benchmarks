@@ -1,15 +1,15 @@
-# Experiment 2: model-derived reusable operators
+# Experiment 2: reusable operators through the unified host compiler
 
-This replaces the November 14 dedicated-generator campaign. Base: Tommaso's
-`exp2-operators-packed` at `8c3d413`. The archived results remain historical;
-this implementation needs its own FPGA qualification and measurements.
+Operator mode has one host generator: `sodap-tosa-network-host` in
+`Tosa/NetworkHost.cpp`, linked with `ReusableOperatorRuntime.cpp` (`esp_op_*`).
+GEMM chains and mixed CNN graphs use the same host lowering and runtime.
+Whole-kernel mode (`LCS_TILES=kernel`, Experiment 1) retains
+`sodap-launches-to-esp`; operator-mode drivers reject that legacy host route.
 
 ## Compile a PyTorch program
 
-The input file exports `create_model(**options) -> (torch.nn.Module, inputs)`.
-Inputs are contiguous FP32 tensors, including scalar tensor coefficients. The
-current backend accepts GEMM chains and one tensor result. Example, in the
-pinned compiler environment:
+The factory returns `(torch.nn.Module, inputs)`. Inputs are contiguous FP32
+tensors, including scalar coefficient tensors. For example:
 
 ```bash
 python3 scripts/pytorch_to_esp.py \
@@ -19,99 +19,80 @@ python3 scripts/pytorch_to_esp.py \
   --output /campaign/cases/LARGE/twomm
 ```
 
-Use a fresh output directory. The frontend executes the actual PyTorch model
-to generate reference values and imports it through torch-mlir. It never reads
-archived TOSA, picks tiles, or substitutes a hardware implementation. The
-original canonical 2MM includes its alpha/beta epilogues. `twomm_mm` is not used.
+The frontend executes the actual model for reference data and imports fresh
+TOSA. Canonical 2MM retains its alpha/beta expressions; `twomm_mm` is not used.
+Python exports fixtures and invokes tools. It makes no fusion, scheduling,
+tiling, banking or allocation decision.
 
-The compiler produces `generated/05_hw_acc.ll`, `architecture.xml`,
-`05_kernel_riscv.ll`, `05_cpu_baseline.ll`, `invocations.json`, compute/storage
-reports, and IR after each pass. The hardware LLVM is Bambu's input; the host
-LLVM links with the reviewed ESP runtime and a bare-metal application harness.
+Outputs under `generated/` include `host.mlir`, `host.ll`, `host-riscv.o`,
+`parameters.bin`, `network.json`, and `engines/<implementation>/05_hw_acc.ll`
+and `architecture.xml`. `--network` is a compatibility spelling, not a second
+host path. `--network-host-only` omits hardware lowering.
 
-## Compiler mechanisms and ownership
+## Shared source-expression recognition and runtime
 
-Tommaso's work is retained:
+`include/sodap/Tosa/Gemm.h` contains the existing `Gemm`/`matchGemm` matcher,
+shared by hardware outlining and host planning. It recognizes the imported
+source expression `alpha * (A @ B) + beta * C`, respecting single-use boundaries.
+The host schedules the launch after its inputs exist and uses SSA last uses to
+keep intermediate products in DRAM. GEMM, canonical 2MM and 3MM use 1, 2 and 3
+GEMM launches, respectively, on the same engine.
 
-- `TosaTransposes.cpp` recognizes model GEMM expressions and outlines launches.
-- `JoinMultipleTiles.cpp` normalizes compatible GEMMs to a dynamic-shape TOSA
-  operator, binds descriptor fields, and joins launches to one implementation.
-- `SODAPTransforms.cpp`, `LoadStore.cpp`, `Schedule.cpp`, `PingPong.cpp` and
-  `Prefix.h` derive tiled tasks, demand-driven schedules, local storage and
-  safe ownership tokens from the operator.
-- `GuardReads.cpp`, `Tails.cpp` and `CopyToDMA.cpp` implement conditional reads,
-  partial-tile transfers/zero fills and packed DMA. Epilogues execute on valid
-  tile extents.
-- `ComputeBudget.cpp` and `BankedMemrefs.cpp` allocate the contraction budget,
-  infer compatible banking, expose register-blocked compute and lower to LLVM.
-- `ESPPasses.cpp` emits the shared arena and ordered host launches. Intermediate
-  matrix products remain in DRAM between invocations.
+`esp_op_gemm_full_source` accepts coefficients and explicit C presence. Scalar
+model inputs are read on each run; constants remain compiler-extracted data.
+The GEMM engine writes its result in place into its C buffer. The host therefore
+copies source C into a distinct writable result buffer before the launch; it
+never overwrites a persistent parameter, model input or live SSA value.
+`esp_op_gemm_source` remains the pure-product entry point.
 
-New consolidation:
+Both entry points use the existing packed source-semantics GEMM descriptor v3.
+Field 14 contains the FP32 C-presence flag, independent of beta. Explicit `0*C`
+still reads C, preserving NaN propagation; an absent C is not read. The 128-byte
+GEMM descriptor is unchanged. The shared operator arena reserves a 256-byte
+header, so data addresses differ from the old GEMM-only arena, while descriptor
+address units and field meanings remain identical.
 
-- `SelectReusableHardware.cpp` implements the previous bounded outer-tile
-  heuristic as `sodap-select-reusable-hardware`. It uses only lane and storage
-  budgets; 64 lanes/327680 bytes select 128x64x64. The final banked storage
-  report remains an independent admission check.
-- `tile_and_fuse` consumes the compiler's `sodap.hardware_tile_sizes` attribute.
-  Explicit transform sizes retain precedence for experiments outside this CLI.
-- The initial Python register-block selector is removed from `tosa_to_lcs.sh`.
-  The common C++ compute-budget pass selects every contraction's dimensions.
-- `sodap-reusable-operator-backend` is a registered C++ pipeline covering
-  guarded/tail DMA, task-to-function conversion, compute/banking and LLVM.
-- `sodap-launches-to-esp` exports the same checked invocation graph it uses for
-  host code. The manual baseline consumes this manifest; it does not reconstruct
-  a benchmark-specific sequence.
+`network.json` is the compiler's actual ordered execution plan: buffers,
+input/parameter bindings, copies, coefficient sources, dimensions, C presence,
+engine implementations and device instances. The manual SPECTRA baseline
+serializes this manifest into tables consumed by a generic C interpreter; it
+does not reconstruct GEMM chains by benchmark name. Its existing padded FP32
+transport differs from the generated engine's packed FP32 transport.
 
-The new entry point cannot fall back to `GenerateReusableGemm.cpp` or
-`tosa_to_reusable_gemm.sh`. Neither `reusable_gemm_config.py`, `compute_budget.py`
-nor `select_tiles.py` participates in the new reusable pipeline. The latter
-remains a legacy whole-kernel-mode search helper; consolidation of that search
-is separate from this Experiment 2 replacement. Python is used for the PyTorch
-frontend, test harnesses and tool orchestration, with no dataflow optimization.
-The common shell driver rejects the superseded `LCS_REUSABLE_GEMM=true` switch.
-Generated C++ `ac_channel` binding units are transport ABI support; they do not
-implement the numerical datapath.
+GEMM-only manifests contain only the GEMM family. The operator runtime supports
+both separate typed sockets and a build configured for the existing single
+GEMM device. It does not require convolution or addition devices for these apps.
 
-## FP32 source expression and descriptor v3
+## Hardware pipeline remains unchanged
 
-The old normalization treated `beta == 0` as "do not read C". This is not
-equivalent to the explicit source expression `beta*C` when C contains NaNs.
-The new entry point selects `source-semantics=true` when outlining operators.
-It carries an explicit f32 C-presence flag (0 or 1) through MLIR and descriptor
-field 14. It skips C only when the source operator has no C expression. Explicit
-`0*C` still reads C and participates in the result.
+The host pass preserves the source module for the existing hardware extraction:
+`TosaTransposes.cpp`, `JoinMultipleTiles.cpp`, `SelectReusableHardware.cpp`,
+tiling, task scheduling, ping-pong ownership, guarded/tail DMA, compute-budget
+selection, banking and the registered reusable-operator backend. The matcher
+was factored into a shared header without changing hardware outlining behavior.
 
-Descriptor version 3 preserves the packed v2 tensor layout and 128-byte header.
-`esp_gemm_invoke_source` writes the new version/flag; compiler-generated hardware
-checks that version. No ESP socket, CSR, DMA port or adapter changes are needed.
-Versions 1/2 and `esp_gemm_invoke` retain their archived behavior. The low-level
-TOSA pass defaults to that behavior for old tests; the supported PyTorch driver
-and operators-mode shell flow default to source semantics. `LCS_GEMM_FP_SEMANTICS=blas`
-is explicit compatibility mode, not the replacement experiment.
+64 compute lanes and a 327680-byte array budget retain the existing GEMM tile
+selection. No Bambu patch, adapter, socket, descriptor reader or FPGA design
+change is part of host unification. Existing accelerator images may be reused
+only after byte-identical accelerator LLVM and architecture checks pass.
 
-Arithmetic remains FP32. Validation uses stated tolerances against PyTorch;
-this is not a claim of bitwise identity across floating-point implementations.
-The NaN test checks that the newly introduced semantic distinction is preserved
-through both the generated host and synthesized hardware.
+## Measurement and qualification
 
-## Scope and qualification
+The primary Experiment 2 interval is first GEMM invocation entry through final
+completion, including dispatch, DMA, polling and all work between invocations.
+Input packing, C copies before the first invocation, final unpacking, setup,
+UART and numerical validation are outside this interval and must be reported
+separately. Copies between launches are inside it. The whole `forward_run`
+function is therefore not the Experiment 2 timing boundary.
 
-The mechanism currently normalizes GEMM with batch dimension one. Source
-tensor shapes are static at tracing/lowering time; the accelerator receives
-runtime M/N/K, strides, addresses and coefficients. Identical hardware for
-different traced workloads does not imply general dynamic PyTorch support.
-Unsupported CPU uses of intermediates or C sourced from a previous launch are
-diagnosed by host lowering. Convolution/addition require separate operator
-contracts; this change does not claim to add those contracts.
+Qualification requires original and added compiler tests; MINI/LARGE native
+GEMM/2MM/3MM; odd dimensions; explicit NaN-C; descriptor byte comparisons;
+unchanged whole-kernel outputs; and MINI full-system ESP RTL with the new host
+and the existing GEMM RTL. FPGA results must identify the new host binary and
+must not inherit measurements from the old `esp_gemm_*` host path.
 
-One generated LLVM/RTL image must cover MINI/LARGE GEMM/2MM/3MM and unseen odd
-multi-tile shapes. Qualification includes native reference checks, compiler
-regressions, exact HLS core-unit counting, finite/NaN/tail/stalled-DMA RTL tests,
-full-system MINI validation on the matched 2x2 SoC, routing/timing checks and
-full-output LARGE FPGA validation. Physical DSP and BRAM usage are measured,
-not inferred from logical lane or array-byte counts.
-
-The campaign keeps the existing pinned Bambu build and all eight reviewed
-patches, including the dual-port array interface correction. No new Bambu or
-handwritten datapath modifications are required by this consolidation.
+FP32 validation uses stated tolerances, not bitwise equality with PyTorch.
+Shapes are static at import; dimensions, addresses and coefficients are runtime
+accelerator parameters. True batched GEMM and general broadcast addition retain
+existing unsupported-case diagnostics. See `Experiment3CleanFlow.md` for the
+shared mixed-network capabilities and classifier fusion.

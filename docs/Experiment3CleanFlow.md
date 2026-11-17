@@ -17,7 +17,7 @@ PyTorch + checkpoint -> torch-mlir/TOSA
             -> accelerator LLVM + architecture.xml -> Bambu -> native ESP
 ```
 
-`scripts/pytorch_to_esp.py --network` loads the model, invokes torch-mlir, saves
+`scripts/pytorch_to_esp.py` (optionally spelled `--network`) loads the model, invokes torch-mlir, saves
 test fixtures and runs tools. Python does not recognize layers, assign buffers,
 emit the network schedule, optimize a datapath or generate accelerator C++.
 The shell driver reads the compiler's engine manifest and invokes the common
@@ -26,8 +26,9 @@ RTL/interface names.
 
 The new C++ network host pass handles mixed CPU/accelerator operations and
 residual lifetimes, which the original GEMM-only host pass did not support.
-It is registered in the compiler and invoked by the main flow. Existing
-Experiment 1/2 host routes remain available; hardware scheduling is shared.
+It is registered in the compiler and invoked by the main flow. All operator-mode inputs, including Experiment 2 GEMM chains, use this pass
+and `esp_op_*`. Only whole-kernel mode retains `sodap-launches-to-esp`.
+Hardware scheduling is unchanged.
 
 ## Reuse contracts and mapping
 
@@ -61,6 +62,22 @@ to `parameters.bin`, and allocates packed DRAM buffers using last uses and a
 best-fit free list. Residual values survive their final consumer. Parameters
 and inputs remain persistent; reshapes repack when padding changes layout.
 It emits `forward_init`, `forward_run`, `forward_close` and `network.json`.
+The manifest also identifies model input buffers, parameter bindings, explicit
+copies and GEMM coefficient sources, so external baseline hosts can consume
+compiler decisions without reconstructing the graph.
+
+The host reuses `Gemm`/`matchGemm` from `Tosa/Gemm.h` for full source-expression
+GEMM. A batch-one classifier matmul plus bias becomes one GEMM invocation with
+alpha=beta=1. Because hardware writes C in place, the host copies the persistent
+bias into the writable result before **every** launch. That recurring copy is
+inside the network timing interval. Neither parameters nor values with later
+consumers are overwritten. Unsupported broadcasting/batches are not newly
+advertised; supported non-fused cases retain separate launches.
+
+ResNet18/34 consequently have 29/53 accelerator calls instead of 30/54.
+SqueezeNet1.1 retains 26 calls and byte-identical host LLVM. Device manifests
+contain only families actually used; GEMM-only apps support a single-device
+runtime build without unused convolution/addition devices.
 
 Weights are copied to DRAM during initialization; their values do not specialize
 hardware. `FoldConvAffine.cpp` folds constant channelwise affine chains covering
@@ -123,7 +140,7 @@ units, including shared epilogues. Local array allocations are respectively
 43910, 262340 and 98691 bytes. These are not routed DSP/BRAM counts. No dynamic
 integer divider module was found in this configuration's reachable RTL.
 
-Supported source graphs use positive static FP32 tensors of rank 1..4;
+Supported source graphs use positive static FP32 tensors of rank 0..4 (rank zero for scalar coefficients);
 batch-one GEMM; dense Conv2D; equal-shape add; ReLU; transpose; reshape; binary
 concat; max pooling; unpadded average pooling. Unsupported operations fail
 compilation. Grouped/depthwise convolution, arbitrary broadcast addition,
@@ -137,7 +154,9 @@ Experiment 3 speedup is attributed to this candidate.
 
 ## Validation
 
-The parent project's `experiments/exp3-clean-20261116/README.md` holds exact
+The parent project's `experiments/exp-unified-20261117/README.md` holds new
+unified-host qualification evidence. The read-only
+`experiments/exp3-clean-20261116/README.md` holds original
 commands and evidence locations. Completed checks include:
 
 - 108 compiler regressions: descriptor schemas, extraction, explicit instance
@@ -149,7 +168,7 @@ commands and evidence locations. Completed checks include:
   the local tile. Both test DMA stalls; conv passes Icarus and Verilator.
 - Actual compiler-host/three-engine RTL execution, repeated twice with stalls.
 - Numerical full-system 3x3 ESP RTL using the fresh RISC-V host, CPU tensor
-  operations and six sequential hardware offloads.
+  operations and five sequential hardware offloads after classifier fusion.
 
 All models produce identical convolution LLVM; the ResNets also share identical
 add/GEMM LLVM. GEMM remains byte-identical to qualified clean Experiment 2.

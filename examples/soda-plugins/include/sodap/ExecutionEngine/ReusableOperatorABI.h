@@ -64,6 +64,13 @@ void esp_op_gemm(int64_t context, int64_t a, int64_t b, int64_t c,
 // Pure source matmul, compatible with the clean common GEMM backend (v3).
 void esp_op_gemm_source(int64_t context,int64_t a,int64_t b,int64_t c,
     int64_t m,int64_t n,int64_t k);
+// Source expression alpha*A*B + beta*C. C is the writable output buffer;
+// has_c is explicitly 0 or 1 and never inferred from beta.
+void esp_op_gemm_full_source(int64_t context,int64_t a,int64_t b,int64_t c,
+    int64_t m,int64_t n,int64_t k,float alpha,float beta,float has_c);
+float esp_op_scalar(int64_t context,int64_t offset);
+// Optional measurement hooks: first GEMM entry through final completion.
+void esp_op_profile_event(uint32_t begin,uint32_t invocation);
 void esp_op_relu(int64_t context,int64_t a,int64_t c,int64_t count);
 void esp_op_pool(int64_t context, int64_t a, int64_t c,
     int64_t n, int64_t ih, int64_t iw, int64_t ch, int64_t oh, int64_t ow,

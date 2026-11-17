@@ -3,6 +3,7 @@
 // Python graph representation. Hardware lowering consumes source.mlir; runtime
 // calls below implement the execution ABI, not accelerator microarchitecture.
 #include "sodap/Tosa/Passes.h"
+#include "sodap/Tosa/Gemm.h"
 #include "sodap/ExecutionEngine/ReusableOperatorABI.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/DenseMap.h"
@@ -69,6 +70,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   DenseMap<Value, Value> aliases;
   DenseSet<Operation *> fused;
   DenseMap<Operation *, bool> activations;
+  DenseMap<Operation *, Gemm> gemms;
   DenseMap<Value, unsigned> lastUse;
   SmallVector<std::pair<int64_t, int64_t>> free;
   int64_t cursor = 0, parameters = 0;
@@ -80,6 +82,25 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   struct Engine {std::string family;unsigned lanes;SmallVector<unsigned> instances;};
   std::map<std::string,Engine> engines;
 
+  StringRef operatorFamily(Operation *op) {
+    return gemms.count(op) ? "gemm" : family(op);
+  }
+  Operation *binding(Operation *op) {
+    auto it=gemms.find(op);
+    return it==gemms.end()?op:it->second.matmul.getOperation();
+  }
+  SmallVector<Value> operands(Operation *op) {
+    auto it=gemms.find(op);
+    if(it==gemms.end()) {
+      auto values=op->getOperands();
+      return llvm::to_vector(isa<tosa::TransposeOp>(op)?values.take_front(1):values);
+    }
+    auto &g=it->second;
+    SmallVector<Value> values{g.matmul.getA(),g.matmul.getB()};
+    for(Value v:{g.c,g.alpha,g.beta})if(v)values.push_back(v);
+    return values;
+  }
+
   Value storageValue(Value v) {
     auto it = aliases.find(v);
     return it == aliases.end() ? v : it->second;
@@ -88,9 +109,9 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   LogicalResult type(Value v) {
     auto t = dyn_cast<RankedTensorType>(v.getType());
     if (!t || !t.hasStaticShape() || !t.getElementType().isF32() ||
-        t.getRank() < 1 || t.getRank() > 4 ||
+        t.getRank() > 4 ||
         llvm::any_of(t.getShape(), [](int64_t d) { return d <= 0; }))
-      return emitError(v.getLoc(), "network tensors must be positive static FP32, rank 1..4");
+      return emitError(v.getLoc(), "network tensors must be positive static FP32, rank 0..4");
     // Check before multiplication, including runtime's 32-bit address bound.
     int64_t count = 1;
     for (auto d : t.getShape()) {
@@ -103,7 +124,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   Buffer allocate(Value v, bool persistent) {
     auto s = shape(v);
     Buffer b;
-    b.id = nextID++; b.elements = product(s); b.columns = s.back();
+    b.id = nextID++; b.elements = product(s); b.columns = s.empty()?1:s.back();
     int64_t beat = dmaWidth / 8;
     int64_t row = ((b.columns * 4 + beat - 1) / beat) * beat;
     b.bytes = b.elements / b.columns * row;
@@ -161,6 +182,17 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
   // All arguments are derived from the verified operation and its SSA buffers.
   // Return a CPU/runtime operation or a typed accelerator invocation.
   FailureOr<std::pair<std::string, SmallVector<int64_t>>> arguments(Operation *op) {
+    if(auto it=gemms.find(op);it!=gemms.end()) {
+      auto &g=it->second;
+      auto a=shape(g.matmul.getA()),b=shape(g.matmul.getB());
+      auto result=shape(g.matmul.getResult());
+      if(a.size()!=3 || b.size()!=3 || a[0]!=1 || b[0]!=1 || a[2]!=b[1] ||
+          result!=SmallVector<int64_t>{1,a[1],b[2]})
+        return op->emitError("reusable GEMM currently requires batch one");
+      return std::make_pair(std::string(g.c || g.alpha ? "gemm_full_source":"gemm_source"),
+          SmallVector<int64_t>{buffer(g.matmul.getA()).offset,buffer(g.matmul.getB()).offset,
+            buffer(op->getResult(0)).offset,a[1],b[2],a[2]});
+    }
     auto y = op->getResult(0); auto out = shape(y);
     auto x = op->getOperand(0); auto in = shape(x);
     int64_t a = buffer(x).offset, c = buffer(y).offset;
@@ -264,18 +296,38 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
         }
       operations.push_back(&op);
     }
+    // Analyze the unchanged source graph. Hardware extraction consumes the
+    // original module; only host scheduling absorbs these expression nodes.
+    for(auto *op:operations)if(auto matmul=dyn_cast<tosa::MatMulOp>(op)) {
+      Gemm g=matchGemm(matmul);
+      if(g.c) {
+        auto out=cast<RankedTensorType>(g.ops.back()->getResult(0).getType());
+        auto c=cast<RankedTensorType>(g.c.getType());
+        auto m=shape(matmul.getResult());
+        bool exact=c.getShape()==out.getShape();
+        bool vectorBias=m.size()==3 && m[0]==1 && m[1]==1 && c.getNumElements()==m[2];
+        if(!exact && !vectorBias) {
+          // Preserve the separate add and its existing broadcast diagnostic.
+          g.ops.pop_back();g.c={};g.beta={};g.betaMul=nullptr;
+        }
+      }
+      auto *last=g.ops.back();
+      for(auto *part:g.ops)if(part!=last)fused.insert(part);
+      if(g.betaMul)fused.insert(g.betaMul);
+      gemms.try_emplace(last,std::move(g));
+    }
     // Fusion is legal only with one consumer, so live residual values retain
     // their original semantics. Keep the actual clamp in the hardware source.
     for(auto *op:operations) if(relu(op)) {
       Value x=op->getOperand(0); auto *producer=x.getDefiningOp();
-      if(producer && x.hasOneUse() && (isa<tosa::Conv2DOp,tosa::AddOp>(producer))) {
+      if(producer && !gemms.count(producer) && x.hasOneUse() && (isa<tosa::Conv2DOp,tosa::AddOp>(producer))) {
         aliases[op->getResult(0)]=x; fused.insert(op); activations[producer]=true;
       }
     }
     // Last uses come from the MLIR graph, including return and residual branches.
     for(auto [i,op]:llvm::enumerate(operations))
       if(!fused.contains(op))
-        for(Value v:op->getOperands()) lastUse[storageValue(v)]=i;
+        for(Value v:operands(op)) lastUse[storageValue(v)]=i;
     lastUse[storageValue(ret.getOperand(0))]=operations.size();
     DenseSet<Value> persistent;
     for(auto c:weights) {
@@ -289,21 +341,21 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       if(fused.contains(op)) continue;
       // Reject data operands not allocated by the SSA analysis (integer
       // constants are allowed only as transpose permutations).
-      unsigned inputs=isa<tosa::TransposeOp>(op)?1:op->getNumOperands();
-      for(Value v:op->getOperands().take_front(inputs))
+      for(Value v:operands(op))
         if(!buffers.count(storageValue(v))) {op->emitError("unsupported data operand");return signalPassFailure();}
       allocate(op->getResult(0),false);
       auto a=arguments(op); if(failed(a)) return signalPassFailure();
-      auto kind=family(op);
+      auto kind=operatorFamily(op);
+      auto *bound=binding(op);
       if(!kind.empty()) {
         std::string name=kind.str()+"_default";
-        if(auto attr=op->getAttrOfType<StringAttr>("sodap.implementation"))name=attr.getValue().str();
+        if(auto attr=bound->getAttrOfType<StringAttr>("sodap.implementation"))name=attr.getValue().str();
         if(name.empty() || name.size()>64 || (!std::isalpha(name[0]) && name[0]!='_') ||
            llvm::any_of(name,[](unsigned char c){return !std::isalnum(c) && c!='_';})) {
           op->emitError("implementation must be a safe symbol name");return signalPassFailure();
         }
         unsigned lanes=kind=="conv"?convLanes:kind=="gemm"?gemmLanes:addLanes;
-        if(auto attr=op->getAttrOfType<IntegerAttr>("sodap.compute_lanes")) {
+        if(auto attr=bound->getAttrOfType<IntegerAttr>("sodap.compute_lanes")) {
           if(attr.getInt()<1 || attr.getInt()>256) {op->emitError("invalid compute lane budget");return signalPassFailure();}
           lanes=attr.getInt();
         }
@@ -313,7 +365,7 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
           op->emitError("incompatible contracts/resources assigned to one implementation");return signalPassFailure();
         }
         unsigned instance=kind=="conv"?convInstance:kind=="gemm"?gemmInstance:addInstance;
-        if(auto attr=op->getAttrOfType<IntegerAttr>("sodap.instance"))instance=attr.getInt();
+        if(auto attr=bound->getAttrOfType<IntegerAttr>("sodap.instance"))instance=attr.getInt();
         for(auto &[other,e]:engines)
           if(other!=name && e.family==kind && llvm::is_contained(e.instances,instance)) {
             op->emitError("different implementations assigned to the same physical device");return signalPassFailure();
@@ -371,28 +423,61 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
     for(auto [i,arg]:llvm::enumerate(source.getArguments())) {reg(ctx,buffer(arg));copy(ctx,buffer(arg),run.getArgument(i+1),true);}
     for(auto [i,op]:llvm::enumerate(scheduled)) {
       auto &entry=calls[i]; Buffer out=buffer(op->getResult(0)); reg(ctx,out);
-      auto f=family(op); bool hw=!f.empty();
+      auto f=operatorFamily(op); bool hw=!f.empty();
+      auto *bound=binding(op);
       unsigned instance=f=="conv"?convInstance:f=="gemm"?gemmInstance:addInstance;
-      if(auto attr=op->getAttrOfType<IntegerAttr>("sodap.instance"))instance=attr.getInt();
+      if(auto attr=bound->getAttrOfType<IntegerAttr>("sodap.instance"))instance=attr.getInt();
       std::string implementation=f.str()+"_default";
-      if(auto attr=op->getAttrOfType<StringAttr>("sodap.implementation"))implementation=attr.getValue().str();
+      if(auto attr=bound->getAttrOfType<StringAttr>("sodap.implementation"))implementation=attr.getValue().str();
       if(hw)invoke("esp_op_select_device",ctx,{f=="conv"?0:f=="add"?1:2,instance});
-      auto callOp=invoke("esp_op_"+entry.first,ctx,entry.second);
+      auto g=gemms.find(op);
+      if(g!=gemms.end() && g->second.c) {
+        auto input=buffer(g->second.c);
+        // The engine overwrites C. Never overwrite parameters, model inputs,
+        // or SSA values retained by another consumer. Refresh on every run.
+        invoke("esp_op_repack",ctx,{input.offset,out.offset,out.elements});
+        records.push_back(llvm::json::Object{{"index",int64_t(records.size())},
+          {"operator","repack"},{"execution","cpu"},{"runtime","repack"},
+          {"arguments",jsonInts({input.offset,out.offset,out.elements})},
+          {"inputs",llvm::json::Array{input.id}},{"output",out.id},
+          {"reason","preserve GEMM C before in-place execution"}});
+      }
+      func::CallOp callOp;
+      if(entry.first=="gemm_full_source") {
+        SmallVector<Value> values{ctx};
+        for(auto n:entry.second)values.push_back(constant(n));
+        auto scalar=[&](Value v,float fallback)->Value {
+          if(v)return call("esp_op_scalar",{ctx,constant(buffer(v).offset)},TypeRange{b.getF32Type()}).getResult(0);
+          return b.create<arith::ConstantOp>(loc,b.getF32FloatAttr(fallback));
+        };
+        values.push_back(scalar(g->second.alpha,1));
+        values.push_back(scalar(g->second.beta,g->second.c?1:0));
+        values.push_back(scalar({},g->second.c?1:0));
+        callOp=call("esp_op_gemm_full_source",values);
+      } else callOp=invoke("esp_op_"+entry.first,ctx,entry.second);
       callOp->setAttr("sodap.execution",b.getStringAttr(hw?"accelerator":"cpu"));
       callOp->setAttr("sodap.operator",b.getStringAttr(hw?f:entry.first));
-      callOp->setAttr("sodap.invocation",b.getI64IntegerAttr(i));
+      callOp->setAttr("sodap.invocation",b.getI64IntegerAttr(records.size()));
       if(hw) {
         callOp->setAttr("sodap.instance",b.getI64IntegerAttr(instance));
         callOp->setAttr("sodap.implementation",b.getStringAttr(implementation));
       }
       llvm::json::Array ids;
-      unsigned count=isa<tosa::TransposeOp>(op)?1:op->getNumOperands();
-      for(auto v:op->getOperands().take_front(count)) ids.push_back(buffer(v).id);
-      records.push_back(llvm::json::Object{{"index",i},{"operator",hw?f.str():entry.first},
+      for(auto v:operands(op)) ids.push_back(buffer(v).id);
+      llvm::json::Object record{{"index",int64_t(records.size())},{"operator",hw?f.str():entry.first},
         {"execution",hw?"accelerator":"cpu"},{"runtime",entry.first},{"instance",hw?int64_t(instance):-1},
         {"descriptor_version",hw?3:0},{"implementation",hw?implementation:""},{"arguments",jsonInts(entry.second)},
         {"inputs",std::move(ids)},{"output",out.id},{"shape",jsonInts(shape(op->getResult(0)))},
-        {"relu",activations.lookup(op)}});
+        {"relu",activations.lookup(op)}};
+      if(g!=gemms.end()) {
+        auto coefficient=[&](Value v,float fallback) {
+          return v?llvm::json::Object{{"buffer",buffer(v).id}}:llvm::json::Object{{"constant",fallback}};
+        };
+        record["alpha"]=coefficient(g->second.alpha,1);
+        record["beta"]=coefficient(g->second.beta,g->second.c?1:0);
+        record["has_c"]=bool(g->second.c);
+      }
+      records.push_back(std::move(record));
     }
     copy(ctx,buffer(ret.getOperand(0)),run.getArguments().back(),false);
     b.create<func::ReturnOp>(loc);
@@ -411,6 +496,16 @@ struct NetworkHost : impl::TosaNetworkHostBase<NetworkHost> {
       {"arena_bytes",cursor},{"parameter_elements",parameters},{"input_elements",std::move(inputSizes)},
       {"output_elements",buffer(ret.getOperand(0)).elements},{"buffers",std::move(storage)},
       {"engines",std::move(implementations)},{"invocations",std::move(records)}};
+    llvm::json::Array inputBuffers,parameterBindings;
+    for(auto arg:source.getArguments())inputBuffers.push_back(buffer(arg).id);
+    for(auto c:weights) {
+      auto p=buffer(c.getResult());
+      parameterBindings.push_back(llvm::json::Object{{"buffer",p.id},
+        {"parameter_offset",p.parameter},{"elements",p.elements}});
+    }
+    report["input_buffers"]=std::move(inputBuffers);
+    report["parameter_bindings"]=std::move(parameterBindings);
+    report["output_buffer"]=buffer(ret.getOperand(0)).id;
     auto manifest=file("network.json"); if(ec) {module.emitError(ec.message());return signalPassFailure();}
     manifest->os()<<llvm::formatv("{0:2}\n",llvm::json::Value(std::move(report)));
     source.erase();

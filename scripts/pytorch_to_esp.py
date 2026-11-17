@@ -82,9 +82,8 @@ def main():
            'LCS_DMA_ABI':'packed', 'LCS_DMA_DATA_WIDTH':str(a.dma_width),
            'LCS_COMPUTE_LANES':str(a.compute_lanes), 'LCS_PLM_BYTES':str(a.plm_bytes),
            'LCS_GEMM_FP_SEMANTICS':'source', 'LCS_PROFILE':'true'}
-    if a.network or a.network_host_only:
-        env.update(LCS_TILES='network',LCS_CONV_LANES=str(a.conv_lanes),
-                   LCS_ADD_LANES=str(a.add_lanes),LCS_GEMM_LANES=str(a.compute_lanes))
+    env.update(LCS_CONV_LANES=str(a.conv_lanes),LCS_ADD_LANES=str(a.add_lanes),
+               LCS_GEMM_LANES=str(a.compute_lanes),LCS_DUMP_IR='false')
     # Reproducible defaults: unrelated experiments must not inject schedules.
     for key in ('LCS_TILE_SIZES','LCS_REGISTER_BLOCK','LCS_TRANSFORM','LCS_ENTRY',
                 'LCS_SEQUENTIAL','LCS_OVERLAP','LCS_FP_UNITS','LCS_BANK_LOCAL'):
@@ -100,16 +99,10 @@ def main():
                       parameter_sha256=sha(out/'generated/parameters.bin'),
                       fixture_sha256=sha(out/'fixture.json'),
                       invocation_manifest_sha256=sha(out/'generated/network.json'))
-    elif a.network:
-        result = dict(status='NETWORK_LOWERED_NOT_HARDWARE_VALIDATED',
+    else:
+        result = dict(status='OPERATOR_LOWERED_NOT_HARDWARE_VALIDATED',
                       compilation_sha256=sha(out/'generated/compilation.json'),
                       fixture_sha256=sha(out/'fixture.json'))
-    else:
-        result = dict(status='LOWERED_NOT_HARDWARE_VALIDATED',
-                  hardware_sha256=sha(out/'generated/05_hw_acc.ll'),
-                  host_sha256=sha(out/'generated/05_kernel_riscv.ll'),
-                  fixture_sha256=sha(out/'fixture.json'),
-                  invocation_manifest_sha256=sha(out/'generated/invocations.json'))
     (out/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result,indent=2))
 

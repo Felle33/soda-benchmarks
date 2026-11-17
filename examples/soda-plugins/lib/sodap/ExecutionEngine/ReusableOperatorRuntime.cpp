@@ -62,6 +62,9 @@ struct Context {
   uint32_t operatorInstances[3]; // conv, add, gemm
   int64_t outputOffset;
   uint64_t outputElements;
+#if defined(SODAP_OP_VERIFY_RTL) && !defined(__riscv)
+  uint32_t *savedOutput;
+#endif
   Context *next;
 #ifdef SODAP_OP_ESP_HW
   esp_device *devices, *device;
@@ -225,6 +228,13 @@ bool launch(Context &ctx, const char *kind, int64_t outputOffset, uint64_t outpu
   ctx.running = true;
   ctx.outputOffset = outputOffset;
   ctx.outputElements = outputElements;
+#if defined(SODAP_OP_VERIFY_RTL) && !defined(__riscv)
+  if(ctx.arena[0]==GEMM_MAGIC && ctx.arena[2*GEMM_FIELD_HAS_C]==0x3f800000) {
+    ctx.savedOutput=static_cast<uint32_t *>(allocate(outputElements*4));
+    for(uint64_t i=0;i<outputElements;++i)
+      ctx.savedOutput[i]=ctx.arena[elementAddress(ctx,outputOffset,i)];
+  }
+#endif
 #ifdef SODAP_OP_TRACE
   std::printf("OP_CONFIG call=%u",ctx.invocations);
   for(unsigned i=0;i<24;++i) std::printf(" %x",ctx.arena[2*i]);
@@ -263,13 +273,14 @@ void complete(Context &ctx) {
   auto *expected=static_cast<float *>(allocate(ctx.outputElements*sizeof(float)));
   for(uint64_t i=0;i<ctx.outputElements;++i) {
     expected[i]=read(ctx,ctx.outputOffset,i);
-    ctx.arena[elementAddress(ctx,ctx.outputOffset,i)]=0x7fc00000;
+    ctx.arena[elementAddress(ctx,ctx.outputOffset,i)]=ctx.savedOutput?ctx.savedOutput[i]:0x7fc00000;
   }
   esp_op_execute_rtl(ctx.arena,ctx.bytes);
   float maxError=0;
   for(uint64_t i=0;i<ctx.outputElements;++i) {
     float actual=read(ctx,ctx.outputOffset,i), error=std::fabs(actual-expected[i]);
-    if(!std::isfinite(actual) || error>1e-4f+1e-4f*std::fabs(expected[i])) {
+    bool sameNaN=std::isnan(actual) && std::isnan(expected[i]);
+    if(!sameNaN && (!std::isfinite(actual) || !std::isfinite(expected[i]) || error>1e-4f+1e-4f*std::fabs(expected[i]))) {
       std::printf("RTL mismatch invocation=%u element=%lu actual=%g expected=%g\n",
                   ctx.invocations,(unsigned long)i,double(actual),double(expected[i]));
       fail("RTL output differs from operator oracle");
@@ -277,6 +288,7 @@ void complete(Context &ctx) {
     maxError=std::max(maxError,error);
   }
   release(expected);
+  release(ctx.savedOutput);ctx.savedOutput=nullptr;
   std::printf("REUSABLE_OP RTL_CHECK elements=%lu max_error=%g\n",
               (unsigned long)ctx.outputElements,double(maxError));
 #endif
@@ -399,16 +411,22 @@ extern "C" int64_t esp_op_open_packed(int64_t bytes,int64_t instance,int64_t wid
 extern "C" int64_t esp_op_open_devices(int64_t bytes,int64_t width,
     int64_t conv,int64_t add,int64_t gemm) {
   if(width<=0 || width>UINT32_MAX || !sodap::DmaTransport{unsigned(width)}.valid())fail("invalid DMA width");
+#if defined(SODAP_OP_ESP_HW) && !defined(SODAP_OP_SEPARATE_DEVICES)
+  if((conv>=0)+(add>=0)+(gemm>=0)!=1)fail("single-device runtime requires one operator family");
+  return openContext(bytes,std::max({conv,add,gemm}),unsigned(width),false,conv,add,gemm);
+#else
   return openContext(bytes,0,unsigned(width),true,conv,add,gemm);
+#endif
 }
 // Mapping is explicit and independent of the operator's arithmetic contract.
 // The default experiment binds one instance per type; another graph may select
 // additional compatible physical instances between synchronous invocations.
 extern "C" void esp_op_select_device(int64_t h,int64_t family,int64_t instance) {
   Context &ctx=lookup(h);
-  if(!ctx.separateDevices || ctx.running || family<0 || family>=3 || instance<0 || uint64_t(instance)>UINT32_MAX)
+  if(ctx.running || family<0 || family>=3 || instance<0 || uint64_t(instance)>UINT32_MAX)
     fail("invalid typed device binding");
   if(ctx.operatorInstances[family]==uint32_t(instance))return;
+  if(!ctx.separateDevices)fail("single-device runtime cannot change operator binding");
 #ifdef SODAP_OP_ESP_HW
   if(uint64_t(instance)>=ctx.enumerationCounts[family])fail("typed operator instance not found");
   auto *device=&ctx.enumerations[family][instance];
@@ -569,8 +587,14 @@ extern "C" void esp_op_add(int64_t handle, int64_t a, int64_t b, int64_t c,
   complete(ctx);
 }
 static void gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
-    int64_t m, int64_t n, int64_t k, bool source) {
+    int64_t m, int64_t n, int64_t k, bool source,
+    float alpha=1,float beta=0,float hasC=0) {
   Context &ctx=lookup(handle);
+#ifdef SODAP_OP_PROFILE
+  esp_op_profile_event(1,ctx.invocations);
+#endif
+  if(source && (!ctx.dmaWidth || (hasC!=0 && hasC!=1)))
+    fail("source GEMM requires packed DMA and an explicit C-presence flag");
   columns(ctx,a,k);columns(ctx,b,n);columns(ctx,c,n);
   auto ae=check(ctx,a,product({m,k})), be=check(ctx,b,product({k,n})), ce=check(ctx,c,product({m,n}));
   disjoint(a,ae,c,ce); disjoint(b,be,c,ce);
@@ -579,22 +603,33 @@ static void gemm(int64_t handle, int64_t a, int64_t b, int64_t c,
   field(ctx,GEMM_FIELD_A,wireAddress(ctx,a)); field(ctx,GEMM_FIELD_B,wireAddress(ctx,b)); field(ctx,GEMM_FIELD_C,wireAddress(ctx,c));
   if(ctx.dmaWidth) {
     field(ctx,GEMM_FIELD_VERSION,source?GEMM_SOURCE_VERSION:GEMM_PACKED_VERSION);field(ctx,GEMM_FIELD_DMA_WIDTH,ctx.dmaWidth);
-    if(source)field(ctx,GEMM_FIELD_HAS_C,0); // Pure matmul: C is absent, including NaN-poisoned storage.
+    uint32_t bits;std::memcpy(&bits,&hasC,4);
+    if(source)field(ctx,GEMM_FIELD_HAS_C,bits);
     field(ctx,GEMM_FIELD_LDA,layout(ctx,a).rowWords*4);
     field(ctx,GEMM_FIELD_LDB,layout(ctx,b).rowWords*4);
     field(ctx,GEMM_FIELD_LDC,layout(ctx,c).rowWords*4);
   } else {
     field(ctx,GEMM_FIELD_LDA,k*2);field(ctx,GEMM_FIELD_LDB,n*2);field(ctx,GEMM_FIELD_LDC,n*2);
   }
-  field(ctx,GEMM_FIELD_ALPHA,0x3f800000); field(ctx,GEMM_FIELD_BETA,0);
-  if (!launch(ctx,"gemm",c,product({m,n})))
+  uint32_t alphaBits,betaBits;
+  std::memcpy(&alphaBits,&alpha,4);std::memcpy(&betaBits,&beta,4);
+  field(ctx,GEMM_FIELD_ALPHA,alphaBits); field(ctx,GEMM_FIELD_BETA,betaBits);
+  if (!launch(ctx,"gemm",c,product({m,n}))) {
+    TensorView av(ctx,a,m*k),bv(ctx,b,k*n),cv(ctx,c,m*n);
+    auto as=av.stride(k),bs=bv.stride(n),cs=cv.stride(n);
     for (int64_t i=0;i<m;++i)
       for (int64_t j=0;j<n;++j) {
         float sum=0;
-        for (int64_t q=0;q<k;++q) sum=sum+read(ctx,a,i*k+q)*read(ctx,b,q*n+j);
-        write(ctx,c,i*n+j,sum);
+        for (int64_t q=0;q<k;++q) sum=sum+av.get(i*as+q*av.step)*bv.get(q*bs+j*bv.step);
+        float value=alpha*sum;
+        if(source?hasC!=0:beta!=0)value=beta*cv.get(i*cs+j*cv.step)+value;
+        cv.put(i*cs+j*cv.step,value);
       }
+  }
   complete(ctx);
+#ifdef SODAP_OP_PROFILE
+  esp_op_profile_event(0,ctx.invocations-1);
+#endif
 }
 
 extern "C" void esp_op_gemm(int64_t h,int64_t a,int64_t b,int64_t c,int64_t m,int64_t n,int64_t k) {
@@ -603,6 +638,15 @@ extern "C" void esp_op_gemm(int64_t h,int64_t a,int64_t b,int64_t c,int64_t m,in
 extern "C" void esp_op_gemm_source(int64_t h,int64_t a,int64_t b,int64_t c,int64_t m,int64_t n,int64_t k) {
   if(!lookup(h).dmaWidth)fail("GEMM source semantics require packed DMA");
   gemm(h,a,b,c,m,n,k,true);
+}
+extern "C" void esp_op_gemm_full_source(int64_t h,int64_t a,int64_t b,int64_t c,
+    int64_t m,int64_t n,int64_t k,float alpha,float beta,float hasC) {
+  gemm(h,a,b,c,m,n,k,true,alpha,beta,hasC);
+}
+extern "C" float esp_op_scalar(int64_t h,int64_t offset) {
+  Context &ctx=lookup(h);check(ctx,offset,1);
+  if(layout(ctx,offset).elements!=1)fail("coefficient is not scalar");
+  return read(ctx,offset,0);
 }
 extern "C" void esp_op_relu(int64_t h,int64_t a,int64_t c,int64_t count) {
   Context &ctx=lookup(h);

@@ -111,7 +111,7 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
 fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ ${LCS_TILES:-kernel} == network ]]; then
+if [[ ${LCS_TILES:-kernel} == network || ( ${LCS_TILES:-kernel} == operators && ${LCS_HARDWARE_ONLY:-false} != true ) ]]; then
   exec bash "$REPO_DIR/scripts/lcs/network.sh" "$1" "${2:-$(dirname "$1")}"
 fi
 source "$REPO_DIR/scripts/check_docker.sh"
@@ -504,6 +504,7 @@ if [[ ${LCS_HARDWARE_ONLY:-false} == true ]]; then
   exit 0
 fi
 
+bash "$REPO_DIR/scripts/lcs/check_host_mode.sh" "$TILES"
 section "$HOST_DUMP" "Host: TOSA to linalg, bufferization, the ESP calls, mlir-opt"
 step "$HOST_DUMP" mlir-opt acc.mlir $PLUGIN --pass-pipeline="builtin.module(
     func.func(

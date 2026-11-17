@@ -11,7 +11,7 @@ if [[ -n ${NN_SECOND_FIXTURE:-} ]]; then stage_args+=(--second-fixture "$NN_SECO
 python3 "$repo/scripts/lcs/stage_network_app.py" "$input" "$app" "${stage_args[@]}"
 app=$(realpath "$app")
 env NN_MAIN_C="$repo/examples/esp-validation/networks/baremetal_main.c" \
-  NN_SEPARATE_DEVICES=1 NN_QUIET=${NN_QUIET:-1} NN_DRAM_BYTES="${5:-16777216}" \
+  NN_SEPARATE_DEVICES=${NN_SEPARATE_DEVICES:-1} NN_QUIET=${NN_QUIET:-1} NN_DRAM_BYTES="${5:-16777216}" \
   bash "$repo/examples/esp-validation/reusable-nn/build-software.sh" "$app" "$esp" "$soc"
 python3 - "$app" <<'PY'
 import hashlib,json,sys

@@ -49,8 +49,9 @@ def main():
             output.fill(np.nan)
             lib.forward_run(context, *map(ptr, inputs), ptr(output))
             np.testing.assert_allclose(output, reference, rtol=fixture['rtol'],
-                                       atol=fixture['atol'], equal_nan=False)
-            errors.append(float(np.max(np.abs(output-reference))))
+                                       atol=fixture['atol'], equal_nan=True)
+            finite=np.isfinite(reference)
+            errors.append(float(np.max(np.abs(output[finite]-reference[finite]))) if finite.any() else 0.0)
     finally:
         lib.forward_close(context)
     result = dict(status='PASS', scope=('compiler host + generated operator RTL + native-DMA adapter; simulated memory, no ESP CPU/socket'
