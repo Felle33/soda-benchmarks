@@ -267,7 +267,7 @@ struct SelectKernelTiles : sodap::impl::SelectKernelTilesBase<SelectKernelTiles>
     // Stable ties retain the historical proposal. Both sets are admitted and
     // scored on the schedule actually generated, never on overlap for serial.
     auto selected=search(schedule=="overlap",true,"double-copy");
-    if (schedule=="nonoverlap") {
+    if (schedule=="nonoverlap" && singleCopyProposals) {
       auto single=search(false,false,"single-copy");
       for (auto &candidate:single) selected.push_back(std::move(candidate));
     }

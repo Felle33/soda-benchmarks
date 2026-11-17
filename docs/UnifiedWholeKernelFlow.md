@@ -48,8 +48,9 @@ also implement the matching portions of `sodap-operator-pipeline` and
 
 `sodap-select-kernel-tiles` keeps the historical five storage-cap proposals and
 max-tile-10 proposal. Overlap evaluates the double-copy proposal set.
-Nonoverlap evaluates the union of double-copy and single-copy proposals, each
-on the actual serial schedule. The objective is lexicographic DMA cycles,
+Nonoverlap also defaults to the double-copy proposals and evaluates them on
+the actual serial schedule. Set the pass or backend pipeline option
+`single-copy-proposals=true` to include the experimental single-copy set. The objective is lexicographic DMA cycles,
 compute iterations, then logical storage. Actual banked local storage is an
 additional admission check. Historical proposals win exact ties.
 `tile_search.json` identifies each candidate's proposal set, status, costs,
@@ -90,7 +91,7 @@ the corresponding native numerical checks pass.
 
 ## Qualification limit
 
-All overlap and MINI designs remain identical to the release. LARGE nonoverlap
+In the earlier union-search campaign, all overlap and MINI designs were identical to the release. LARGE nonoverlap
 2MM/TRMM also remain identical. GEMM, 3MM, SYRK, SYR2K, SYMM, ATAX, GESUMMV and
 DOITGEN have changed LARGE hardware and would require new qualification/builds.
 Every LARGE analytical cost is no worse than the release. However, measured

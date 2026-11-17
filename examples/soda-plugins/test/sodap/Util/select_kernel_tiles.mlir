@@ -1,7 +1,8 @@
-// RUN: mkdir -p %t.o %t.n %t.reject
+// RUN: mkdir -p %t.o %t.n %t.union %t.reject
 // RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-select-kernel-tiles{schedule=overlap transform-file=%S/../../../../../scripts/lcs/transform.mlir report-dir=%t.o})" -o %t.o/tasks.mlir
 // RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-select-kernel-tiles{schedule=nonoverlap transform-file=%S/../../../../../scripts/lcs/transform.mlir report-dir=%t.n})" -o %t.n/tasks.mlir
-// RUN: python3 %S/Inputs/check_kernel_selection.py %t.o/tile_search.json %t.n/tile_search.json
+// RUN: mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-select-kernel-tiles{schedule=nonoverlap single-copy-proposals=true transform-file=%S/../../../../../scripts/lcs/transform.mlir report-dir=%t.union})" -o %t.union/tasks.mlir
+// RUN: python3 %S/Inputs/check_kernel_selection.py %t.o/tile_search.json %t.n/tile_search.json %t.union/tile_search.json
 // RUN: not mlir-opt %s --load-dialect-plugin=%sodap_libs/SODAPlugin%shlibext --load-pass-plugin=%sodap_libs/SODAPlugin%shlibext --pass-pipeline="builtin.module(sodap-select-kernel-tiles{plm-bytes=1 transform-file=%S/../../../../../scripts/lcs/transform.mlir report-dir=%t.reject})" 2>&1 | FileCheck %s --check-prefix=REJECT
 // REJECT: all whole-kernel tile candidates rejected
 module attributes {torch.debug_module_name = "Gemm"} {

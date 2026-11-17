@@ -89,6 +89,8 @@ def SelectKernelTiles : Pass<"sodap-select-kernel-tiles", "::mlir::ModuleOp"> {
   let summary = "Select whole-kernel tiles using the requested scheduled IR";
   let options = [
     Option<"schedule", "schedule", "std::string", "\"overlap\"", "overlap or nonoverlap">,
+    Option<"singleCopyProposals", "single-copy-proposals", "bool", "false",
+           "Also consider single-copy proposals for the fused schedule">,
     Option<"lanes", "lanes", "unsigned", "64", "Core FP32 lane budget">,
     Option<"plmBytes", "plm-bytes", "uint64_t", "327680", "Final local storage budget">,
     Option<"reuseBytes", "reuse-bytes", "uint64_t", "262144", "Reuse admission budget">,

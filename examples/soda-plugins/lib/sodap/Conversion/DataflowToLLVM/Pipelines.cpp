@@ -69,6 +69,7 @@ struct KernelHostOptions : public PassPipelineOptions<KernelHostOptions> {
   Option<std::string> directory{*this,"directory",llvm::cl::init(".")};
 };
 struct WholeKernelBackendOptions : public PassPipelineOptions<WholeKernelBackendOptions> {
+  Option<bool> singleCopyProposals{*this,"single-copy-proposals",llvm::cl::init(false)};
   Option<std::string> schedule{*this,"schedule",llvm::cl::init("overlap")};
   Option<unsigned> lanes{*this,"lanes",llvm::cl::init(64)};
   Option<unsigned> dmaWidth{*this,"dma-width",llvm::cl::init(64)};
@@ -168,7 +169,8 @@ void mlir::sodap::registerDataflowToLLVMPipeline() {
           return "sodap-snapshot-kernel-ir{file="+dir+"/"+name.str()+".mlir},";
         };
         std::string pipeline=
-          "sodap-select-kernel-tiles{schedule="+o.schedule.getValue()+" lanes="+
+          "sodap-select-kernel-tiles{schedule="+o.schedule.getValue()+
+          " single-copy-proposals="+(o.singleCopyProposals ? "true" : "false")+" lanes="+
           std::to_string(o.lanes)+" plm-bytes="+std::to_string(o.plmBytes)+
           " reuse-bytes="+std::to_string(o.reuseBytes)+" dma-width="+std::to_string(o.dmaWidth)+
           " word-stride="+std::to_string(o.wordStride)+" request-cycles="+
